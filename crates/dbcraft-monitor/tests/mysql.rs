@@ -553,3 +553,89 @@ fn session_list() {
     b.session.send(DbRequest::Rollback);
     setup.ok("drop table dbcraft_mon_list");
 }
+
+/// A thread with two InnoDB transactions (#492): MariaDB's OPTIMIZE TABLE
+/// changes the data dictionary in a second one. Sessions, the open
+/// transactions and the thread's detail show it once. MySQL's has one.
+#[test]
+fn a_thread_with_two_transactions() {
+    let (Some(app), Some(dba)) = (
+        params("DBCRAFT_TEST_MYSQL"),
+        params("DBCRAFT_TEST_MYSQL_DBA"),
+    ) else {
+        return;
+    };
+    let _serial = LOCK_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut setup = Harness::connect(app.clone());
+    if !setup.scalar("select version()").contains("MariaDB") {
+        return;
+    }
+    setup.ok("drop table if exists dbcraft_mon_rebuild");
+    setup.ok("create table dbcraft_mon_rebuild \
+         (id int primary key auto_increment, pad char(255))");
+    setup.ok("insert into dbcraft_mon_rebuild (pad) values (repeat('x', 255))");
+    // 2^18 rows: the rebuild copies them for a second or so, the later part
+    // of it with both transactions.
+    for _ in 0..18 {
+        setup.ok("insert into dbcraft_mon_rebuild (pad) select pad from dbcraft_mon_rebuild");
+    }
+    setup.ok("commit");
+
+    let mut optimize = Harness::connect(app.clone());
+    let id: i64 = optimize.scalar("select connection_id()").parse().unwrap();
+    let mut writer = Harness::connect(app);
+    let mut monitor = Harness::connect(dba);
+    let state = format!(
+        "select case when (select count(*) from information_schema.innodb_trx \
+                            where trx_mysql_thread_id = {id}) >= 2 then 'two' \
+                     when exists (select 1 from information_schema.processlist \
+                                   where id = {id} and info like 'optimize%') \
+                     then 'running' else 'done' end"
+    );
+    let mut held = false;
+    for _ in 0..5 {
+        optimize.send("optimize table dbcraft_mon_rebuild");
+        let mut started = false;
+        for _ in 0..2000 {
+            match monitor.scalar(&state).as_str() {
+                "two" => {
+                    // A change during the copy: the rebuild waits for its
+                    // metadata lock at the end, with both transactions,
+                    // until the change rolls back.
+                    writer.ok("update dbcraft_mon_rebuild set pad = 'y' where id = 1");
+                    held = monitor.scalar(&state) == "two";
+                    break;
+                }
+                "running" => started = true,
+                _ if started => break,
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if held {
+            break;
+        }
+        // Missed: the rebuild ended first.
+        writer.session.send(DbRequest::Rollback);
+        writer.settle("rollback");
+        optimize.settle("optimize table");
+    }
+    assert!(held, "no rebuild with two transactions in 5 tries");
+
+    let list = monitor.run(|c| mysql::connections(c, false)).unwrap();
+    let rows: Vec<_> = list.rows.iter().filter(|t| t.id == id).collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].transaction_secs.is_some(), "{:?}", rows[0]);
+    let s = monitor.snapshot(false);
+    let open: Vec<_> = s.transactions.iter().filter(|t| t.thread == id).collect();
+    assert_eq!(open.len(), 1, "{open:?}");
+    let d = monitor
+        .run(move |c| Ok(mysql::thread_detail(c, id)))
+        .unwrap();
+    assert!(d.transaction.is_some(), "{d:?}");
+    assert_eq!(monitor.scalar(&state), "two", "still two transactions");
+
+    writer.session.send(DbRequest::Rollback);
+    optimize.settle("optimize table");
+    setup.ok("drop table dbcraft_mon_rebuild");
+}
