@@ -38,7 +38,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             formats: wix,nsis
           - name: macos-aarch64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             formats: app,dmg
           - name: macos-x86_64
