@@ -1568,6 +1568,12 @@ fn with_update_waits_for_commit() {
     let Some(mut h) = Harness::connect() else {
         return;
     };
+    // MariaDB reads WITH only before a SELECT (#497).
+    if h.scalar("select version()")
+        .is_some_and(|v| v.contains("MariaDB"))
+    {
+        return;
+    }
     h.ok("drop table if exists r101_cte");
     h.ok("create table r101_cte (id int primary key, n int)");
     h.ok("insert into r101_cte values (1, 1)");

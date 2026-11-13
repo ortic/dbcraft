@@ -472,17 +472,33 @@ fn threads(c: &mut dyn Client, s: &mut MySqlSnapshot) -> Result<(), DbError> {
     Ok(())
 }
 
+/// `innodb_trx` with one row per thread (#492): MariaDB's InnoDB runs an
+/// ALTER's data dictionary changes (OPTIMIZE TABLE's too) in a second
+/// transaction of the thread. Its oldest start, `LOCK WAIT` when one of them
+/// waits, their rows summed; transactions of no thread (recovered XA ones,
+/// thread 0) stay apart.
+const TRX_PER_THREAD: &str = "(select trx_mysql_thread_id as thread, \
+        min(trx_started) as started, min(trx_wait_started) as wait_started, \
+        case when sum(trx_state = 'LOCK WAIT') > 0 then 'LOCK WAIT' \
+             else max(trx_state) end as state, \
+        sum(trx_rows_locked) as rows_locked, sum(trx_rows_modified) as rows_modified, \
+        sum(trx_tables_locked) as tables_locked, max(trx_isolation_level) as isolation, \
+        max(trx_query) as query \
+   from information_schema.innodb_trx \
+  group by trx_mysql_thread_id, case when trx_mysql_thread_id = 0 then trx_id end)";
+
 fn transactions(c: &mut dyn Client, s: &mut MySqlSnapshot) -> Result<(), DbError> {
-    let count = c.query("select count(*) from information_schema.innodb_trx", &[])?;
+    let count = c.query(&format!("select count(*) from {TRX_PER_THREAD} t"), &[])?;
     s.open_transactions = count.first().map(|r| int(r, 0));
     let rows = c.query(
-        "select t.trx_mysql_thread_id, p.user, t.trx_state, \
-                timestampdiff(second, t.trx_started, now()), t.trx_rows_locked, \
-                t.trx_rows_modified, t.trx_query, p.command \
-           from information_schema.innodb_trx t \
-           left join information_schema.processlist p on p.id = t.trx_mysql_thread_id \
-          order by t.trx_started \
-          limit 10",
+        &format!(
+            "select t.thread, p.user, t.state, timestampdiff(second, t.started, now()), \
+                    t.rows_locked, t.rows_modified, t.query, p.command \
+               from {TRX_PER_THREAD} t \
+               left join information_schema.processlist p on p.id = t.thread \
+              order by t.started \
+              limit 10"
+        ),
         &[],
     )?;
     s.transactions = rows
@@ -942,9 +958,11 @@ pub fn thread_detail(c: &mut dyn Client, id: i64) -> ThreadDetail {
         "the PROCESS privilege",
         (|| {
             let rows = c.query(
-                "select trx_state, trx_started, timestampdiff(second, trx_started, now()), \
-                        trx_rows_locked, trx_rows_modified, trx_isolation_level, trx_tables_locked \
-                   from information_schema.innodb_trx where trx_mysql_thread_id = ?",
+                &format!(
+                    "select state, started, timestampdiff(second, started, now()), \
+                            rows_locked, rows_modified, isolation, tables_locked \
+                       from {TRX_PER_THREAD} t where thread = ?"
+                ),
                 &[&id_text],
             )?;
             d.transaction = rows.first().map(|r| ThreadTransaction {
@@ -1125,12 +1143,14 @@ fn plan_table(rows: &[Vec<Cell>]) -> String {
 pub fn connections(c: &mut dyn Client, background: bool) -> Result<ConnectionList, DbError> {
     let mut list = ConnectionList::default();
     let with_transactions = c.query(
-        "select p.id, p.user, p.host, p.db, p.command, p.time, p.state, p.info, \
-                timestampdiff(second, t.trx_started, now()), t.trx_state, \
-                timestampdiff(second, t.trx_wait_started, now()) \
-           from information_schema.processlist p \
-           left join information_schema.innodb_trx t on t.trx_mysql_thread_id = p.id \
-          where p.id <> connection_id()",
+        &format!(
+            "select p.id, p.user, p.host, p.db, p.command, p.time, p.state, p.info, \
+                    timestampdiff(second, t.started, now()), t.state, \
+                    timestampdiff(second, t.wait_started, now()) \
+               from information_schema.processlist p \
+               left join {TRX_PER_THREAD} t on t.thread = p.id \
+              where p.id <> connection_id()"
+        ),
         &[],
     );
     let rows = match with_transactions {

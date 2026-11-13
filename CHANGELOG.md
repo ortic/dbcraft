@@ -6,6 +6,14 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- MariaDB: the Sessions tab lists a thread once while it runs `OPTIMIZE
+  TABLE` or an ALTER that rebuilds an InnoDB table (#492). It showed
+  twice: MariaDB's InnoDB changes the data dictionary in a second
+  transaction of the thread, and every transaction made a row. The
+  Dashboard's open transactions show the thread once too, and the
+  session detail its transactions together.
+
 ## [0.12.0] - 2026-11-13
 
 ### Changed
