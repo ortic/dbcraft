@@ -1,7 +1,7 @@
 # Oracle Free for local development and integration tests.
 #
 #   podman compose up -d   (or docker compose up -d)
-#   PYTHIA_TEST_DB=pythia/pythia@localhost:1521/FREEPDB1 cargo test -p pythia-db
+#   DBCRAFT_TEST_DB=dbcraft/dbcraft@localhost:1521/FREEPDB1 cargo test -p dbcraft-db
 services:
   oracle:
     image: docker.io/gvenzl/oracle-free:23-slim
@@ -9,8 +9,8 @@ services:
       - "1521:1521"
     environment:
       ORACLE_PASSWORD: oracle
-      APP_USER: pythia
-      APP_USER_PASSWORD: pythia
+      APP_USER: dbcraft
+      APP_USER_PASSWORD: dbcraft
     volumes:
       - oracle-data:/opt/oracle/oradata
     healthcheck:
@@ -20,16 +20,16 @@ services:
       retries: 30
   # MySQL for the MySQL backend:
   #   podman compose up -d mysql
-  #   PYTHIA_TEST_MYSQL=pythia/pythia@localhost:3306/pythia cargo test -p pythia-db
+  #   DBCRAFT_TEST_MYSQL=dbcraft/dbcraft@localhost:3306/dbcraft cargo test -p dbcraft-db
   mysql:
     image: docker.io/library/mysql:9.4.0
     ports:
       - "3306:3306"
     environment:
       MYSQL_ROOT_PASSWORD: mysql
-      MYSQL_DATABASE: pythia
-      MYSQL_USER: pythia
-      MYSQL_PASSWORD: pythia
+      MYSQL_DATABASE: dbcraft
+      MYSQL_USER: dbcraft
+      MYSQL_PASSWORD: dbcraft
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -39,16 +39,16 @@ services:
       retries: 30
   # MariaDB, for the MySQL backend's MariaDB differences (port 3307):
   #   podman compose up -d mariadb
-  #   PYTHIA_TEST_MYSQL=pythia/pythia@localhost:3307/pythia cargo test -p pythia-db --test mysql
+  #   DBCRAFT_TEST_MYSQL=dbcraft/dbcraft@localhost:3307/dbcraft cargo test -p dbcraft-db --test mysql
   mariadb:
     image: docker.io/library/mariadb:10.6
     ports:
       - "3307:3306"
     environment:
       MARIADB_ROOT_PASSWORD: mariadb
-      MARIADB_DATABASE: pythia
-      MARIADB_USER: pythia
-      MARIADB_PASSWORD: pythia
+      MARIADB_DATABASE: dbcraft
+      MARIADB_USER: dbcraft
+      MARIADB_PASSWORD: dbcraft
     volumes:
       - mariadb-data:/var/lib/mysql
     healthcheck:
@@ -56,51 +56,51 @@ services:
       interval: 10s
       timeout: 5s
       retries: 30
-  # An SSH server for tunnels (user pythia / pythia). From there, MySQL is
+  # An SSH server for tunnels (user dbcraft / dbcraft). From there, MySQL is
   # mysql:3306:
   #   podman compose up -d mysql ssh
-  #   PYTHIA_TEST_SSH=pythia:pythia@localhost:2222 \
-  #   PYTHIA_TEST_MYSQL_VIA_SSH=pythia/pythia@mysql:3306/pythia cargo test -p pythia-db
+  #   DBCRAFT_TEST_SSH=dbcraft:dbcraft@localhost:2222 \
+  #   DBCRAFT_TEST_MYSQL_VIA_SSH=dbcraft/dbcraft@mysql:3306/dbcraft cargo test -p dbcraft-db
   ssh:
     build: docker/ssh
     ports:
       - "2222:22"
-  # PostgreSQL for the PostgreSQL backend (PYTHIA_POSTGRES_PORT if 5432 is
+  # PostgreSQL for the PostgreSQL backend (DBCRAFT_POSTGRES_PORT if 5432 is
   # taken):
   #   podman compose up -d postgres
-  #   PYTHIA_TEST_POSTGRES=pythia/pythia@localhost:5432/pythia cargo test -p pythia-db
+  #   DBCRAFT_TEST_POSTGRES=dbcraft/dbcraft@localhost:5432/dbcraft cargo test -p dbcraft-db
   postgres:
     image: docker.io/library/postgres:18
     # pg_stat_statements for the dashboard's top statements.
     command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
     ports:
-      - "${PYTHIA_POSTGRES_PORT:-5432}:5432"
+      - "${DBCRAFT_POSTGRES_PORT:-5432}:5432"
     environment:
-      POSTGRES_USER: pythia
-      POSTGRES_PASSWORD: pythia
-      POSTGRES_DB: pythia
+      POSTGRES_USER: dbcraft
+      POSTGRES_PASSWORD: dbcraft
+      POSTGRES_DB: dbcraft
     volumes:
       - postgres-data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "pythia", "-d", "pythia"]
+      test: ["CMD", "pg_isready", "-U", "dbcraft", "-d", "dbcraft"]
       interval: 10s
       timeout: 5s
       retries: 30
   # SQL Server for the SQL Server backend; mssql-init adds the database and
-  # login pythia/pythia once it is up:
+  # login dbcraft/dbcraft once it is up:
   #   podman compose up -d mssql mssql-init
-  #   PYTHIA_TEST_MSSQL=pythia/pythia@localhost:1433/pythia cargo test -p pythia-db
+  #   DBCRAFT_TEST_MSSQL=dbcraft/dbcraft@localhost:1433/dbcraft cargo test -p dbcraft-db
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
     ports:
       - "1433:1433"
     environment:
       ACCEPT_EULA: "Y"
-      MSSQL_SA_PASSWORD: Pythia-2026
+      MSSQL_SA_PASSWORD: DbCraft-2026
     volumes:
       - mssql-data:/var/opt/mssql
     healthcheck:
-      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa", "-P", "Pythia-2026", "-Q", "select 1", "-b", "-o", "/dev/null"]
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa", "-P", "DbCraft-2026", "-Q", "select 1", "-b", "-o", "/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -117,13 +117,13 @@ services:
       - -U
       - sa
       - -P
-      - Pythia-2026
+      - DbCraft-2026
       - -b
       - -Q
       - >-
-        if db_id('pythia') is null create database pythia;
-        if suser_id('pythia') is null create login pythia with password = 'pythia', check_policy = off, default_database = pythia;
-        exec('use pythia; if user_id(''pythia'') is null create user pythia for login pythia; alter role db_owner add member pythia;')
+        if db_id('dbcraft') is null create database dbcraft;
+        if suser_id('dbcraft') is null create login dbcraft with password = 'dbcraft', check_policy = off, default_database = dbcraft;
+        exec('use dbcraft; if user_id(''dbcraft'') is null create user dbcraft for login dbcraft; alter role db_owner add member dbcraft;')
     restart: "no"
 volumes:
   oracle-data:

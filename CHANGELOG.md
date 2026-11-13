@@ -1,17 +1,28 @@
 # Changelog
 
-All notable changes to Pythia are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
-[Semantic Versioning](https://semver.org/).
+All notable changes to DbCraft (called Pythia up to 0.11.0) are documented
+here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Pythia is now DbCraft (#493): the program is `dbcraft`, its app id
+  `com.ortic.dbcraft`, the repository ortic/dbcraft and the website
+  ortic.github.io/dbcraft. On first start, settings, connections, the
+  workspace, history and recovered editors move over from Pythia's
+  folders (copied, when Pythia still holds them), and saved passwords,
+  SSH secrets and AI keys move over from Pythia's keychain entries when
+  first used. The installers can't replace Pythia: DbCraft installs next
+  to it, and Pythia is uninstalled by hand. `PYTHIA_WAYLAND` still keeps
+  Wayland under WSLg; its new name is `DBCRAFT_WAYLAND`.
+
 ### Fixed
-- Windows: Pythia draws through DirectX 12 before Vulkan (#491). wgpu
+- Windows: DbCraft draws through DirectX 12 before Vulkan (#491). wgpu
   took Vulkan wherever the driver has it, and with Intel's Vulkan driver
   the whole window flickered now and then as the mouse moved over it.
   Vulkan and OpenGL remain the fallbacks, `WGPU_BACKEND=vulkan` still
-  chooses Vulkan, and the log names the adapter Pythia draws with.
+  chooses Vulkan, and the log names the adapter DbCraft draws with.
 - SQL Server: `money` and `smallmoney` show every digit (#186): read as
   a double, 922337203685477.5807 showed as 922337203685477.6, and an
   edit of such a value found no row. They show with their four decimals,
@@ -42,7 +53,7 @@ All notable changes to Pythia are documented here. The format follows
   names), and a result is editable only when it ends with the key
   columns that were added.
 - PostgreSQL and SQL Server: block comments nest, as the servers read
-  them (#391). In `/* off /* step 2 */ delete from t; */`, Pythia ended
+  them (#391). In `/* off /* step 2 */ delete from t; */`, DbCraft ended
   the comment at the first `*/` and ran the `delete`, which the server
   would have left commented out. The editor highlights it as comment too.
 - The value editor shows a binary value the grid holds cut short (its
@@ -54,7 +65,7 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: `key=value` connect strings are read as libpq reads them
   (#393): a `?` in a value no longer makes the string a URL, quoted
   values keep their spaces, and `sslmode = require` with spaces is
-  taken. An `sslmode` that the driver read but Pythia didn't was turned
+  taken. An `sslmode` that the driver read but DbCraft didn't was turned
   into `prefer`, which falls back to a connection without TLS.
 - Script files in UTF-16 (with its byte order mark, as SQL Server
   Management Studio and Windows PowerShell write them) open as text and
@@ -112,8 +123,8 @@ All notable changes to Pythia are documented here. The format follows
   with its and its columns' options (#409); it was a plain CREATE TABLE.
 - SQL Server: a table's DDL keeps the descriptions (`MS_Description`) of
   the table and its columns (#410), as `sp_addextendedproperty` calls.
-- A SQL window's file that changed on disk (a `git pull` while Pythia
-  was closed) is read again when Pythia starts, unless the window has
+- A SQL window's file that changed on disk (a `git pull` while DbCraft
+  was closed) is read again when DbCraft starts, unless the window has
   changes of its own; saving over such a file asks first (#411). The
   window restored its old text, and Save wrote it over the change.
 - PostgreSQL: a table's DDL keeps its row level security (#373): `alter
@@ -301,7 +312,7 @@ All notable changes to Pythia are documented here. The format follows
 - Editor: Find/Replace *In selection* reads the text around the
   selection (`^`, `$`, `\b`) as `$1` does, and follows the selection
   through replacements (#418). A raw `$1` went in at the selection's
-  edges, and *Replace all* that shortened the text could crash Pythia.
+  edges, and *Replace all* that shortened the text could crash DbCraft.
 - The formatter no longer renames names (#419): on MySQL, tables named
   like keywords (`User`, `Session`) were lowercased with them, another
   table on Linux; and `straße` became `STRASSE` with identifier case
@@ -494,7 +505,7 @@ All notable changes to Pythia are documented here. The format follows
   CURRENT_TIMESTAMP` and a spatial column's SRID (#483).
 - The result grid's filter finds what the cells show: NULLs by the text
   the grid writes for them, binary values with their `0x` (#478).
-- Pythia starts while a window's file is on a share that doesn't answer:
+- DbCraft starts while a window's file is on a share that doesn't answer:
   the windows' files are checked for changes on a thread of their own,
   after the window is up (#479).
 - PostgreSQL: a partitioned table's partitions are listed among the
@@ -2891,16 +2902,16 @@ First release.
 - Scheduler jobs window: run, stop, enable, disable, drop, run history.
 - Saved user reports with parameters.
 
-[Unreleased]: https://github.com/ortic/pythia/compare/v0.11.0...HEAD
-[0.11.0]: https://github.com/ortic/pythia/compare/v0.10.0...v0.11.0
-[0.10.0]: https://github.com/ortic/pythia/compare/v0.9.0...v0.10.0
-[0.9.0]: https://github.com/ortic/pythia/compare/v0.8.0...v0.9.0
-[0.8.0]: https://github.com/ortic/pythia/compare/v0.7.0...v0.8.0
-[0.7.0]: https://github.com/ortic/pythia/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/ortic/pythia/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/ortic/pythia/compare/v0.4.1...v0.5.0
-[0.4.1]: https://github.com/ortic/pythia/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/ortic/pythia/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/ortic/pythia/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/ortic/pythia/releases/tag/v0.2.0
-[0.1.0]: https://github.com/ortic/pythia/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ortic/dbcraft/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ortic/dbcraft/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/ortic/dbcraft/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/ortic/dbcraft/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/ortic/dbcraft/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/ortic/dbcraft/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/ortic/dbcraft/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/ortic/dbcraft/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/ortic/dbcraft/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/ortic/dbcraft/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/ortic/dbcraft/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/ortic/dbcraft/releases/tag/v0.2.0
+[0.1.0]: https://github.com/ortic/dbcraft/releases/tag/v0.1.0

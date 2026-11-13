@@ -1,0 +1,15562 @@
+//! Renders the real app offscreen (wgpu) into PNGs for visual review.
+//!
+//! Skipped unless `DBCRAFT_SCREENSHOT_DIR` is set. With `DBCRAFT_TEST_DB`
+//! (`user/password@connect_string`) the scenarios connect to a database:
+//!
+//! ```text
+//! DBCRAFT_SCREENSHOT_DIR=/tmp/shots DBCRAFT_TEST_DB=dbcraft/dbcraft@localhost:1521/FREEPDB1 \
+//!   cargo test -p dbcraft-app screenshots -- --nocapture
+//! ```
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use dbcraft_config::{ConnectionProfile, Privilege};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+
+use crate::app::DbCraftApp;
+use crate::documents::{ObjectRef, OpenRequest};
+
+fn out_dir() -> Option<PathBuf> {
+    std::env::var_os("DBCRAFT_SCREENSHOT_DIR").map(PathBuf::from)
+}
+
+/// How many UI tests run side by side. Each holds a few database sessions,
+/// and Oracle Free has 200 processes (ORA-12516 beyond).
+const UI_SLOTS: usize = 4;
+
+/// UI tests run side by side, [`UI_SLOTS`] at a time (#139). A test on
+/// state the others see (the debug scenario, the schema's invalid objects)
+/// runs alone, and so does every test that renders or uses OCI sessions
+/// (the thick driver): many wgpu renderers and OCI sessions in one test
+/// process crash intermittently (SIGSEGV) when they run in parallel.
+static UI_LOCK: UiLock = UiLock {
+    state: std::sync::Mutex::new(UiState {
+        shared: 0,
+        alone: false,
+        waiting_alone: 0,
+    }),
+    changed: std::sync::Condvar::new(),
+};
+
+struct UiLock {
+    state: std::sync::Mutex<UiState>,
+    changed: std::sync::Condvar,
+}
+
+struct UiState {
+    /// Tests running side by side.
+    shared: usize,
+    /// A test running alone.
+    alone: bool,
+    /// Tests waiting to run alone: no new ones start beside the others
+    /// meanwhile.
+    waiting_alone: usize,
+}
+
+impl UiLock {
+    fn state(&self) -> std::sync::MutexGuard<'_, UiState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait_while(&self, busy: impl Fn(&UiState) -> bool) -> std::sync::MutexGuard<'_, UiState> {
+        let mut state = self.state();
+        while busy(&state) {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state
+    }
+
+    fn shared(&'static self) -> UiGuard {
+        let mut state = self.wait_while(|s| s.alone || s.waiting_alone > 0 || s.shared >= UI_SLOTS);
+        state.shared += 1;
+        UiGuard { alone: false }
+    }
+
+    fn alone(&'static self) -> UiGuard {
+        self.state().waiting_alone += 1;
+        let mut state = self.wait_while(|s| s.alone || s.shared > 0);
+        state.waiting_alone -= 1;
+        state.alone = true;
+        UiGuard { alone: true }
+    }
+}
+
+/// A test's place in [`UI_LOCK`], given back when the test ends (also when
+/// it fails).
+struct UiGuard {
+    alone: bool,
+}
+
+impl Drop for UiGuard {
+    fn drop(&mut self) {
+        let mut state = UI_LOCK.state();
+        if self.alone {
+            state.alone = false;
+        } else {
+            state.shared -= 1;
+        }
+        UI_LOCK.changed.notify_all();
+    }
+}
+
+/// A harness holding its place in the UI lock for the test's duration.
+struct Ui {
+    harness: Harness<'static, DbCraftApp>,
+    lock: Option<UiGuard>,
+}
+
+impl Ui {
+    /// Runs the rest of the test with no other UI test beside it: for
+    /// tests on state the others see or change.
+    fn alone(mut self) -> Self {
+        if !self.lock.as_ref().is_some_and(|l| l.alone) {
+            self.lock = None;
+            self.lock = Some(UI_LOCK.alone());
+        }
+        self
+    }
+}
+
+impl std::ops::Deref for Ui {
+    type Target = Harness<'static, DbCraftApp>;
+    fn deref(&self) -> &Self::Target {
+        &self.harness
+    }
+}
+
+impl std::ops::DerefMut for Ui {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.harness
+    }
+}
+
+/// A harness with the renderer only when screenshots are written: tests
+/// that drive the UI and query it also run where no GPU adapter is
+/// available (the Linux CI runner).
+fn harness(dark: bool) -> Ui {
+    locked(dark, out_dir().is_some())
+}
+
+/// A harness in the light theme.
+fn headless_harness() -> Ui {
+    harness(false)
+}
+
+fn locked(dark: bool, render: bool) -> Ui {
+    locked_sized(dark, render, egui::vec2(1440.0, 900.0))
+}
+
+/// A harness of `size` (logical pixels), e.g. a small window.
+fn sized_harness(size: egui::Vec2) -> Ui {
+    locked_sized(true, out_dir().is_some(), size)
+}
+
+fn locked_sized(dark: bool, render: bool, size: egui::Vec2) -> Ui {
+    let lock = if render || dbcraft_db::THICK {
+        UI_LOCK.alone()
+    } else {
+        UI_LOCK.shared()
+    };
+    Ui {
+        harness: new_harness(dark, render, size),
+        lock: Some(lock),
+    }
+}
+
+fn new_harness(dark: bool, render: bool, size: egui::Vec2) -> Harness<'static, DbCraftApp> {
+    let builder = Harness::builder()
+        .with_size(size)
+        .with_pixels_per_point(1.5);
+    let builder = if render { builder.wgpu() } else { builder };
+    let mut harness = builder.build_eframe(|cc| DbCraftApp::new(cc, None));
+    // Scenes start without the connect dialog DbCraft opens on start.
+    harness.state_mut().test_close_connect();
+    harness.ctx.set_theme(if dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
+    harness
+}
+
+fn save(harness: &mut Harness<'_, DbCraftApp>, name: &str) {
+    let Some(dir) = out_dir() else { return };
+    std::fs::create_dir_all(&dir).unwrap();
+    harness.run_steps(4);
+    let image = harness.render().expect("render");
+    let path = dir.join(format!("{name}.png"));
+    image.save(&path).unwrap();
+    eprintln!("wrote {}", path.display());
+}
+
+/// A file that exists on every platform but isn't a font (`/etc/hostname`
+/// is missing on macOS and Windows), named after the test using it.
+fn not_a_font(test: &str) -> String {
+    let path = std::env::temp_dir().join(format!("dbcraft-{test}-{}.ttf", std::process::id()));
+    std::fs::write(&path, "not a font").unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// Steps the app until `done` holds (DB events arrive on other threads).
+fn wait_until(
+    harness: &mut Harness<'_, DbCraftApp>,
+    what: &str,
+    done: impl Fn(&DbCraftApp) -> bool,
+) {
+    let start = Instant::now();
+    while !done(harness.state()) {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "timed out waiting for {what}"
+        );
+        harness.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    harness.run_steps(3);
+}
+
+/// Clicks `label`, a button that connects, and runs the frames that take
+/// the click. The first session of a test run may wait there, in the UI
+/// thread, while another run has the test databases (#100): that wait
+/// isn't one of [`wait_until`]'s, whose 60 s it used up.
+fn click_to_connect(harness: &mut Harness<'_, DbCraftApp>, label: &str) {
+    harness.get_by_label(label).click();
+    harness.step();
+}
+
+/// The test database's profile (`DBCRAFT_TEST_DB`), with the demo schema in
+/// place.
+fn profile() -> Option<(ConnectionProfile, String)> {
+    let spec = std::env::var("DBCRAFT_TEST_DB").ok()?;
+    crate::test_db::demo_schema();
+    let (credentials, connect_string) = spec.rsplit_once('@')?;
+    let (username, password) = credentials.split_once('/')?;
+    Some((
+        ConnectionProfile {
+            name: "dbcraft@FREEPDB1".into(),
+            username: username.into(),
+            connect_string: connect_string.into(),
+            privilege: Privilege::Normal,
+            color: Some([0x3b, 0x82, 0xf6]),
+            ..Default::default()
+        },
+        password.into(),
+    ))
+}
+
+const QUERY: &str = "-- Salary overview per department
+select d.department_name,
+       count(*)                 as employees,
+       round(avg(e.salary), 2)  as avg_salary,
+       max(e.hire_date)         as last_hire
+  from demo_employees e
+  join demo_departments d on d.department_id = e.department_id
+ group by d.department_name
+ order by avg_salary desc;
+
+select * from demo_employees where salary > 9000 order by salary desc;
+";
+
+#[test]
+fn screenshots() {
+    if out_dir().is_none() {
+        eprintln!("DBCRAFT_SCREENSHOT_DIR not set, skipping");
+        return;
+    }
+    for dark in [true, false] {
+        let suffix = if dark { "dark" } else { "light" };
+        let mut h = harness(dark);
+        h.run_steps(3);
+        save(&mut h, &format!("01-start-{suffix}"));
+        h.state_mut().test_settings(true);
+        h.run_steps(4);
+        save(&mut h, &format!("00-settings-formatter-{suffix}"));
+        h.state_mut().test_close_settings();
+        let sample = |name: &str, folder: &str, color: Option<[u8; 3]>, production: bool| {
+            ConnectionProfile {
+                name: name.into(),
+                folder: folder.into(),
+                username: "app".into(),
+                connect_string: format!(
+                    "{}.db.example.com:1521/SVC",
+                    name.to_lowercase().replace(' ', "-")
+                ),
+                color,
+                production,
+                ..Default::default()
+            }
+        };
+        h.state_mut().test_show_connections(vec![
+            sample("Local dev", "", Some([0x22, 0xc5, 0x5e]), false),
+            sample("Acme test", "acme", Some([0xea, 0xb3, 0x08]), false),
+            sample("Acme prod", "acme", None, true),
+            sample("Globex QA", "globex", Some([0xa8, 0x55, 0xf7]), false),
+        ]);
+        h.run_steps(4);
+        save(&mut h, &format!("00-connect-{suffix}"));
+        h.state_mut().test_close_connect();
+
+        let Some((profile, password)) = profile() else {
+            continue;
+        };
+        h.state_mut().test_connect(profile, password);
+        wait_until(&mut h, "connection", |app| app.test_connected());
+
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "dbcraft@FREEPDB1".into(),
+            text: QUERY.into(),
+            run: true,
+        });
+        wait_until(&mut h, "query", |app| !app.test_focused_busy());
+        h.state_mut().test_expand_browser(&[
+            dbcraft_db::ObjectType::Table,
+            dbcraft_db::ObjectType::Package,
+        ]);
+        wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+        save(&mut h, &format!("02-sql-window-{suffix}"));
+        if dark {
+            h.state_mut()
+                .test_command(crate::commands::Command::ExplainPlan);
+            wait_until(&mut h, "plan", |app| {
+                app.test_sql_window_ref()
+                    .is_some_and(|w| w.state.plan.as_ref().is_some_and(|p| p.result.is_some()))
+            });
+            save(&mut h, "13-plan-dark");
+            h.state_mut()
+                .test_command(crate::commands::Command::ExecuteWithStatistics);
+            wait_until(&mut h, "statistics", |app| !app.test_focused_busy());
+            save(&mut h, "14-statistics-dark");
+        }
+
+        let object = |name: &str, t| ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: name.into(),
+            object_type: t,
+        };
+        h.state_mut().test_open(OpenRequest::Program {
+            connection: "dbcraft@FREEPDB1".into(),
+            object: object("DEMO_PKG", dbcraft_db::ObjectType::PackageBody),
+        });
+        wait_until(&mut h, "package source", |app| !app.test_focused_busy());
+        save(&mut h, &format!("03-program-window-{suffix}"));
+
+        h.state_mut().test_open(OpenRequest::Program {
+            connection: "dbcraft@FREEPDB1".into(),
+            object: object("DEMO_BROKEN", dbcraft_db::ObjectType::Procedure),
+        });
+        wait_until(&mut h, "procedure source", |app| !app.test_focused_busy());
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "compile", |app| !app.test_focused_busy());
+        save(&mut h, &format!("04-compile-errors-{suffix}"));
+
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: "dbcraft@FREEPDB1".into(),
+            object: object("DEMO_EMPLOYEES", dbcraft_db::ObjectType::Table),
+        });
+        wait_until(&mut h, "columns", |app| !app.test_focused_busy());
+        save(&mut h, &format!("05-object-view-{suffix}"));
+
+        h.state_mut().test_open(OpenRequest::Monitor {
+            connection: "dbcraft@FREEPDB1".into(),
+            start: crate::monitor_window::MonitorStart::Dashboard,
+        });
+        for _ in 0..3 {
+            wait_until(&mut h, "monitor", |app| !app.test_focused_busy());
+        }
+        save(&mut h, &format!("07-monitor-{suffix}"));
+
+        h.state_mut()
+            .test_command(crate::commands::Command::CompareSchemas);
+        h.run_steps(5);
+        save(&mut h, &format!("09-compare-{suffix}"));
+
+        h.state_mut()
+            .test_command(crate::commands::Command::FindInSource);
+        h.run_steps(3);
+        h.state_mut().test_search_source("salary");
+        wait_until(&mut h, "source search", |app| !app.test_focused_busy());
+        save(&mut h, &format!("10-source-search-{suffix}"));
+
+        if dark {
+            h.state_mut()
+                .test_command(crate::commands::Command::SearchData);
+            h.run_steps(3);
+            h.state_mut().test_search_data("Basel", false);
+            wait_until(&mut h, "data search", |app| !app.test_focused_busy());
+            let hits = h.state().test_data_hits();
+            assert!(
+                hits.contains(&"DEMO_DEPARTMENTS.LOCATION=1".to_owned()),
+                "{hits:?}"
+            );
+            save(&mut h, "15-data-search-dark");
+            h.state_mut().test_search_data("sal", true);
+            wait_until(&mut h, "column search", |app| !app.test_focused_busy());
+            let hits = h.state().test_data_hits();
+            assert!(
+                hits.contains(&"DEMO_EMPLOYEES.SALARY=0".to_owned()),
+                "{hits:?}"
+            );
+            h.state_mut().test_open(OpenRequest::EditTable {
+                connection: "dbcraft@FREEPDB1".into(),
+                object: object("DEMO_EMPLOYEES", dbcraft_db::ObjectType::Table),
+                tab: crate::table_editor::TableTab::Columns,
+            });
+            wait_until(&mut h, "table definition", |app| !app.test_focused_busy());
+            save(&mut h, "16-table-editor-dark");
+        }
+    }
+}
+
+/// The Schema of Export tables, Search data and Search source takes a
+/// quoted name as written and others in uppercase, as Oracle reads names:
+/// a schema "r71_schema" is found by `"r71_schema"` (#337).
+#[test]
+fn schemas_are_taken_as_typed() {
+    let (Some((profile, password)), Some(dba)) =
+        (profile(), crate::test_db::connect("DBCRAFT_TEST_DB_DBA"))
+    else {
+        eprintln!("DBCRAFT_TEST_DB / DBCRAFT_TEST_DB_DBA not set, skipping");
+        return;
+    };
+    let user = profile.username.to_uppercase();
+    let _ = dba.execute("drop user \"r71_schema\" cascade", &[]);
+    for sql in [
+        "create user \"r71_schema\" no authentication quota unlimited on users".to_owned(),
+        "create table \"r71_schema\".r71_t (name varchar2(20))".to_owned(),
+        "insert into \"r71_schema\".r71_t values ('r71_needle')".to_owned(),
+        "commit".to_owned(),
+        format!("grant select on \"r71_schema\".r71_t to {user}"),
+        "create procedure \"r71_schema\".r71_p is begin null; -- r71_needle\nend;".to_owned(),
+        format!("grant execute on \"r71_schema\".r71_p to {user}"),
+    ] {
+        dba.execute(&sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let typed = "\"r71_schema\"";
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    let folder = std::env::temp_dir().join(format!("dbcraft-r71-export-{}", std::process::id()));
+    let export = h.state_mut().test_export_tables();
+    export.owner = typed.into();
+    export.folder = Some(folder.clone());
+    h.get_by_label("Reload").click();
+    h.run_steps(3);
+    wait_until(&mut h, "tables of the schema", |app| {
+        !app.test_focused_busy()
+    });
+    assert_eq!(h.query_all_by_label("r71_t").count(), 1);
+    h.get_by_label("Select all").click();
+    h.run_steps(2);
+    let effects = h.state_mut().test_export_tables().start_now();
+    h.state_mut().test_apply_focused(effects);
+    wait_until(&mut h, "export", |app| !app.test_focused_busy());
+    let message = h.state_mut().test_export_tables().message().cloned();
+    assert!(
+        matches!(&message, Some((false, m)) if m.starts_with("Exported 1 rows from 1 table(s)")),
+        "{message:?}"
+    );
+    let csv = std::fs::read_to_string(folder.join("r71_t.csv")).unwrap();
+    assert!(csv.contains("r71_needle"), "{csv}");
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::SearchData);
+    h.run_steps(3);
+    h.state_mut().test_data_search().owner = typed.into();
+    h.state_mut().test_search_data("r71_needle", false);
+    wait_until(&mut h, "data search", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_data_hits(), ["R71_T.NAME=1"]);
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::FindInSource);
+    h.run_steps(3);
+    h.state_mut().test_source_search().owner = typed.into();
+    h.state_mut().test_search_source("r71_needle");
+    wait_until(&mut h, "source search", |app| !app.test_focused_busy());
+    assert!(
+        h.query_by_label_contains("r71_schema.R71_P").is_some(),
+        "no hit in r71_p"
+    );
+    h.state_mut().test_close_focused();
+
+    dba.execute("drop user \"r71_schema\" cascade", &[])
+        .unwrap();
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
+/// Edits a result in the grid, applies it, and checks that a row changed by
+/// another session in the meantime is reported as a conflict.
+#[test]
+fn data_editing() {
+    let Some((profile, password)) = profile() else {
+        eprintln!("DBCRAFT_TEST_DB not set, skipping");
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let conn = "dbcraft@FREEPDB1".to_string();
+    let setup = "begin execute immediate 'drop table dbcraft_edit_t purge'; exception when others then null; end;\n/\n\
+                 create table dbcraft_edit_t (id number primary key, name varchar2(20), hired date);\n\
+                 insert into dbcraft_edit_t values (1, 'one', date '2020-01-01');\n\
+                 insert into dbcraft_edit_t values (2, 'two', null);\n\
+                 commit;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: conn.clone(),
+        text: setup.into(),
+        run: true,
+    });
+    wait_until(&mut h, "setup", |app| !app.test_focused_busy());
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: conn.clone(),
+        text: "select * from dbcraft_edit_t order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let grid_window = h.state().test_focused();
+    // INSERTs of these rows go into the table they come from (#158).
+    let options = h.state_mut().test_sql_window().state.results[0]
+        .grid
+        .export_options();
+    assert_eq!(options.table, "dbcraft_edit_t");
+
+    let cx = |app: &mut DbCraftApp| {
+        let (id, settings, connection) = app.test_cx();
+        (id, settings, connection)
+    };
+    let start_edit = |h: &mut Harness<'_, DbCraftApp>| {
+        let (id, settings, connection) = cx(h.state_mut());
+        let app = h.state_mut();
+        let cx = crate::documents::DocContext {
+            id,
+            settings: &settings,
+            connected: true,
+            fetch_size: 100,
+            connection,
+            catalog: None,
+            catalog_revision: 0,
+            connections: &[],
+            debug: None,
+            marks: None,
+            privilege: None,
+            dialect: Default::default(),
+            mariadb: false,
+            read_only: false,
+            production: false,
+        };
+        let effects = app.test_sql_window().start_editing(0, &cx);
+        app.test_apply(effects);
+    };
+    start_edit(&mut h);
+    wait_until(&mut h, "editable query", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable(), "result should be editable");
+        assert_eq!(r.columns.last().unwrap().type_name, "ROWID");
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 0, 1, Some("uno".into()));
+        r.grid
+            .edit_cell(&rows, 1, 2, Some("2021-02-03 04:05:06".into()));
+    }
+    save(&mut h, "06-editing-dark");
+    // The single record view shows the pending values and edits them too
+    // (#141).
+    h.state_mut().test_sql_window().state.results[0]
+        .grid
+        .record_view = true;
+    h.run_steps(2);
+    save(&mut h, "06-editing-record-dark");
+    // Typing on a field replaces its value, Enter keeps it.
+    h.get_by_label("uno").click();
+    h.run();
+    h.event(egui::Event::Text("eins".into()));
+    h.run();
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    {
+        let r = &mut h.state_mut().test_sql_window().state.results[0];
+        let changes = r.grid.changes().unwrap();
+        assert_eq!(changes.updates[&0][&1].as_deref(), Some("eins"));
+        r.grid.record_view = false;
+    }
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.open_value_editor(&rows, (0, 2));
+    }
+    h.run_steps(3);
+    save(&mut h, "06-editing-date-dark");
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        // Closing without Apply leaves the cell alone.
+        r.grid.close_value_editor();
+        assert_eq!(
+            r.grid.changes().unwrap().updates[&0].get(&2),
+            None,
+            "{rows:?}"
+        );
+    }
+    let apply = |h: &mut Harness<'_, DbCraftApp>| {
+        let (id, settings, connection) = cx(h.state_mut());
+        let app = h.state_mut();
+        let cx = crate::documents::DocContext {
+            id,
+            settings: &settings,
+            connected: true,
+            fetch_size: 100,
+            connection,
+            catalog: None,
+            catalog_revision: 0,
+            connections: &[],
+            debug: None,
+            marks: None,
+            privilege: None,
+            dialect: Default::default(),
+            mariadb: false,
+            read_only: false,
+            production: false,
+        };
+        let effects = app.test_sql_window().apply_changes(0, &cx);
+        app.test_apply(effects);
+    };
+    apply(&mut h);
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("Changes applied")),
+            "{messages:?}"
+        );
+        let r = &w.state.results[0];
+        assert_eq!(r.rows[0][1].as_deref(), Some("eins"));
+        assert_eq!(r.rows[1][2].as_deref(), Some("2021-02-03 04:05:06"));
+        assert!(r.grid.changes().is_some_and(|c| c.is_empty()));
+    }
+    assert!(
+        h.state().test_pending_tx(),
+        "applied changes stay in the open transaction"
+    );
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+
+    // Another session changes row 2 behind our back; editing it must conflict.
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: conn.clone(),
+        text: "update dbcraft_edit_t set name = 'changed' where id = 2;\ncommit;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "concurrent update", |app| !app.test_focused_busy());
+    h.state_mut().test_close_focused();
+    h.state_mut().test_focus(grid_window);
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 1, Some("mine".into()));
+    }
+    apply(&mut h);
+    wait_until(&mut h, "conflicting apply", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+    assert!(
+        messages.iter().any(|m| m.starts_with("Conflict on row 2")),
+        "{messages:?}"
+    );
+}
+
+/// Edits MySQL results (`DBCRAFT_TEST_MYSQL`, #101): rows are found by the
+/// table's key, selected or not; values MySQL takes as they are (a date
+/// for a DATETIME) aren't conflicts, rows changed by another session are;
+/// tables without a key and grouped results stay read-only.
+#[test]
+fn mysql_data_editing() {
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    // MySQL keeps JSON as a document of its own: a value typed with
+    // `\u00e9` reads `é`. MariaDB's JSON is text, kept as it was typed.
+    let mariadb =
+        crate::test_db::run_on("DBCRAFT_TEST_MYSQL", dbcraft_config::DbKind::MySql, |c| {
+            c.query("select version()", &[]).unwrap()[0][0].clone()
+        })
+        .flatten()
+        .is_some_and(|v| v.contains("MariaDB"));
+    let typed = r#"{"a": [1, "\u00e9"]}"#;
+    let stored = if mariadb {
+        typed
+    } else {
+        r#"{"a": [1, "é"]}"#
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let run = |h: &mut Harness<'_, DbCraftApp>, sql: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        h.state_mut().test_close_focused();
+    };
+    run(
+        &mut h,
+        "drop table if exists dbcraft_edit_t, dbcraft_edit_k, dbcraft_edit_n;\n\
+         create table dbcraft_edit_t (id int auto_increment primary key, name varchar(20), \
+           born datetime, doc json, price float);\n\
+         insert into dbcraft_edit_t (name, born, doc, price) values \
+           ('one', '2020-01-01 00:00:00', '{\"a\": 1}', 123456.789), ('two', null, null, 1.1);\n\
+         create table dbcraft_edit_k (a int not null, b varchar(5) not null, v int, \
+           unique key (a, b));\n\
+         insert into dbcraft_edit_k values (1, 'x', 10), (1, 'y', 20);\n\
+         create table dbcraft_edit_n (x int);\n\
+         insert into dbcraft_edit_n values (1);\n\
+         commit;\n",
+    );
+    let query = |h: &mut Harness<'_, DbCraftApp>, sql: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+        wait_until(h, "editing", |app| !app.test_focused_busy());
+    };
+    let apply = |h: &mut Harness<'_, DbCraftApp>| {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+    };
+    let messages = |h: &mut Harness<'_, DbCraftApp>| -> Vec<String> {
+        let w = h.state_mut().test_sql_window();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+
+    // The key isn't selected: DbCraft adds it, read-only, at the end.
+    query(
+        &mut h,
+        "select name, born, doc, price from dbcraft_edit_t order by id",
+    );
+    let grid_window = h.state().test_focused();
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(
+            r.grid.is_editable(),
+            "{:?}",
+            w.state.messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["name", "born", "doc", "price", "dbcraft$id"]);
+        assert_eq!(r.rows[0][3].as_deref(), Some("123457"));
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 0, 0, Some(r"C:\new 'one'".into()));
+        r.grid.edit_cell(&rows, 0, 2, Some(typed.into()));
+        // Shown rounded, still found.
+        r.grid.edit_cell(&rows, 0, 3, Some("2.5".into()));
+        r.grid.edit_cell(&rows, 1, 4, Some("99".into()));
+        r.grid
+            .edit_cell(&rows, 1, 1, Some("2021-02-03 04:05:06".into()));
+    }
+    save(&mut h, "mysql-editing");
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("Changes applied")),
+        "{texts:?}"
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert_eq!(r.rows[0][0].as_deref(), Some(r"C:\new 'one'"));
+        assert_eq!(r.rows[0][1].as_deref(), Some("2020-01-01 00:00:00"));
+        assert_eq!(r.rows[0][2].as_deref(), Some(stored));
+        assert_eq!(r.rows[0][3].as_deref(), Some("2.5"));
+        assert_eq!(r.rows[1][1].as_deref(), Some("2021-02-03 04:05:06"));
+        assert_eq!(
+            r.rows[1][4].as_deref(),
+            Some("2"),
+            "the key can't be edited"
+        );
+        // A new row (the key from AUTO_INCREMENT), a deleted one, and the
+        // same value written differently: its UPDATE changes nothing but
+        // finds the row, which isn't a conflict.
+        let rows = r.rows.clone();
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 2, 0, Some("three".into()));
+        r.grid.delete_row(&rows, 1);
+        r.grid.edit_cell(&rows, 0, 1, Some("2020-01-01".into()));
+    }
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(!texts.iter().any(|m| m.contains("Conflict")), "{texts:?}");
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &w.state.results[0];
+        let names: Vec<Option<&str>> = r.rows.iter().map(|row| row[0].as_deref()).collect();
+        assert_eq!(names, [Some(r"C:\new 'one'"), Some("three")]);
+        assert_eq!(r.rows[0][1].as_deref(), Some("2020-01-01 00:00:00"));
+    }
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+
+    // Another session changes the row behind our back.
+    run(
+        &mut h,
+        "update dbcraft_edit_t set name = 'theirs' where name = 'three';\ncommit;",
+    );
+    h.state_mut().test_focus(grid_window);
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 0, Some("mine".into()));
+    }
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.starts_with("Conflict on row 2")),
+        "{texts:?}"
+    );
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
+    // A unique key on NOT NULL columns does, too.
+    query(
+        &mut h,
+        "select v from dbcraft_edit_k k where a = 1 order by b",
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["v", "dbcraft$a", "dbcraft$b"]);
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 0, Some("21".into()));
+    }
+    apply(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        let values: Vec<Option<&str>> = w.state.results[0]
+            .rows
+            .iter()
+            .map(|r| r[0].as_deref())
+            .collect();
+        assert_eq!(values, [Some("10"), Some("21")]);
+    }
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
+    // Without a key, rows can't be found again.
+    query(&mut h, "select * from dbcraft_edit_n");
+    let texts = messages(&mut h);
+    assert!(
+        texts
+            .iter()
+            .any(|m| m.starts_with("The rows of dbcraft_edit_n can't be edited")),
+        "{texts:?}"
+    );
+    assert!(
+        !h.state_mut().test_sql_window().state.results[0]
+            .grid
+            .is_editable()
+    );
+    h.state_mut().test_close_focused();
+
+    // A count isn't a row of the table.
+    query(&mut h, "select count(*) from dbcraft_edit_t");
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("can't be edited")),
+        "{texts:?}"
+    );
+    assert!(
+        !h.state_mut().test_sql_window().state.results[0]
+            .grid
+            .is_editable()
+    );
+    h.state_mut().test_close_focused();
+
+    run(
+        &mut h,
+        "drop table dbcraft_edit_t, dbcraft_edit_k, dbcraft_edit_n;",
+    );
+}
+
+/// *Edit* of a MySQL object whose new version fails (`DBCRAFT_TEST_MYSQL`,
+/// #240): the script dropped it first, so it was gone, and the
+/// drop revoked the grants on a routine. MariaDB replaces routines,
+/// triggers and views in place, MySQL views: the object stays as it was, a
+/// routine with its grant (given with `DBCRAFT_TEST_MYSQL_DBA`). MySQL drops
+/// its routines and triggers first still, as their script says.
+#[test]
+fn mysql_edit_keeps_what_fails() {
+    use crate::browser::ObjectAction;
+    use dbcraft_db::ObjectType;
+
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let database = connect_string.split_once('/').unwrap().1.to_owned();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mariadb =
+        crate::test_db::run_on("DBCRAFT_TEST_MYSQL", dbcraft_config::DbKind::MySql, |c| {
+            c.query("select version()", &[]).unwrap()[0][0].clone()
+        })
+        .flatten()
+        .is_some_and(|v| v.contains("MariaDB"));
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let run = |h: &mut Harness<'_, DbCraftApp>, sql: &str| -> Vec<String> {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let rows = w
+            .state
+            .results
+            .first()
+            .map(|r| r.rows.clone())
+            .unwrap_or_default();
+        h.state_mut().test_close_focused();
+        rows.iter()
+            .map(|r| r[0].clone().unwrap_or_default())
+            .collect()
+    };
+    run(
+        &mut h,
+        "drop view if exists dbcraft_replace_v;\n\
+         drop procedure if exists dbcraft_replace_p;\n\
+         drop table if exists dbcraft_replace_t;\n\
+         create table dbcraft_replace_t (n int);\n\
+         create view dbcraft_replace_v as select 1 as a;\n\
+         create procedure dbcraft_replace_p() select 1;\n\
+         create trigger dbcraft_replace_g before insert on dbcraft_replace_t for each row \
+           set new.n = 1;\n",
+    );
+    let grant =
+        format!("grant execute on procedure {database}.dbcraft_replace_p to dbcraft_replace_u");
+    let granted = crate::test_db::run_on(
+        "DBCRAFT_TEST_MYSQL_DBA",
+        dbcraft_config::DbKind::MySql,
+        move |c| {
+            let _ = c.execute("drop user if exists dbcraft_replace_u");
+            c.execute("create user dbcraft_replace_u identified by 'Pw-replace-1'")
+                .unwrap();
+            c.execute(&grant).unwrap();
+        },
+    )
+    .is_some();
+    let grants = || {
+        crate::test_db::run_on(
+            "DBCRAFT_TEST_MYSQL_DBA",
+            dbcraft_config::DbKind::MySql,
+            |c| {
+                let rows = c.query("show grants for dbcraft_replace_u", &[]).unwrap();
+                rows.iter().any(|r| {
+                    r[0].as_deref()
+                        .is_some_and(|g| g.contains("dbcraft_replace_p"))
+                })
+            },
+        )
+    };
+    let exists = |h: &mut Harness<'_, DbCraftApp>, object_type: ObjectType, name: &str| {
+        let sql = match object_type {
+            ObjectType::View => {
+                "select count(*) from information_schema.views \
+                 where table_schema = database() and table_name = '{}'"
+            }
+            ObjectType::Procedure => {
+                "select count(*) from information_schema.routines \
+                 where routine_schema = database() and routine_name = '{}'"
+            }
+            _ => {
+                "select count(*) from information_schema.triggers \
+                 where trigger_schema = database() and trigger_name = '{}'"
+            }
+        };
+        run(h, &sql.replace("{}", name)) == ["1"]
+    };
+    let objects = [
+        (
+            ObjectType::View,
+            "dbcraft_replace_v",
+            "select 1 AS `a`",
+            "select 2 AS `a`",
+        ),
+        (
+            ObjectType::Procedure,
+            "dbcraft_replace_p",
+            "select 1",
+            "select 2",
+        ),
+        (
+            ObjectType::Trigger,
+            "dbcraft_replace_g",
+            "set new.n = 1",
+            "set new.n = 2",
+        ),
+    ];
+    for (object_type, name, old, new) in objects {
+        // Creating a trigger takes SUPER where the server logs binary (1419).
+        if !exists(&mut h, object_type, name) {
+            eprintln!("{name} wasn't created: skipped");
+            continue;
+        }
+        let object = ObjectRef {
+            owner: database.clone(),
+            name: name.into(),
+            object_type,
+        };
+        h.state_mut()
+            .test_object_action("shop", ObjectAction::Edit(object));
+        wait_until(&mut h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        let in_place = mariadb || object_type == ObjectType::View;
+        assert_eq!(!script.contains("drop "), in_place, "{script}");
+        assert!(script.contains(old), "{script}");
+        // A version that fails: the object stays as it was where it is
+        // replaced in place.
+        let failing = script.replace(old, &old.replacen("se", "sx", 1));
+        h.state_mut().test_sql_window().editor.set_text(failing);
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "the failing version", |app| {
+            !app.test_focused_busy()
+        });
+        let texts: Vec<String> = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(texts.iter().any(|m| m.contains("1064")), "{texts:?}");
+        h.state_mut().test_close_focused();
+        assert_eq!(exists(&mut h, object_type, name), in_place, "{name}");
+        if object_type == ObjectType::Procedure && granted {
+            assert_eq!(grants(), Some(in_place), "{name}");
+        }
+        // The new version that works replaces it.
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: script.replace(old, new),
+            run: true,
+        });
+        wait_until(&mut h, "the new version", |app| !app.test_focused_busy());
+        h.state_mut().test_close_focused();
+        assert!(exists(&mut h, object_type, name), "{name}");
+        if object_type == ObjectType::Procedure && granted {
+            assert_eq!(grants(), Some(in_place), "{name}");
+        }
+    }
+    let rows = run(&mut h, "select * from dbcraft_replace_v");
+    assert_eq!(rows, ["2"]);
+    run(
+        &mut h,
+        "drop view dbcraft_replace_v;\ndrop procedure dbcraft_replace_p;\ndrop table dbcraft_replace_t;",
+    );
+    crate::test_db::run_on(
+        "DBCRAFT_TEST_MYSQL_DBA",
+        dbcraft_config::DbKind::MySql,
+        |c| {
+            let _ = c.execute("drop user if exists dbcraft_replace_u");
+        },
+    );
+}
+
+/// *Edit* of an object outside the current database or schema creates it
+/// again where it was (#248). MySQL's script dropped a routine or trigger
+/// in its database and created it in the current one; SQLite's dropped a
+/// view, trigger or index of an attached database and created it in
+/// `main`; SQL Server's created a routine stored without its schema in
+/// the default one. A new version (`select 2`) runs where the old one was.
+/// PostgreSQL's DDL names the schema already.
+#[test]
+fn edit_creates_the_object_where_it_was() {
+    use crate::browser::ObjectAction;
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+
+    // Edits `object` on `connection`: runs its script with `old` made
+    // `new`, and gives the messages.
+    let edit = |h: &mut Harness<'_, DbCraftApp>,
+                connection: &str,
+                object: ObjectRef,
+                old: &str,
+                new: &str|
+     -> Vec<String> {
+        let name = object.name.clone();
+        h.state_mut()
+            .test_object_action(connection, ObjectAction::Edit(object));
+        wait_until(h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(&name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        assert!(script.contains(old), "{script}");
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text(script.replace(old, new));
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the script to run", |app| !app.test_focused_busy());
+        let messages = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        h.state_mut().test_close_focused();
+        messages
+    };
+    let object = |owner: &str, name: &str, object_type| ObjectRef {
+        owner: owner.into(),
+        name: name.into(),
+        object_type,
+    };
+    let first = |rows: Vec<Vec<dbcraft_db::Cell>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| r[0].clone().unwrap_or_default())
+            .collect()
+    };
+
+    // MySQL, as a DBA (creating a trigger takes SUPER where the server
+    // logs binary): a routine and a trigger in a database that isn't the
+    // current one.
+    let mysql = "DBCRAFT_TEST_MYSQL_DBA";
+    if let Some(mut h) = connect_to(mysql, "dba", DbKind::MySql) {
+        crate::test_db::run_on(mysql, DbKind::MySql, |c| {
+            for sql in [
+                "drop database if exists r4_edit",
+                "drop procedure if exists r4_p",
+                "create database r4_edit",
+                "create table r4_edit.r4_t (n int)",
+                "create procedure r4_edit.r4_p() select 1",
+                "create trigger r4_edit.r4_g before insert on r4_edit.r4_t for each row \
+                 set new.n = 1",
+            ] {
+                c.execute(sql).unwrap();
+            }
+        });
+        for (o, old, new) in [
+            (
+                object("r4_edit", "r4_p", ObjectType::Procedure),
+                "select 1",
+                "select 2",
+            ),
+            (object("r4_edit", "r4_g", ObjectType::Trigger), "= 1", "= 2"),
+        ] {
+            let messages = edit(&mut h, "dba", o, old, new);
+            assert!(
+                !messages.iter().any(|m| m.contains("ERROR")),
+                "{messages:?}"
+            );
+        }
+        let found = crate::test_db::run_on(mysql, DbKind::MySql, |c| {
+            let rows = c
+                .query(
+                    "select concat(routine_schema, ' ', routine_definition) \
+                       from information_schema.routines where routine_name = 'r4_p' \
+                     union all \
+                     select concat(trigger_schema, ' ', action_statement) \
+                       from information_schema.triggers where trigger_name = 'r4_g'",
+                    &[],
+                )
+                .unwrap();
+            for sql in ["drop database r4_edit", "drop procedure if exists r4_p"] {
+                c.execute(sql).unwrap();
+            }
+            rows
+        })
+        .unwrap();
+        assert_eq!(first(found), ["r4_edit select 2", "r4_edit set new.n = 2"]);
+    }
+
+    // SQL Server: a procedure, a view and a trigger of a schema that isn't
+    // the default one, written without it (by a user whose default schema
+    // it is).
+    let mssql = "DBCRAFT_TEST_MSSQL";
+    if let Some(mut h) = connect_to(mssql, "ms", DbKind::SqlServer) {
+        let drops = [
+            "drop trigger if exists r4s.r4_g",
+            "drop view if exists r4s.r4_v",
+            "drop procedure if exists r4s.r4_p",
+            "drop view if exists dbo.r4_v",
+            "drop procedure if exists dbo.r4_p",
+            "drop table if exists r4s.r4_t",
+            "drop user if exists r4_u",
+            "drop schema if exists r4s",
+        ];
+        crate::test_db::run_on(mssql, DbKind::SqlServer, move |c| {
+            for sql in drops {
+                let _ = c.execute(sql);
+            }
+            for sql in [
+                "create schema r4s",
+                "create table r4s.r4_t (n int)",
+                "create user r4_u without login with default_schema = r4s",
+                "grant create procedure, create view to r4_u",
+                "grant alter, select on schema::r4s to r4_u",
+                "execute as user = 'r4_u'",
+                "create procedure r4_p as select 1",
+                "create view r4_v as select n from r4_t where 1 = 1",
+                "create trigger r4_g on r4_t after insert as select 1",
+                "revert",
+            ] {
+                c.execute(sql).unwrap();
+            }
+        });
+        for o in [
+            object("r4s", "r4_p", ObjectType::Procedure),
+            object("r4s", "r4_v", ObjectType::View),
+            object("r4s", "r4_g", ObjectType::Trigger),
+        ] {
+            let messages = edit(&mut h, "ms", o, "1", "2");
+            assert!(!messages.iter().any(|m| m.contains("Msg ")), "{messages:?}");
+        }
+        let found = crate::test_db::run_on(mssql, DbKind::SqlServer, move |c| {
+            let rows = c
+                .query(
+                    "select schema_name(o.schema_id) + ' ' + o.name + ' ' \
+                            + right(rtrim(object_definition(o.object_id)), 1) \
+                       from sys.objects o where o.name in ('r4_p', 'r4_v', 'r4_g') \
+                      order by o.name",
+                    &[],
+                )
+                .unwrap();
+            for sql in drops {
+                c.execute(sql).unwrap();
+            }
+            rows
+        })
+        .unwrap();
+        assert_eq!(first(found), ["r4s r4_g 2", "r4s r4_p 2", "r4s r4_v 2"]);
+    }
+
+    // SQLite: a view, a trigger and an index of an attached database.
+    let dir = std::env::temp_dir().join(format!("dbcraft-edit-where-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let aux = dir.join("aux.db");
+    let profile = ConnectionProfile {
+        name: "lite".into(),
+        kind: DbKind::Sqlite,
+        connect_string: format!("{}?create", dir.join("main.db").display()),
+        login_script: format!("attach database '{}' as aux;", aux.display()),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    run_script(
+        &mut h,
+        "lite",
+        "create table aux.r4_t (n int);
+create view aux.r4_v as select n, 1 as m from r4_t;
+create trigger aux.r4_g after insert on r4_t begin select 1; end;
+create index aux.r4_i on r4_t (n);",
+    );
+    for (o, old, new) in [
+        (object("aux", "r4_v", ObjectType::View), "1 as m", "2 as m"),
+        (
+            object("aux", "r4_g", ObjectType::Trigger),
+            "select 1",
+            "select 2",
+        ),
+        (object("aux", "r4_i", ObjectType::Index), "(n)", "(n desc)"),
+    ] {
+        let messages = edit(&mut h, "lite", o, old, new);
+        assert!(
+            !messages.iter().any(|m| m.contains("no such")),
+            "{messages:?}"
+        );
+    }
+    drop(h);
+    let found = crate::test_db::run_with(DbKind::Sqlite, "", "", &aux.display().to_string(), |c| {
+        c.query(
+            "select name, sql from sqlite_master where name like 'r4%' order by name",
+            &[],
+        )
+        .unwrap()
+    });
+    let found: Vec<String> = found
+        .into_iter()
+        .map(|r| r[1].clone().unwrap_or_default())
+        .collect();
+    assert_eq!(found.len(), 4, "{found:?}");
+    assert!(
+        found[0].contains("r4_g") && found[0].contains("select 2"),
+        "{found:?}"
+    );
+    assert!(found[1].contains("(n desc)"), "{found:?}");
+    assert!(found[3].contains("2 as m"), "{found:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// *Edit* of a MySQL view of another database that reads a table of the
+/// connection's (`DBCRAFT_TEST_MYSQL_DBA`, #285): `SHOW CREATE VIEW` left out
+/// the session's database, so the script, which runs in the view's, read
+/// that table there and failed. The DDL names other databases' tables
+/// with their database, its own database's without.
+#[test]
+fn mysql_edit_of_a_view_reading_other_databases() {
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+
+    let mysql = "DBCRAFT_TEST_MYSQL_DBA";
+    let Some(mut h) = connect_to(mysql, "dba", DbKind::MySql) else {
+        return;
+    };
+    let ready = crate::test_db::run_on(mysql, DbKind::MySql, |c| {
+        for sql in [
+            "drop database if exists r53_ev",
+            "drop table if exists r53_et",
+            "create database r53_ev",
+            "create table r53_et (id int, n int)",
+            "insert into r53_et values (1, 1)",
+            "create table r53_ev.r53_eu (id int, n int)",
+            "insert into r53_ev.r53_eu values (1, 2)",
+        ] {
+            c.execute(sql).unwrap();
+        }
+        let current: Vec<Vec<dbcraft_db::Cell>> = c.query("select database()", &[]).unwrap();
+        let current = current[0][0].clone().unwrap();
+        c.execute(&format!(
+            "create view r53_ev.r53_evw as select t.n + u.n as s, 1 as k \
+               from `{current}`.r53_et t join r53_ev.r53_eu u on u.id = t.id"
+        ))
+        .unwrap();
+    });
+    assert!(ready.is_some());
+    let view = ObjectRef {
+        owner: "r53_ev".into(),
+        name: "r53_evw".into(),
+        object_type: ObjectType::View,
+    };
+    h.state_mut()
+        .test_object_action("dba", crate::browser::ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r53_evw"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    assert!(script.contains("1 AS `k`"), "{script}");
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text(script.replace("1 AS `k`", "2 AS `k`"));
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| !app.test_focused_busy());
+    let messages: Vec<String> = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .messages
+        .iter()
+        .map(|m| m.text.clone())
+        .collect();
+    let found = crate::test_db::run_on(mysql, DbKind::MySql, |c| {
+        let rows = c
+            .query("select concat(s, ' ', k) from r53_ev.r53_evw", &[])
+            .unwrap();
+        for sql in ["drop database r53_ev", "drop table r53_et"] {
+            c.execute(sql).unwrap();
+        }
+        rows
+    })
+    .unwrap();
+    assert!(
+        !messages.iter().any(|m| m.contains("ERROR")),
+        "{script}\n{messages:?}"
+    );
+    assert_eq!(found[0][0].as_deref(), Some("3 2"), "{messages:?}");
+}
+
+/// *Edit* leaves the object as it was when its new version fails (#286). On
+/// SQLite and for a PostgreSQL materialized view the script dropped it
+/// first, and the drop stayed: the object was gone. A transaction pending
+/// in the window is neither committed nor rolled back. PostgreSQL's
+/// routines, triggers and views are replaced in place.
+#[test]
+fn edit_keeps_what_fails_on_sqlite_and_postgres() {
+    use crate::browser::ObjectAction;
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+
+    // Runs the Edit script of `object` with `old` made `new` in its window,
+    // after `before` there; gives the messages once the window has settled
+    // with its transaction `pending` or not.
+    let edit = |h: &mut Ui,
+                connection: &str,
+                object: &ObjectRef,
+                (old, new): (&str, &str),
+                before: Option<&str>,
+                pending: bool|
+     -> Vec<String> {
+        h.state_mut()
+            .test_object_action(connection, ObjectAction::Edit(object.clone()));
+        wait_until(h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(&object.name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        assert!(script.contains(old), "{script}");
+        if let Some(sql) = before {
+            h.state_mut()
+                .test_sql_window()
+                .editor
+                .set_text(sql.to_owned());
+            h.state_mut().test_execute_focused();
+            wait_until(h, sql, |app| {
+                !app.test_focused_busy() && app.test_pending_tx()
+            });
+        }
+        let edited = script.replacen(old, new, 1);
+        h.state_mut().test_sql_window().editor.set_text(edited);
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the script to run", |app| {
+            !app.test_focused_busy() && app.test_pending_tx() == pending
+        });
+        let w = h.state_mut().test_sql_window();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+    let object = |owner: &str, name: &str, object_type| ObjectRef {
+        owner: owner.into(),
+        name: name.into(),
+        object_type,
+    };
+    let first = |rows: Vec<Vec<dbcraft_db::Cell>>| rows.first().and_then(|r| r[0].clone());
+
+    // SQLite: a view, a trigger and an index.
+    let connection = "r55-edit.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r55_et (n);
+create view r55_ev as select n, 1 as m from r55_et;
+create trigger r55_eg after insert on r55_et begin select 1; end;
+create index r55_ei on r55_et (n);",
+    );
+    let path = file.0.display().to_string();
+    let lite = |sql: &str| {
+        let sql = sql.to_owned();
+        first(crate::test_db::run_with(
+            DbKind::Sqlite,
+            "",
+            "",
+            &path,
+            move |c| c.query(&sql, &[]).unwrap(),
+        ))
+    };
+    let sql_of = |name: &str| {
+        lite(&format!(
+            "select sql from sqlite_master where name = '{name}'"
+        ))
+    };
+    for (object_type, name, old, failing, new) in [
+        (ObjectType::View, "r55_ev", "1 as m", "1 as m,", "2 as m"),
+        (
+            ObjectType::Trigger,
+            "r55_eg",
+            "select 1",
+            "sxlect 1",
+            "select 2",
+        ),
+        (ObjectType::Index, "r55_ei", "(n)", "(nx)", "(n desc)"),
+    ] {
+        let o = object("main", name, object_type);
+        let was = sql_of(name);
+        let messages = edit(&mut h, connection, &o, (old, failing), None, false);
+        h.state_mut().test_close_focused();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("syntax error") || m.contains("no such column")),
+            "{messages:?}"
+        );
+        assert_eq!(sql_of(name), was, "{name} as it was");
+        let messages = edit(&mut h, connection, &o, (old, new), None, false);
+        h.state_mut().test_close_focused();
+        let now = sql_of(name);
+        assert!(
+            now.as_deref().is_some_and(|s| s.contains(new)),
+            "{now:?} {messages:?}"
+        );
+    }
+    // A change pending in the window: the script doesn't take it in.
+    let trigger = object("main", "r55_eg", ObjectType::Trigger);
+    let insert = "insert into r55_et values (7)";
+    let messages = edit(
+        &mut h,
+        connection,
+        &trigger,
+        ("select 2", "select 3"),
+        Some(insert),
+        true,
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("within a transaction")),
+        "{messages:?}"
+    );
+    assert_eq!(lite("select count(*) from r55_et").as_deref(), Some("0"));
+    assert!(sql_of("r55_eg").is_some_and(|s| s.contains("select 2")));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "the rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    drop(h);
+
+    // PostgreSQL: a materialized view; a view, function, procedure and
+    // trigger, which are replaced in place.
+    let pg = "DBCRAFT_TEST_POSTGRES";
+    let Some(mut h) = connect_to(pg, "r55-edit", DbKind::Postgres) else {
+        return;
+    };
+    let drops = [
+        "drop table if exists r55_et cascade",
+        "drop function if exists r55_ef()",
+        "drop procedure if exists r55_ep()",
+        "drop function if exists r55_etf()",
+    ];
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        for sql in drops {
+            c.execute(sql).unwrap();
+        }
+        for sql in [
+            "create table r55_et (n int)",
+            "create materialized view r55_emv as select n, 1 as m from r55_et",
+            "create view r55_ev as select n, 1 as m from r55_et",
+            "create function r55_ef() returns int language sql as $$select 1$$",
+            "create procedure r55_ep() language plpgsql as $$begin perform 1; end$$",
+            "create function r55_etf() returns trigger language plpgsql \
+             as $$begin return new; end$$",
+            "create trigger r55_eg before insert on r55_et \
+             for each row execute function r55_etf()",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    let pg_first = |sql: String| {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            first(c.query(&sql, &[]).unwrap())
+        })
+        .flatten()
+    };
+    let definition = |o: &ObjectRef| {
+        pg_first(match o.object_type {
+            ObjectType::View | ObjectType::MaterializedView => format!(
+                "select pg_get_viewdef(c.oid) from pg_class c where c.relname = '{}'",
+                o.name
+            ),
+            ObjectType::Trigger => format!(
+                "select pg_get_triggerdef(t.oid) from pg_trigger t where t.tgname = '{}'",
+                o.name
+            ),
+            _ => format!(
+                "select pg_get_functiondef(p.oid) from pg_proc p where p.proname = '{}'",
+                o.name
+            ),
+        })
+    };
+    for (object_type, name, old, failing, new) in [
+        (
+            ObjectType::MaterializedView,
+            "r55_emv",
+            "1 AS m",
+            "1 AS m,",
+            "2 AS m",
+        ),
+        (ObjectType::View, "r55_ev", "1 AS m", "1 AS m,", "2 AS m"),
+        (
+            ObjectType::Function,
+            "r55_ef",
+            "select 1",
+            "sxlect 1",
+            "select 2",
+        ),
+        (
+            ObjectType::Procedure,
+            "r55_ep",
+            "perform 1",
+            "perfxrm 1",
+            "perform 2",
+        ),
+        (
+            ObjectType::Trigger,
+            "r55_eg",
+            "r55_etf()",
+            "r55_etfx()",
+            "INSERT OR UPDATE",
+        ),
+    ] {
+        let o = object("public", name, object_type);
+        let was = definition(&o);
+        assert!(was.is_some(), "{name}");
+        let messages = edit(&mut h, "r55-edit", &o, (old, failing), None, false);
+        h.state_mut().test_close_focused();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("syntax error") || m.contains("does not exist")),
+            "{name}: {messages:?}"
+        );
+        assert_eq!(definition(&o), was, "{name} as it was");
+        // The materialized view's new version waits for Commit.
+        let block = object_type == ObjectType::MaterializedView;
+        let new = if object_type == ObjectType::Trigger {
+            ("INSERT", new)
+        } else {
+            (old, new)
+        };
+        edit(&mut h, "r55-edit", &o, new, None, block);
+        if block {
+            h.state_mut().test_commit();
+            wait_until(&mut h, "the commit", |app| !app.test_pending_tx());
+        }
+        h.state_mut().test_close_focused();
+        let now = definition(&o);
+        assert!(now.as_deref().is_some_and(|d| d.contains(new.1)), "{now:?}");
+    }
+    // A change pending in the window: neither committed nor rolled back.
+    let view = object("public", "r55_emv", ObjectType::MaterializedView);
+    let was = definition(&view);
+    let messages = edit(
+        &mut h,
+        "r55-edit",
+        &view,
+        ("2 AS m", "2 AS m,"),
+        Some("insert into r55_et values (7)"),
+        true,
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("syntax error")),
+        "{messages:?}"
+    );
+    assert_eq!(definition(&view), was);
+    let rows = pg_first("select count(*) from r55_et".into());
+    assert_eq!(rows.as_deref(), Some("0"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "the rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        for sql in drops {
+            c.execute(sql).unwrap();
+        }
+    });
+}
+
+/// The object browser offers *Edit* where its script replaces the object:
+/// SQLite's views, indexes and triggers, PostgreSQL's views and
+/// materialized views besides its routines and triggers. It was there for
+/// triggers and routines only, though the README says it opens views.
+#[test]
+fn edit_is_offered_where_it_opens_a_script() {
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+    // The script of Edit in the context menu of the entry `name`, chosen if
+    // `open`; None if the menu has no Edit. The menu bar has an Edit too:
+    // the menu's is the one below it.
+    let edit_in_menu = |h: &mut Ui, name: &str, open: bool| -> Option<String> {
+        let bar = h.query_all_by_label("Edit").count();
+        h.get_by_label(name).click_secondary();
+        h.run_steps(3);
+        let offered = h.query_all_by_label("Edit").count() > bar;
+        if !offered || !open {
+            h.key_press(egui::Key::Escape);
+            h.run_steps(2);
+            return offered.then(String::new);
+        }
+        h.query_all_by_label("Edit")
+            .max_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+            .unwrap()
+            .click();
+        wait_until(h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        h.state_mut().test_close_focused();
+        Some(script)
+    };
+    let connection = "r64-edit.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r64_t (n);
+create view r64_v as select n from r64_t;
+create index r64_i on r64_t (n);
+create trigger r64_g after insert on r64_t begin select 1; end;",
+    );
+    h.state_mut().test_expand_browser(&[
+        ObjectType::Table,
+        ObjectType::View,
+        ObjectType::Index,
+        ObjectType::Trigger,
+    ]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    let script = edit_in_menu(&mut h, "r64_v", true).expect("Edit for a view");
+    assert!(
+        script.contains("drop view if exists main.r64_v;") && script.contains("begin;"),
+        "{script}"
+    );
+    let script = edit_in_menu(&mut h, "r64_i", true).expect("Edit for an index");
+    assert!(
+        script.contains("drop index if exists main.r64_i;"),
+        "{script}"
+    );
+    assert!(edit_in_menu(&mut h, "r64_g", false).is_some(), "a trigger");
+    assert!(
+        edit_in_menu(&mut h, "r64_t", false).is_none(),
+        "not a table"
+    );
+    // The view's own Edit, in its view.
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: ObjectRef {
+            owner: "main".into(),
+            name: "r64_v".into(),
+            object_type: ObjectType::View,
+        },
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Edit").count(), 2, "the view's Edit");
+    h.state_mut().test_close_focused();
+    drop(h);
+
+    let pg = "DBCRAFT_TEST_POSTGRES";
+    let Some(mut h) = connect_to(pg, "r64-edit", DbKind::Postgres) else {
+        return;
+    };
+    let cleanup = "drop table if exists r64_et cascade";
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        c.execute(cleanup).unwrap();
+        for sql in [
+            "create table r64_et (n int)",
+            "create view r64_ev as select n from r64_et",
+            "create materialized view r64_emv as select n from r64_et",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    h.state_mut().test_expand_browser(&[
+        ObjectType::Table,
+        ObjectType::View,
+        ObjectType::MaterializedView,
+    ]);
+    h.state_mut().test_browser().set_filter("R64_E");
+    h.state_mut().test_refresh_browser();
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    let script = edit_in_menu(&mut h, "r64_ev", true).expect("Edit for a view");
+    assert!(script.contains("create or replace view"), "{script}");
+    let script = edit_in_menu(&mut h, "r64_emv", true).expect("Edit for a materialized view");
+    assert!(script.contains("do $dbcraft$"), "{script}");
+    assert!(
+        edit_in_menu(&mut h, "r64_et", false).is_none(),
+        "not a table"
+    );
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| c.execute(cleanup).unwrap());
+    drop(h);
+
+    // MySQL's and SQL Server's views: CREATE OR REPLACE, CREATE OR ALTER.
+    for (env, kind, words) in [
+        ("DBCRAFT_TEST_MYSQL", DbKind::MySql, "or replace"),
+        ("DBCRAFT_TEST_MSSQL", DbKind::SqlServer, "or alter"),
+    ] {
+        let Some(mut h) = connect_to(env, "r64-edit", kind) else {
+            continue;
+        };
+        let drops = ["drop view if exists r64_ev", "drop table if exists r64_et"];
+        crate::test_db::run_on(env, kind, move |c| {
+            for sql in drops {
+                c.execute(sql).unwrap();
+            }
+            c.execute("create table r64_et (n int)").unwrap();
+            c.execute("create view r64_ev as select n from r64_et")
+                .unwrap();
+        });
+        h.state_mut()
+            .test_expand_browser(&[ObjectType::Table, ObjectType::View]);
+        h.state_mut().test_browser().set_filter("R64_E");
+        h.state_mut().test_refresh_browser();
+        wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        let script = edit_in_menu(&mut h, "r64_ev", true).expect("Edit for a view");
+        assert!(script.to_lowercase().contains(words), "{kind:?}: {script}");
+        crate::test_db::run_on(env, kind, move |c| {
+            for sql in drops {
+                c.execute(sql).unwrap();
+            }
+        });
+    }
+}
+
+/// *Edit* of a PostgreSQL materialized view keeps its indexes, comments
+/// and grants: its DDL had only the CREATE, so the view the script made
+/// again came without them.
+#[test]
+fn postgres_edit_keeps_a_materialized_views_indexes_grants_and_comments() {
+    use crate::browser::ObjectAction;
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+    let pg = "DBCRAFT_TEST_POSTGRES";
+    let connection = "r64-mv";
+    let Some(mut h) = connect_to(pg, connection, DbKind::Postgres) else {
+        return;
+    };
+    let drop = "drop table if exists r64_mt cascade";
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        c.execute(drop).unwrap();
+        for sql in [
+            "create table r64_mt (n int, m int)",
+            "create materialized view r64_mv as select n, m, 1 as k from r64_mt",
+            "create unique index r64_mv_n on r64_mv (n)",
+            "create index r64_mv_m on r64_mv (m) where m > 0",
+            "comment on materialized view r64_mv is 'It''s the view'",
+            "comment on column r64_mv.n is 'the key'",
+            "grant select on r64_mv to public",
+            "grant select on r64_mv to pg_monitor with grant option",
+            "grant select (m) on r64_mv to pg_read_all_stats",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    // What the view has besides its query.
+    let state = || {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            c.query(
+                "select (select string_agg(indexdef, '; ' order by indexname) \
+                           from pg_indexes where tablename = 'r64_mv'), \
+                        obj_description('r64_mv'::regclass, 'pg_class'), \
+                        col_description('r64_mv'::regclass, 1), \
+                        (select string_agg(x.grantee::regrole || ' ' || x.privilege_type \
+                                           || case when x.is_grantable then '*' else '' end, \
+                                           ', ' order by x.grantee::regrole::text) \
+                           from pg_class c, aclexplode(c.relacl) x \
+                          where c.oid = 'r64_mv'::regclass and x.grantee <> c.relowner), \
+                        (select array_to_string(attacl, ',') from pg_attribute \
+                          where attrelid = 'r64_mv'::regclass and attname = 'm'), \
+                        pg_get_viewdef('r64_mv'::regclass)",
+                &[],
+            )
+            .unwrap()
+            .remove(0)
+        })
+        .unwrap()
+    };
+    let was = state();
+    assert!(
+        was[0].as_deref().is_some_and(|i| i.contains("r64_mv_n")),
+        "{was:?}"
+    );
+    let view = ObjectRef {
+        owner: "public".into(),
+        name: "r64_mv".into(),
+        object_type: ObjectType::MaterializedView,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r64_mv"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    let edited = script.replacen("1 AS k", "2 AS k", 1);
+    assert_ne!(edited, script);
+    h.state_mut().test_sql_window().editor.set_text(edited);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| {
+        !app.test_focused_busy() && app.test_pending_tx()
+    });
+    h.state_mut().test_commit();
+    wait_until(&mut h, "the commit", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    let now = state();
+    assert!(
+        now[5].as_deref().is_some_and(|d| d.contains("2 AS k")),
+        "{now:?}"
+    );
+    assert_eq!(now[..5], was[..5], "{script}");
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| c.execute(drop).unwrap());
+}
+
+/// *Edit* of a PostgreSQL materialized view keeps its owner, its lack of
+/// data and its storage: the view the script made again was the editor's,
+/// populated, with the default parameters, tablespace and access method
+/// (#330).
+#[test]
+fn postgres_edit_keeps_a_materialized_views_owner_data_and_storage() {
+    use crate::browser::ObjectAction;
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+    let pg = "DBCRAFT_TEST_POSTGRES";
+    let connection = "r73-mv";
+    let Some(mut h) = connect_to(pg, connection, DbKind::Postgres) else {
+        return;
+    };
+    let superuser = crate::test_db::run_on(pg, DbKind::Postgres, |c| {
+        c.query(
+            "select rolsuper::text from pg_roles where rolname = current_user",
+            &[],
+        )
+        .unwrap()
+        .remove(0)
+        .remove(0)
+    })
+    .flatten();
+    if superuser.as_deref() != Some("true") {
+        return;
+    }
+    let drops = [
+        "drop table if exists r73_et cascade",
+        "drop tablespace if exists r73_ets",
+        "drop access method if exists r73_eheap",
+        "drop role if exists r73_eowner",
+    ];
+    let results = crate::test_db::execute_on(
+        pg,
+        DbKind::Postgres,
+        &[
+            drops[0],
+            drops[1],
+            drops[2],
+            drops[3],
+            "create role r73_eowner",
+            // A tablespace in the data directory, as tests make them.
+            "set allow_in_place_tablespaces = on",
+            "create tablespace r73_ets location ''",
+            "create access method r73_eheap type table handler heap_tableam_handler",
+            "create table r73_et (n int, s text)",
+            "insert into r73_et values (1, 'a')",
+            "create materialized view r73_emv using r73_eheap \
+             with (fillfactor = 70, toast.autovacuum_enabled = false) tablespace r73_ets \
+             as select n, s, 1 as k from r73_et with no data",
+            "alter materialized view r73_emv owner to r73_eowner",
+        ],
+    )
+    .unwrap();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    // What the view has besides its query.
+    let state = || {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            c.query(
+                "select c.relowner::regrole::text, c.relispopulated::text, \
+                        array_to_string(c.reloptions, ','), array_to_string(s.reloptions, ','), \
+                        t.spcname, a.amname, pg_get_viewdef(c.oid) \
+                   from pg_class c join pg_am a on a.oid = c.relam \
+                   left join pg_class s on s.oid = c.reltoastrelid \
+                   left join pg_tablespace t on t.oid = c.reltablespace \
+                  where c.oid = 'r73_emv'::regclass",
+                &[],
+            )
+            .unwrap()
+            .remove(0)
+        })
+        .unwrap()
+    };
+    let was = state();
+    assert_eq!(
+        was[..6],
+        [
+            Some("r73_eowner".into()),
+            Some("false".into()),
+            Some("fillfactor=70".into()),
+            Some("autovacuum_enabled=false".into()),
+            Some("r73_ets".into()),
+            Some("r73_eheap".into()),
+        ]
+    );
+    let view = ObjectRef {
+        owner: "public".into(),
+        name: "r73_emv".into(),
+        object_type: ObjectType::MaterializedView,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r73_emv"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    let edited = script.replacen("1 AS k", "2 AS k", 1);
+    assert_ne!(edited, script);
+    h.state_mut().test_sql_window().editor.set_text(edited);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| {
+        !app.test_focused_busy() && app.test_pending_tx()
+    });
+    h.state_mut().test_commit();
+    wait_until(&mut h, "the commit", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    let now = state();
+    assert!(
+        now[6].as_deref().is_some_and(|d| d.contains("2 AS k")),
+        "{now:?}"
+    );
+    assert_eq!(now[..6], was[..6], "{script}");
+    let results = crate::test_db::execute_on(pg, DbKind::Postgres, &drops).unwrap();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+}
+
+/// *Edit* of a PostgreSQL view keeps its `security_barrier`,
+/// `security_invoker` and check option: the script's CREATE OR REPLACE
+/// came without them and reset them (#351).
+#[test]
+fn postgres_edit_keeps_a_views_security_and_check_option() {
+    use crate::browser::ObjectAction;
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+    let pg = "DBCRAFT_TEST_POSTGRES";
+    let connection = "r81-v";
+    let Some(mut h) = connect_to(pg, connection, DbKind::Postgres) else {
+        return;
+    };
+    let drop = "drop table if exists r81_evt cascade";
+    let results = crate::test_db::execute_on(
+        pg,
+        DbKind::Postgres,
+        &[
+            drop,
+            "create table r81_evt (n int)",
+            "create view r81_ev with (security_barrier, security_invoker) as \
+             select n, 1 as k from r81_evt where n > 0 with local check option",
+        ],
+    )
+    .unwrap();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    // The view's options and query.
+    let state = || {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            c.query(
+                "select array_to_string(reloptions, ','), pg_get_viewdef(oid) from pg_class \
+                  where oid = 'r81_ev'::regclass",
+                &[],
+            )
+            .unwrap()
+            .remove(0)
+        })
+        .unwrap()
+    };
+    let was = state();
+    assert_eq!(
+        was[0].as_deref(),
+        Some("security_barrier=true,security_invoker=true,check_option=local")
+    );
+    let view = ObjectRef {
+        owner: "public".into(),
+        name: "r81_ev".into(),
+        object_type: ObjectType::View,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r81_ev"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    let edited = script.replacen("1 AS k", "2 AS k", 1);
+    assert_ne!(edited, script);
+    h.state_mut().test_sql_window().editor.set_text(edited);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| !app.test_focused_busy());
+    h.state_mut().test_close_focused();
+    let now = state();
+    assert!(
+        now[1].as_deref().is_some_and(|d| d.contains("2 AS k")),
+        "{now:?}"
+    );
+    assert_eq!(now[0], was[0], "{script}");
+    let results = crate::test_db::execute_on(pg, DbKind::Postgres, &[drop]).unwrap();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+}
+
+/// `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails, as
+/// in SQL*Plus (#286); the window only stopped. Without `ROLLBACK` the
+/// changes before stay pending.
+#[test]
+fn whenever_sqlerror_exit_rollback() {
+    use dbcraft_config::DbKind;
+
+    // Runs the script after `whenever`; gives whether a change is pending
+    // and the rows of r55_w seen in the window.
+    let run = |h: &mut Ui, connection: &str, whenever: &str| -> (bool, String) {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: format!(
+                "insert into r55_w values (1);\n{whenever}\n\
+                 insert into r55_nosuch values (1);\ninsert into r55_w values (2);"
+            ),
+            run: true,
+        });
+        let pending = whenever.ends_with("exit");
+        wait_until(h, whenever, |app| {
+            !app.test_focused_busy() && app.test_pending_tx() == pending
+        });
+        let messages: Vec<String> = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("1 remaining")),
+            "{messages:?}"
+        );
+        let w = h.state_mut().test_sql_window();
+        w.editor.set_text("select count(*) from r55_w".to_owned());
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the count", |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let count = w.state.results[0].rows[0][0].clone().unwrap_or_default();
+        if pending {
+            h.state_mut().test_rollback();
+            wait_until(h, "the rollback", |app| !app.test_pending_tx());
+        }
+        h.state_mut().test_close_focused();
+        (pending, count)
+    };
+    let check = |h: &mut Ui, connection: &str| {
+        assert_eq!(
+            run(h, connection, "whenever sqlerror exit rollback"),
+            (false, "0".into())
+        );
+        assert_eq!(
+            run(h, connection, "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK"),
+            (false, "0".into())
+        );
+        assert_eq!(
+            run(h, connection, "whenever sqlerror exit"),
+            (true, "1".into())
+        );
+    };
+
+    let connection = "r55-whenever.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(&mut h, connection, "create table r55_w (n)");
+    check(&mut h, connection);
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    if let Some(mut h) = connect_to("DBCRAFT_TEST_DB", "r55-whenever", DbKind::Oracle) {
+        run_script(&mut h, "r55-whenever", "create table r55_w (n number)");
+        check(&mut h, "r55-whenever");
+        run_script(&mut h, "r55-whenever", "drop table r55_w purge");
+    }
+}
+
+/// Edits a long MySQL value (`DBCRAFT_TEST_MYSQL`, #205). The UPDATE wrote
+/// the value it had found out again to check it, so a value of more than
+/// half of max_allowed_packet made a statement the driver refused, which
+/// was taken for a lost connection: the window's session went, with the
+/// changes applied before. A value too long for any statement fails alone.
+#[test]
+fn mysql_long_values() {
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "long".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let execute = |h: &mut Harness<'_, DbCraftApp>, sql: &str| {
+        h.state_mut().test_sql_window().editor.set_text(sql);
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the statements", |app| !app.test_focused_busy());
+    };
+    let first_row = |h: &mut Harness<'_, DbCraftApp>| -> Vec<Option<String>> {
+        h.state_mut().test_sql_window().state.results[0].rows[0].clone()
+    };
+    let edit = |h: &mut Harness<'_, DbCraftApp>, row: usize, col: usize, value: &str| {
+        let r = &mut h.state_mut().test_sql_window().state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, row, col, Some(value.into()));
+    };
+    let apply = |h: &mut Harness<'_, DbCraftApp>| -> Vec<String> {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "long".into(),
+        text: String::new(),
+        run: false,
+    });
+    execute(&mut h, "select @@max_allowed_packet, connection_id()");
+    let row = first_row(&mut h);
+    let max: usize = row[0].as_deref().unwrap().parse().unwrap();
+    let connection = row[1].clone();
+    // Lines of 100 bytes, 0.6 of the largest statement in all.
+    let lines = max * 6 / 10 / 100;
+    execute(
+        &mut h,
+        &format!(
+            "drop table if exists fx_long_edit;\n\
+             create table fx_long_edit (id int primary key, n int, texto longtext);\n\
+             insert into fx_long_edit values \
+               (1, 1, repeat(concat(repeat('a', 99), char(10)), {lines})), (2, 2, 'short');\n\
+             commit;"
+        ),
+    );
+    execute(&mut h, "select id, n, texto from fx_long_edit order by id");
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+
+    // A change applied first, then the long value.
+    edit(&mut h, 1, 1, "20");
+    let texts = apply(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("Changes applied")),
+        "{texts:?}"
+    );
+    let long = format!("{}\n", "b".repeat(99)).repeat(lines);
+    edit(&mut h, 0, 2, &long);
+    let texts = apply(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("Changes applied")),
+        "{texts:?}"
+    );
+    {
+        let rows = &h.state_mut().test_sql_window().state.results[0].rows;
+        assert!(rows[0][2].as_deref() == Some(long.as_str()));
+        assert_eq!(rows[1][1].as_deref(), Some("20"));
+    }
+
+    // With its backslashes, written out as hex, too long for a statement.
+    let too_long = format!("{}\\\n", "c".repeat(98)).repeat(lines);
+    edit(&mut h, 0, 2, &too_long);
+    let texts = apply(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("max_allowed_packet")),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|m| m.starts_with("Connection lost")),
+        "{texts:?}"
+    );
+    assert!(h.state().test_has_doc_session());
+    h.state_mut().test_sql_window().state.results[0]
+        .grid
+        .clear_changes();
+    execute(
+        &mut h,
+        "select connection_id(), (select n from fx_long_edit where id = 2), \
+                (select left(texto, 1) from fx_long_edit where id = 1)",
+    );
+    assert_eq!(
+        first_row(&mut h),
+        [connection, Some("20".into()), Some("b".into())]
+    );
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    execute(&mut h, "drop table fx_long_edit");
+}
+
+/// A database for [`keyed_data_editing`].
+struct Keyed {
+    /// The variable with its account (`user/password@connect string`).
+    env: &'static str,
+    kind: dbcraft_config::DbKind,
+    /// Creates `dbcraft_edit_t` (an identity key, name, born, doc, price)
+    /// with two rows, `dbcraft_edit_k` (a unique key on NOT NULL `a`, `b`)
+    /// and `dbcraft_edit_n` (no key), and commits.
+    create: &'static str,
+    drop: &'static str,
+    /// Cells of `dbcraft_edit_t`'s rows changed (row, column, value), and
+    /// what they read once applied.
+    edits: &'static [(usize, usize, &'static str, &'static str)],
+    screenshot: &'static str,
+}
+
+/// Edits results of a database that finds rows by key, as MySQL does
+/// ([`mysql_data_editing`]): the key, selected or not, is added; values
+/// are found again as they were shown; an identity fills a new row's key;
+/// a row changed by another session is a conflict; tables without a key
+/// and grouped results stay read-only.
+fn keyed_data_editing(db: &Keyed) {
+    let Some(spec) = std::env::var(db.env).ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: db.kind,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    keyed_data_editing_on(db, profile, password.into());
+}
+
+/// [`keyed_data_editing`] on the connection `profile` (named `shop`).
+fn keyed_data_editing_on(db: &Keyed, profile: ConnectionProfile, password: String) {
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let run = |h: &mut Harness<'_, DbCraftApp>, sql: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let errors: Vec<&String> = w
+            .state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| &m.text)
+            .collect();
+        assert!(errors.is_empty(), "{sql}: {errors:?}");
+        h.state_mut().test_close_focused();
+    };
+    run(&mut h, db.drop);
+    run(&mut h, db.create);
+    let query = |h: &mut Harness<'_, DbCraftApp>, sql: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+        wait_until(h, "editing", |app| !app.test_focused_busy());
+    };
+    let apply = |h: &mut Harness<'_, DbCraftApp>| {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+    };
+    let messages = |h: &mut Harness<'_, DbCraftApp>| -> Vec<String> {
+        let w = h.state_mut().test_sql_window();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+
+    // The key isn't selected: DbCraft adds it, read-only, at the end.
+    query(
+        &mut h,
+        "select name, born, doc, price from dbcraft_edit_t order by id",
+    );
+    let grid_window = h.state().test_focused();
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(
+            r.grid.is_editable(),
+            "{:?}",
+            w.state.messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["name", "born", "doc", "price", "dbcraft$id"]);
+        // Copies and exports leave that key out (#249).
+        let (copied, _) = dbcraft_ui::selection_data(&r.columns, &r.rows, &r.grid).unwrap();
+        let copied: Vec<&str> = copied.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(copied, ["name", "born", "doc", "price"]);
+        let rows = r.rows.clone();
+        for &(row, col, value, _) in db.edits {
+            r.grid.edit_cell(&rows, row, col, Some(value.into()));
+        }
+        r.grid.edit_cell(&rows, 1, 4, Some("99".into()));
+        // Nothing is copied of rows with changes not applied (#250).
+        assert!(matches!(
+            dbcraft_ui::shown_data(&r.columns, &r.rows, &r.grid),
+            Err(dbcraft_ui::NotCopied::Unapplied(_))
+        ));
+    }
+    save(&mut h, db.screenshot);
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("Changes applied")),
+        "{texts:?}"
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        for &(row, col, _, shown) in db.edits {
+            assert_eq!(r.rows[row][col].as_deref(), Some(shown), "column {col}");
+        }
+        assert_eq!(
+            r.rows[1][4].as_deref(),
+            Some("2"),
+            "the key can't be edited"
+        );
+        // A new row (the key from the identity) and a deleted one.
+        let rows = r.rows.clone();
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 2, 0, Some("three".into()));
+        r.grid.delete_row(&rows, 1);
+    }
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(!texts.iter().any(|m| m.contains("Conflict")), "{texts:?}");
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &w.state.results[0];
+        let names: Vec<Option<&str>> = r.rows.iter().map(|row| row[0].as_deref()).collect();
+        assert_eq!(names, [Some(db.edits[0].3), Some("three")]);
+        assert_eq!(r.rows[1][4].as_deref(), Some("3"));
+    }
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+
+    // Another session changes the row behind our back.
+    run(
+        &mut h,
+        "update dbcraft_edit_t set name = 'theirs' where name = 'three';\ncommit;",
+    );
+    h.state_mut().test_focus(grid_window);
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 0, Some("mine".into()));
+    }
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.starts_with("Conflict on row 2")),
+        "{texts:?}"
+    );
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
+    // A unique key on NOT NULL columns does, too.
+    query(
+        &mut h,
+        "select v from dbcraft_edit_k k where a = 1 order by b",
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["v", "dbcraft$a", "dbcraft$b"]);
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 0, Some("21".into()));
+    }
+    apply(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        let values: Vec<Option<&str>> = w.state.results[0]
+            .rows
+            .iter()
+            .map(|r| r[0].as_deref())
+            .collect();
+        assert_eq!(values, [Some("10"), Some("21")]);
+    }
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
+    // Renamed, a column under another's name is read-only, as is an
+    // expression; the table's columns as they are can be edited.
+    query(
+        &mut h,
+        "select name as price, price as name, price * 2 as twice, name \
+           from dbcraft_edit_t order by id",
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        for c in 0..3 {
+            r.grid.edit_cell(&rows, 0, c, Some("1".into()));
+        }
+        assert_eq!(r.grid.changes().map(|c| c.count()), Some(0));
+        r.grid.edit_cell(&rows, 0, 3, Some("plain".into()));
+        assert_eq!(r.grid.changes().map(|c| c.count()), Some(1));
+    }
+    apply(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        assert_eq!(w.state.results[0].rows[0][3].as_deref(), Some("plain"));
+    }
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
+    // Without a key, rows can't be found again.
+    query(&mut h, "select * from dbcraft_edit_n");
+    let texts = messages(&mut h);
+    assert!(
+        texts
+            .iter()
+            .any(|m| m.starts_with("The rows of dbcraft_edit_n can't be edited")),
+        "{texts:?}"
+    );
+    assert!(
+        !h.state_mut().test_sql_window().state.results[0]
+            .grid
+            .is_editable()
+    );
+    h.state_mut().test_close_focused();
+
+    // A count isn't a row of the table.
+    query(&mut h, "select count(*) from dbcraft_edit_t");
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("can't be edited")),
+        "{texts:?}"
+    );
+    h.state_mut().test_close_focused();
+
+    run(&mut h, db.drop);
+}
+
+/// Edits PostgreSQL results (`DBCRAFT_TEST_POSTGRES`): json compares as
+/// its text, a real as shown.
+#[test]
+fn postgres_data_editing() {
+    keyed_data_editing(&Keyed {
+        env: "DBCRAFT_TEST_POSTGRES",
+        kind: dbcraft_config::DbKind::Postgres,
+        create: "create table dbcraft_edit_t (id integer generated by default as identity \
+                   primary key, name text, born timestamp, doc json, price real);\n\
+                 insert into dbcraft_edit_t (name, born, doc, price) values \
+                   ('one', '2020-01-01 00:00:00', '{\"a\":  1}', 123456.79), \
+                   ('two', null, null, 0.1);\n\
+                 create table dbcraft_edit_k (a int not null, b varchar(5) not null, v int, \
+                   unique (a, b));\n\
+                 insert into dbcraft_edit_k values (1, 'x', 10), (1, 'y', 20);\n\
+                 create table dbcraft_edit_n (x int);\n\
+                 insert into dbcraft_edit_n values (1);\n\
+                 commit;\n",
+        drop: "drop table if exists dbcraft_edit_t, dbcraft_edit_k, dbcraft_edit_n;",
+        edits: &[
+            (0, 0, r"C:\new 'one' & more", r"C:\new 'one' & more"),
+            (0, 2, r#"{"a": [1, "é"]}"#, r#"{"a": [1, "é"]}"#),
+            (0, 3, "2.5", "2.5"),
+            (1, 1, "2021-02-03 04:05:06", "2021-02-03 04:05:06"),
+            (1, 3, "0.3", "0.3"),
+        ],
+        screenshot: "postgres-editing",
+    });
+}
+
+/// Edits SQLite results, on a file of its own: the key from the table (a
+/// view has none), text with a backslash, a quote and `&`, and reals.
+#[test]
+fn sqlite_data_editing() {
+    let path = std::env::temp_dir().join(format!("dbcraft-editing-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", path.display()),
+        ..Default::default()
+    };
+    keyed_data_editing_on(
+        &Keyed {
+            env: "",
+            kind: dbcraft_config::DbKind::Sqlite,
+            // AUTOINCREMENT: a deleted row's id isn't given out again.
+            create: "create table dbcraft_edit_t (id integer primary key autoincrement, \
+                       name text, born timestamp, doc json, price real);\n\
+                     insert into dbcraft_edit_t (name, born, doc, price) values \
+                       ('one', '2020-01-01 00:00:00', '{\"a\":  1}', 123456.79), \
+                       ('two', null, null, 0.1);\n\
+                     create table dbcraft_edit_k (a int not null, b varchar(5) not null, v int, \
+                       unique (a, b));\n\
+                     insert into dbcraft_edit_k values (1, 'x', 10), (1, 'y', 20);\n\
+                     create view dbcraft_edit_n as select 1 as x;\n\
+                     commit;\n",
+            drop: "drop view if exists dbcraft_edit_n;\n\
+                   drop table if exists dbcraft_edit_t;\n\
+                   drop table if exists dbcraft_edit_k;",
+            edits: &[
+                (0, 0, r"C:\new 'one' & more", r"C:\new 'one' & more"),
+                (0, 2, r#"{"a": [1, "é"]}"#, r#"{"a": [1, "é"]}"#),
+                (0, 3, "2.5", "2.5"),
+                (1, 1, "2021-02-03 04:05:06", "2021-02-03 04:05:06"),
+                (1, 3, "0.3", "0.3"),
+            ],
+            screenshot: "sqlite-editing",
+        },
+        profile,
+        String::new(),
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Edits SQL Server results (`DBCRAFT_TEST_MSSQL`): Unicode as N'…', xml
+/// compared as its text.
+#[test]
+fn sqlserver_data_editing() {
+    keyed_data_editing(&Keyed {
+        env: "DBCRAFT_TEST_MSSQL",
+        kind: dbcraft_config::DbKind::SqlServer,
+        create: "create table dbcraft_edit_t (id int identity primary key, name nvarchar(40), \
+                   born datetime, doc xml, price real);\n\
+                 insert into dbcraft_edit_t (name, born, doc, price) values \
+                   (N'one', '2020-01-01T00:00:00', N'<a>1</a>', 123456.79), \
+                   (N'two', null, null, 0.1);\n\
+                 create table dbcraft_edit_k (a int not null, b varchar(5) not null, v int, \
+                   unique (a, b));\n\
+                 insert into dbcraft_edit_k values (1, 'x', 10), (1, 'y', 20);\n\
+                 create table dbcraft_edit_n (x int);\n\
+                 insert into dbcraft_edit_n values (1);\n\
+                 commit;\n",
+        drop: "drop table if exists dbcraft_edit_t, dbcraft_edit_k, dbcraft_edit_n;",
+        edits: &[
+            (0, 0, "grüße 'one' & 日本", "grüße 'one' & 日本"),
+            (0, 2, "<a>é</a>", "<a>é</a>"),
+            (0, 3, "2.5", "2.5"),
+            (1, 1, "2021-02-03 04:05:06", "2021-02-03 04:05:06.000"),
+            (1, 3, "0.3", "0.3"),
+        ],
+        screenshot: "sqlserver-editing",
+    });
+}
+
+/// The rows of the focused window's first result as (id, v), the changes
+/// waiting for Apply as (id, v) of the rows updated, (id, v) of the new
+/// rows and the ids of the rows deleted, and its messages.
+type Part = (
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    Vec<String>,
+    Vec<String>,
+);
+
+fn part(h: &mut Harness<'_, DbCraftApp>) -> Part {
+    let w = h.state_mut().test_sql_window();
+    let text = |c: &Option<String>| c.clone().unwrap_or_default();
+    let r = &w.state.results[0];
+    let rows: Vec<(String, String)> = r
+        .rows
+        .iter()
+        .map(|row| (text(&row[0]), text(&row[1])))
+        .collect();
+    let changes = r.grid.changes().cloned().unwrap_or_default();
+    let updates = changes
+        .updates
+        .iter()
+        .map(|(row, cells)| {
+            (
+                rows[*row].0.clone(),
+                cells.get(&1).map(text).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let inserts = changes
+        .inserts
+        .iter()
+        .map(|row| (text(&row[0]), text(&row[1])))
+        .collect();
+    let deletes = changes
+        .deletes
+        .iter()
+        .map(|row| rows[*row].0.clone())
+        .collect();
+    let messages = w.state.messages.iter().map(|m| m.text.clone()).collect();
+    (rows, updates, inserts, deletes, messages)
+}
+
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+        .collect()
+}
+
+/// An Apply that stops part-way, at a statement that fails (a CHECK) or
+/// finds a conflict (#247), on the connection `profile` (named
+/// `shop`) with `create` making `dbcraft_part (id, v)`, whose CHECK refuses
+/// `bad`: the result shows what was applied, the rest waits for Apply.
+/// Before, the changes before the failure were applied in the transaction
+/// but still pending in the grid, and applying again found a conflict on
+/// the first of them.
+fn applied_part_way_on(profile: ConnectionProfile, password: String, create: &str) {
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let run = |h: &mut Harness<'_, DbCraftApp>, sql: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let errors: Vec<String> = w
+            .state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(errors.is_empty(), "{sql}: {errors:?}");
+        h.state_mut().test_close_focused();
+    };
+    let apply = |h: &mut Harness<'_, DbCraftApp>| {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+    };
+    run(&mut h, "drop table if exists dbcraft_part;");
+    run(
+        &mut h,
+        &format!(
+            "{create};\n\
+             insert into dbcraft_part (id, v) values (1, 'a');\n\
+             insert into dbcraft_part (id, v) values (2, 'b');\n\
+             insert into dbcraft_part (id, v) values (3, 'c');\n\
+             insert into dbcraft_part (id, v) values (4, 'd');\n\
+             commit;"
+        ),
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from dbcraft_part order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let grid_window = h.state().test_focused();
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+
+    // Deletes run first, then updates by row, then inserts: the update of
+    // row 2 fails after the delete of 4 and the update of 1.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        r.grid.delete_row(&rows, 3);
+        r.grid.edit_cell(&rows, 0, 1, Some("x".into()));
+        r.grid.edit_cell(&rows, 1, 1, Some("bad".into()));
+        r.grid.edit_cell(&rows, 2, 1, Some("z".into()));
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 4, 0, Some("5".into()));
+        r.grid.edit_cell(&rows, 4, 1, Some("n".into()));
+    }
+    apply(&mut h);
+    let (rows, updates, inserts, deletes, messages) = part(&mut h);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m == "3 change(s) weren't applied: they wait for Apply"),
+        "{messages:?}"
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "b"), ("3", "c")]),
+        "{messages:?}"
+    );
+    assert_eq!(updates, pairs(&[("2", "bad"), ("3", "z")]));
+    assert_eq!(inserts, pairs(&[("5", "n")]));
+    assert!(deletes.is_empty());
+
+    // Corrected, the rest applies once, without a conflict.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 1, Some("y".into()));
+    }
+    apply(&mut h);
+    let (rows, updates, inserts, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.contains("Changes applied")),
+        "{messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|m| m.contains("Conflict")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "y"), ("3", "z"), ("5", "n")])
+    );
+    assert!(updates.is_empty() && inserts.is_empty());
+
+    // New rows: the first goes in, the second fails and waits.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        for (view, (id, v)) in [(4, ("6", "p")), (5, ("7", "bad"))] {
+            r.grid.add_row(&rows, r.columns.len());
+            r.grid.edit_cell(&rows, view, 0, Some(id.into()));
+            r.grid.edit_cell(&rows, view, 1, Some(v.into()));
+        }
+    }
+    apply(&mut h);
+    let (rows, updates, inserts, _, messages) = part(&mut h);
+    assert_eq!(rows.len(), 5, "{rows:?} {messages:?}");
+    assert_eq!(rows[4], ("6".to_owned(), "p".to_owned()));
+    assert!(updates.is_empty());
+    assert_eq!(inserts, pairs(&[("7", "bad")]));
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 5, 1, Some("q".into()));
+    }
+    apply(&mut h);
+    let (rows, _, inserts, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.contains("Changes applied")),
+        "{messages:?}"
+    );
+    assert_eq!(rows.len(), 6, "{rows:?}");
+    assert_eq!(rows[5], ("7".to_owned(), "q".to_owned()));
+    assert!(inserts.is_empty());
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+
+    // A conflict: the row another session changed keeps its value and
+    // loses the change, the change after it waits.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 0, 1, Some("k".into()));
+        r.grid.edit_cell(&rows, 2, 1, Some("m".into()));
+        r.grid.edit_cell(&rows, 3, 1, Some("o".into()));
+    }
+    run(
+        &mut h,
+        "update dbcraft_part set v = 'theirs' where id = 3;\ncommit;",
+    );
+    h.state_mut().test_focus(grid_window);
+    apply(&mut h);
+    let (rows, updates, _, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.starts_with("Conflict on row 3")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        &rows[..4],
+        &pairs(&[("1", "k"), ("2", "y"), ("3", "theirs"), ("5", "n")])[..]
+    );
+    assert_eq!(updates, pairs(&[("5", "o")]));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    run(&mut h, "drop table dbcraft_part;");
+}
+
+#[test]
+fn applied_part_way() {
+    let path = std::env::temp_dir().join(format!("dbcraft-part-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let sqlite = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", path.display()),
+        ..Default::default()
+    };
+    let create = "create table dbcraft_part (id int primary key, v varchar(10) not null \
+                  check (v <> 'bad'))";
+    applied_part_way_on(sqlite, String::new(), create);
+    let _ = std::fs::remove_file(&path);
+    for (env, kind) in [
+        ("DBCRAFT_TEST_MYSQL", dbcraft_config::DbKind::MySql),
+        ("DBCRAFT_TEST_POSTGRES", dbcraft_config::DbKind::Postgres),
+        ("DBCRAFT_TEST_MSSQL", dbcraft_config::DbKind::SqlServer),
+    ] {
+        let Some(spec) = std::env::var(env).ok() else {
+            continue;
+        };
+        let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+        let (username, password) = credentials.split_once('/').unwrap();
+        let profile = ConnectionProfile {
+            name: "shop".into(),
+            kind,
+            username: username.into(),
+            connect_string: connect_string.into(),
+            ..Default::default()
+        };
+        applied_part_way_on(profile, password.into(), create);
+    }
+}
+
+/// A session of a UI test's own, beside the app's: `user/password@connect
+/// string` of a database of `kind`, autocommitting.
+struct Side {
+    session: dbcraft_db::Session,
+    wake: std::sync::mpsc::Receiver<()>,
+}
+
+impl Side {
+    fn connect(kind: dbcraft_db::DbKind, spec: &str) -> Self {
+        let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+        let (username, password) = credentials.split_once('/').unwrap();
+        let (tx, wake) = std::sync::mpsc::channel();
+        let session = dbcraft_db::Session::connect(
+            dbcraft_db::ConnectParams {
+                kind,
+                username: username.into(),
+                password: password.into(),
+                connect_string: connect_string.into(),
+                privilege: Default::default(),
+                init_sql: Vec::new(),
+                ssh: None,
+            },
+            move || {
+                let _ = tx.send(());
+            },
+        );
+        let mut side = Self { session, wake };
+        match side.next() {
+            dbcraft_db::DbEvent::Connected(_) => {}
+            other => panic!("{spec}: {other:?}"),
+        }
+        side.session
+            .send(dbcraft_db::DbRequest::SetAutocommit(true));
+        side
+    }
+
+    fn next(&mut self) -> dbcraft_db::DbEvent {
+        loop {
+            if let Some(event) = self.session.try_recv() {
+                return event;
+            }
+            self.wake
+                .recv_timeout(Duration::from_secs(60))
+                .expect("timed out");
+        }
+    }
+
+    /// Runs a statement that must succeed: the rows of a query. Its
+    /// transaction state comes last, but on Oracle before what it did.
+    fn run(&mut self, sql: &str) -> Vec<Vec<dbcraft_db::Cell>> {
+        self.session.send(dbcraft_db::DbRequest::Execute {
+            id: 1,
+            sql: sql.into(),
+            max_rows: 1000,
+            binds: Vec::new(),
+        });
+        let mut rows = Vec::new();
+        let (mut done, mut ended) = (false, false);
+        while !(done && ended) {
+            match self.next() {
+                dbcraft_db::DbEvent::Rows { rows: r, .. } => {
+                    rows = r;
+                    done = true;
+                }
+                dbcraft_db::DbEvent::Executed { .. } => done = true,
+                dbcraft_db::DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+                dbcraft_db::DbEvent::Transaction { .. } => ended = true,
+                _ => {}
+            }
+        }
+        rows
+    }
+
+    fn end(&mut self, request: dbcraft_db::DbRequest) {
+        self.session.send(request);
+        while !matches!(self.next(), dbcraft_db::DbEvent::Transaction { .. }) {}
+    }
+}
+
+/// An Apply on SQL Server cut off while a statement after the first waits
+/// for a lock. The session killed, a lost connection, rolls back the
+/// transaction, and all the changes wait for Apply again (#289); before,
+/// they were taken for applied, and lost. Break keeps the transaction, as
+/// on the other databases (#384): the update of row 1 stays applied in it,
+/// and the changes of rows 2 and 3 wait for Apply. Before, the session
+/// opened the connection again after Break, which rolled it back too.
+#[test]
+fn an_apply_cut_off_by_a_new_connection() {
+    let (Ok(spec), Ok(dba)) = (
+        std::env::var("DBCRAFT_TEST_MSSQL"),
+        std::env::var("DBCRAFT_TEST_MSSQL_DBA"),
+    ) else {
+        eprintln!("DBCRAFT_TEST_MSSQL / DBCRAFT_TEST_MSSQL_DBA not set, skipping");
+        return;
+    };
+    let kind = dbcraft_db::DbKind::SqlServer;
+    let mut locker = Side::connect(kind, &spec);
+    let mut admin = Side::connect(kind, &dba);
+    locker.run("drop table if exists r52_apply");
+    locker.run("create table r52_apply (id int primary key, v varchar(10))");
+    locker.run("insert into r52_apply values (1, 'a'), (2, 'b'), (3, 'c')");
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::SqlServer,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r52_apply order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        for (row, v) in ["x", "y", "z"].into_iter().enumerate() {
+            r.grid.edit_cell(&rows, row, 1, Some(v.into()));
+        }
+    }
+    let locker_spid = locker.run("select @@spid")[0][0].clone().unwrap();
+    let schema = locker.run("select schema_name()")[0][0].clone().unwrap();
+    for how in ["kill", "break"] {
+        // Row 2 locked: the Apply updates row 1, then waits.
+        locker
+            .session
+            .send(dbcraft_db::DbRequest::SetAutocommit(false));
+        locker.run("update r52_apply set v = v where id = 2");
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        let started = Instant::now();
+        let spid = loop {
+            h.step();
+            let blocked = admin.run(&format!(
+                "select session_id from sys.dm_exec_requests \
+                 where blocking_session_id = {locker_spid}"
+            ));
+            if let Some(spid) = blocked.first().and_then(|r| r[0].clone()) {
+                break spid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "{how}: not blocked"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if how == "kill" {
+            admin.run(&format!("kill {spid}"));
+        } else {
+            h.state_mut().test_command(crate::commands::Command::Cancel);
+        }
+        // The statement stopped, row 2 is let go: fetching the result again
+        // waits for it.
+        let started = Instant::now();
+        while !admin
+            .run(&format!(
+                "select 1 from sys.dm_exec_requests where session_id = {spid} \
+                 and blocking_session_id = {locker_spid}"
+            ))
+            .is_empty()
+        {
+            h.step();
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "{how}: still blocked"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        locker.end(dbcraft_db::DbRequest::Rollback);
+        locker
+            .session
+            .send(dbcraft_db::DbRequest::SetAutocommit(true));
+        wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+        // Past the lock of a change the window's transaction keeps.
+        let stored = admin.run(&format!(
+            "select v from {schema}.r52_apply with (nolock) order by id"
+        ));
+        let (rows, updates, _, _, messages) = part(&mut h);
+        let text = |v: &str| vec![Some(v.to_owned())];
+        let said = |start: &str| messages.iter().any(|m| m.starts_with(start));
+        if how == "kill" {
+            assert_eq!(stored, [text("a"), text("b"), text("c")], "{how}");
+            assert_eq!(
+                rows,
+                pairs(&[("1", "a"), ("2", "b"), ("3", "c")]),
+                "{how}: {messages:?}"
+            );
+            assert_eq!(
+                updates,
+                pairs(&[("1", "x"), ("2", "y"), ("3", "z")]),
+                "{how}: {messages:?}"
+            );
+            assert!(said("Connection lost."), "{messages:?}");
+        } else {
+            assert_eq!(stored, [text("x"), text("b"), text("c")], "{how}");
+            assert!(h.state().test_pending_tx(), "{messages:?}");
+            assert_eq!(
+                rows,
+                pairs(&[("1", "x"), ("2", "b"), ("3", "c")]),
+                "{how}: {messages:?}"
+            );
+            assert_eq!(
+                updates,
+                pairs(&[("2", "y"), ("3", "z")]),
+                "{how}: {messages:?}"
+            );
+            assert!(!said("The transaction was rolled back"), "{messages:?}");
+            assert!(
+                said("2 change(s) weren't applied: they wait for Apply"),
+                "{messages:?}"
+            );
+        }
+    }
+    // Applied again, the rest go in once.
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let (rows, updates, _, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.contains("Changes applied")),
+        "{messages:?}"
+    );
+    assert_eq!(rows, pairs(&[("1", "x"), ("2", "y"), ("3", "z")]));
+    assert!(updates.is_empty());
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    locker.run("drop table r52_apply");
+}
+
+/// A TCP proxy to a database server that cuts one of the connections
+/// through it when a test says: the one waiting for a reply, when it
+/// sends again.
+struct Cutter {
+    port: u16,
+    links: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<Link>>>>,
+}
+
+/// A connection through a [`Cutter`].
+struct Link {
+    client: std::net::TcpStream,
+    server: std::net::TcpStream,
+    /// Since when the client waits for the reply to what it sent.
+    waiting: std::sync::Mutex<Option<Instant>>,
+    /// Cut when the client sends again.
+    cut: std::sync::atomic::AtomicBool,
+}
+
+impl Cutter {
+    fn start(server: &str) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let links = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = links.clone();
+        let server = server.to_owned();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let (Ok(client), Ok(server)) = (client, std::net::TcpStream::connect(&server))
+                else {
+                    continue;
+                };
+                let link = std::sync::Arc::new(Link {
+                    client,
+                    server,
+                    waiting: std::sync::Mutex::new(None),
+                    cut: Default::default(),
+                });
+                kept.lock().unwrap().push(link.clone());
+                let back = link.clone();
+                std::thread::spawn(move || back.pass(false));
+                std::thread::spawn(move || link.pass(true));
+            }
+        });
+        Self { port, links }
+    }
+
+    /// Has the connections that have waited a second or more for a reply
+    /// cut when they send again; how many there are.
+    fn cut_waiting(&self) -> usize {
+        let links = self.links.lock().unwrap();
+        links
+            .iter()
+            .filter(|l| {
+                let waiting = *l.waiting.lock().unwrap();
+                waiting.is_some_and(|since| since.elapsed() >= Duration::from_secs(1))
+            })
+            .map(|l| l.cut.store(true, std::sync::atomic::Ordering::SeqCst))
+            .count()
+    }
+}
+
+impl Link {
+    /// Passes on what the client sends (`up`), or what the server replies.
+    fn pass(&self, up: bool) {
+        use std::io::{Read, Write};
+        let (mut from, mut to) = if up {
+            (&self.client, &self.server)
+        } else {
+            (&self.server, &self.client)
+        };
+        let mut buffer = vec![0; 1 << 16];
+        while let Ok(n @ 1..) = from.read(&mut buffer) {
+            if up && self.cut.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let mut waiting = self.waiting.lock().unwrap();
+            *waiting = if up {
+                waiting.or(Some(Instant::now()))
+            } else {
+                None
+            };
+            drop(waiting);
+            if to.write_all(&buffer[..n]).is_err() {
+                break;
+            }
+        }
+        let _ = self.client.shutdown(std::net::Shutdown::Both);
+        let _ = self.server.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// An Apply on SQL Server whose connection is lost once its statement
+/// ran, while the session reads how many rows it changed (#310): the
+/// messages say the connection was lost, and the change waits for Apply.
+/// Before, they read "Conflict on row 1: it was changed or deleted by
+/// another session".
+#[test]
+fn a_connection_lost_after_an_apply_statement() {
+    let (Ok(spec), Ok(dba)) = (
+        std::env::var("DBCRAFT_TEST_MSSQL"),
+        std::env::var("DBCRAFT_TEST_MSSQL_DBA"),
+    ) else {
+        eprintln!("DBCRAFT_TEST_MSSQL / DBCRAFT_TEST_MSSQL_DBA not set, skipping");
+        return;
+    };
+    let kind = dbcraft_db::DbKind::SqlServer;
+    let mut locker = Side::connect(kind, &spec);
+    let mut admin = Side::connect(kind, &dba);
+    locker.run("drop table if exists r61_lost");
+    locker.run("create table r61_lost (id int primary key, v varchar(10))");
+    locker.run("insert into r61_lost values (1, 'a'), (2, 'b')");
+    let locker_spid = locker.run("select @@spid")[0][0].clone().unwrap();
+    let schema = locker.run("select schema_name()")[0][0].clone().unwrap();
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let (server, database) = connect_string.split_once('/').unwrap();
+    let cutter = Cutter::start(server);
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::SqlServer,
+        username: username.into(),
+        connect_string: format!("127.0.0.1:{}/{database}", cutter.port),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r61_lost order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 0, 1, Some("x".into()));
+    }
+    // Row 1 locked: the Apply's update waits, and its connection is cut
+    // when it reads the row count after it.
+    locker
+        .session
+        .send(dbcraft_db::DbRequest::SetAutocommit(false));
+    locker.run("update r61_lost set v = v where id = 1");
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    let started = Instant::now();
+    loop {
+        h.step();
+        let blocked = admin.run(&format!(
+            "select session_id from sys.dm_exec_requests \
+             where blocking_session_id = {locker_spid}"
+        ));
+        if !blocked.is_empty() && cutter.cut_waiting() > 0 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "not blocked");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(cutter.cut_waiting(), 1, "only the window's session waits");
+    locker.end(dbcraft_db::DbRequest::Rollback);
+    locker
+        .session
+        .send(dbcraft_db::DbRequest::SetAutocommit(true));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let (_, updates, _, _, messages) = part(&mut h);
+    let said = |start: &str| messages.iter().any(|m| m.starts_with(start));
+    assert!(!said("Conflict"), "{messages:?}");
+    assert!(said("Lost connection to SQL Server"), "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.ends_with("\nThe statement ran; its row count couldn't be read.")),
+        "{messages:?}"
+    );
+    assert!(said("Connection lost."), "{messages:?}");
+    assert_eq!(updates, pairs(&[("1", "x")]), "{messages:?}");
+    let stored = admin.run(&format!("select v from {schema}.r61_lost order by id"));
+    let text = |v: &str| vec![Some(v.to_owned())];
+    assert_eq!(stored, [text("a"), text("b")]);
+    h.state_mut().test_close_focused();
+    drop(h);
+    locker.run("drop table r61_lost");
+}
+
+/// An Apply in auto-commit on SQL Server whose connection is lost once a
+/// statement ran, while the session reads its row count (#310): auto-commit
+/// committed it, as it did the statements before, and none of them waits
+/// for Apply (#345). The insert of a new row waits for a lock, then the
+/// update of row 2. Before, the new row stayed pending, and applying again
+/// failed with a duplicate key; the update stayed pending on row 2's old
+/// value, which the table no longer had.
+#[test]
+fn a_connection_lost_after_an_apply_statement_in_autocommit() {
+    let (Ok(spec), Ok(dba)) = (
+        std::env::var("DBCRAFT_TEST_MSSQL"),
+        std::env::var("DBCRAFT_TEST_MSSQL_DBA"),
+    ) else {
+        eprintln!("DBCRAFT_TEST_MSSQL / DBCRAFT_TEST_MSSQL_DBA not set, skipping");
+        return;
+    };
+    let kind = dbcraft_db::DbKind::SqlServer;
+    let mut locker = Side::connect(kind, &spec);
+    let mut admin = Side::connect(kind, &dba);
+    locker.run("drop table if exists r72_ran");
+    locker.run("create table r72_ran (id int primary key, v varchar(10))");
+    locker.run("insert into r72_ran values (1, 'a'), (2, 'b')");
+    let locker_spid = locker.run("select @@spid")[0][0].clone().unwrap();
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let (server, database) = connect_string.split_once('/').unwrap();
+    let cutter = Cutter::start(server);
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::SqlServer,
+        username: username.into(),
+        connect_string: format!("127.0.0.1:{}/{database}", cutter.port),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_settings_mut().autocommit = true;
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r72_ran order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    // The Apply's statement that waits for the locker's lock is cut off
+    // when it reads its row count, once the lock is let go.
+    let cut_off = |h: &mut Harness<'_, DbCraftApp>, locker: &mut Side, admin: &mut Side| {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        let started = Instant::now();
+        loop {
+            h.step();
+            let blocked = admin.run(&format!(
+                "select session_id from sys.dm_exec_requests \
+                 where blocking_session_id = {locker_spid}"
+            ));
+            if !blocked.is_empty() && cutter.cut_waiting() > 0 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30), "not blocked");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        locker.end(dbcraft_db::DbRequest::Rollback);
+        locker
+            .session
+            .send(dbcraft_db::DbRequest::SetAutocommit(true));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+        part(h)
+    };
+    let ran = "\nThe statement ran; its row count couldn't be read.";
+    let stored = |locker: &mut Side| locker.run("select id, v from r72_ran order by id");
+    let row = |id: &str, v: &str| vec![Some(id.to_owned()), Some(v.to_owned())];
+
+    // Row 1 changed, row 3 new; the insert waits for the locker's row 3.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 0, 1, Some("x".into()));
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 2, 0, Some("3".into()));
+        r.grid.edit_cell(&rows, 2, 1, Some("n".into()));
+    }
+    locker
+        .session
+        .send(dbcraft_db::DbRequest::SetAutocommit(false));
+    locker.run("insert into r72_ran values (3, 'theirs')");
+    let (rows, updates, inserts, _, messages) = cut_off(&mut h, &mut locker, &mut admin);
+    assert!(messages.iter().any(|m| m.ends_with(ran)), "{messages:?}");
+    assert_eq!(
+        stored(&mut locker),
+        [row("1", "x"), row("2", "b"), row("3", "n")]
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "b"), ("3", "n")]),
+        "{messages:?}"
+    );
+    assert!(updates.is_empty() && inserts.is_empty(), "{messages:?}");
+    let said = |messages: &[String], text: &str| messages.iter().any(|m| m == text);
+    let too = "Auto-commit committed its change too: only its row count wasn't read";
+    assert!(
+        said(
+            &messages,
+            "Auto-commit committed the 1 change(s) applied before it"
+        ),
+        "{messages:?}"
+    );
+    assert!(said(&messages, too), "{messages:?}");
+
+    // Row 2 changed, waiting for the locker's lock on it.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 1, Some("y".into()));
+    }
+    locker
+        .session
+        .send(dbcraft_db::DbRequest::SetAutocommit(false));
+    locker.run("update r72_ran set v = v where id = 2");
+    let (rows, updates, _, _, messages) = cut_off(&mut h, &mut locker, &mut admin);
+    assert!(messages.iter().any(|m| m.ends_with(ran)), "{messages:?}");
+    assert!(said(&messages, too), "{messages:?}");
+    assert!(
+        !messages.iter().any(|m| m.contains("another session")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        stored(&mut locker),
+        [row("1", "x"), row("2", "y"), row("3", "n")]
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "y"), ("3", "n")]),
+        "{messages:?}"
+    );
+    assert!(updates.is_empty(), "{messages:?}");
+    h.state_mut().test_close_focused();
+    drop(h);
+    locker.run("drop table r72_ran");
+}
+
+/// An Apply in auto-commit whose session is killed, a lost connection,
+/// while its update of row 2 waits for a lock: the update of row 1 before
+/// it was committed and stays applied, the result fetched again has it,
+/// and the changes of rows 2 and 3 wait for Apply, which makes them once.
+/// Before, all three waited on the rows as they were, and applying again
+/// found a conflict on row 1 (#338). On Oracle (`DBCRAFT_TEST_DB`), SQL
+/// Server, MySQL and PostgreSQL, with their DBAs (PostgreSQL: the user
+/// itself).
+#[test]
+fn an_apply_cut_off_in_autocommit() {
+    use dbcraft_config::DbKind as Profile;
+    use dbcraft_db::DbKind;
+    let cases = [
+        (
+            "DBCRAFT_TEST_DB",
+            "DBCRAFT_TEST_DB_DBA",
+            DbKind::Oracle,
+            Profile::Oracle,
+        ),
+        (
+            "DBCRAFT_TEST_MSSQL",
+            "DBCRAFT_TEST_MSSQL_DBA",
+            DbKind::SqlServer,
+            Profile::SqlServer,
+        ),
+        (
+            "DBCRAFT_TEST_MYSQL",
+            "DBCRAFT_TEST_MYSQL_DBA",
+            DbKind::MySql,
+            Profile::MySql,
+        ),
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            Profile::Postgres,
+        ),
+    ];
+    for (env, dba_env, kind, profile_kind) in cases {
+        let (Ok(spec), Ok(dba)) = (std::env::var(env), std::env::var(dba_env)) else {
+            eprintln!("{env} / {dba_env} not set, skipping");
+            continue;
+        };
+        apply_cut_off_in_autocommit(kind, profile_kind, &spec, &dba);
+    }
+}
+
+fn apply_cut_off_in_autocommit(
+    kind: dbcraft_db::DbKind,
+    profile_kind: dbcraft_config::DbKind,
+    spec: &str,
+    dba: &str,
+) {
+    use dbcraft_db::DbKind;
+    let mut locker = Side::connect(kind, spec);
+    let mut admin = Side::connect(kind, dba);
+    locker.run("drop table if exists r72_auto");
+    locker.run(if kind == DbKind::Oracle {
+        "create table r72_auto (id number primary key, v varchar2(10))"
+    } else {
+        "create table r72_auto (id int primary key, v varchar(10))"
+    });
+    locker.run("insert into r72_auto values (1, 'a'), (2, 'b'), (3, 'c')");
+    let locker_id = locker.run(match kind {
+        DbKind::Oracle => "select sys_context('userenv', 'sid') from dual",
+        DbKind::SqlServer => "select @@spid",
+        DbKind::MySql => "select connection_id()",
+        _ => "select pg_backend_pid()",
+    })[0][0]
+        .clone()
+        .unwrap();
+    // The session that waits for the locker, and how it is killed.
+    let waiting = match kind {
+        DbKind::Oracle => format!(
+            "select sid || ',' || serial# from v$session where blocking_session = {locker_id}"
+        ),
+        DbKind::SqlServer => format!(
+            "select session_id from sys.dm_exec_requests where blocking_session_id = {locker_id}"
+        ),
+        // sys.innodb_lock_waits doesn't always have the Apply's update,
+        // whose transaction information_schema.innodb_trx leaves out.
+        DbKind::MySql => format!(
+            "select id from information_schema.processlist \
+             where info like 'update r72_auto set v = ''y''%' and id <> {locker_id}"
+        ),
+        _ => format!(
+            "select pid from pg_stat_activity where {locker_id} = any(pg_blocking_pids(pid))"
+        ),
+    };
+    let kill = |id: &str| match kind {
+        // Marked for kill (ORA-00031), it is gone once the lock is let go.
+        DbKind::Oracle => format!(
+            "begin execute immediate 'alter system disconnect session ''{id}'' immediate'; \
+             exception when others then if sqlcode <> -31 then raise; end if; end;"
+        ),
+        DbKind::Postgres => format!("select pg_terminate_backend({id})"),
+        _ => format!("kill {id}"),
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: profile_kind,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_settings_mut().autocommit = true;
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r72_auto order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable(), "{kind:?}");
+        let rows = r.rows.clone();
+        for (row, v) in ["x", "y", "z"].into_iter().enumerate() {
+            r.grid.edit_cell(&rows, row, 1, Some(v.into()));
+        }
+    }
+    // Row 2 locked: the Apply updates row 1, then waits, and its session
+    // is killed.
+    locker
+        .session
+        .send(dbcraft_db::DbRequest::SetAutocommit(false));
+    locker.run("update r72_auto set v = v where id = 2");
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    let started = Instant::now();
+    let id = loop {
+        h.step();
+        if let Some(id) = admin.run(&waiting).first().and_then(|r| r[0].clone()) {
+            break id;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{kind:?}: not blocked"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    admin.run(&kill(&id));
+    // Gone, it lets row 2 go: on SQL Server, fetching the result again
+    // waits for it.
+    let started = Instant::now();
+    while admin
+        .run(&waiting)
+        .iter()
+        .any(|r| r[0].as_deref() == Some(id.as_str()))
+    {
+        h.step();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{kind:?}: still blocked"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    locker.end(dbcraft_db::DbRequest::Rollback);
+    locker
+        .session
+        .send(dbcraft_db::DbRequest::SetAutocommit(true));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let text = |v: &str| vec![Some(v.to_owned())];
+    let stored = |locker: &mut Side| locker.run("select v from r72_auto order by id");
+    assert_eq!(
+        stored(&mut locker),
+        [text("x"), text("b"), text("c")],
+        "{kind:?}"
+    );
+    let (rows, updates, _, _, messages) = part(&mut h);
+    let said = |start: &str| messages.iter().any(|m| m.starts_with(start));
+    assert!(said("Connection lost."), "{kind:?}: {messages:?}");
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "b"), ("3", "c")]),
+        "{kind:?}: {messages:?}"
+    );
+    assert_eq!(
+        updates,
+        pairs(&[("2", "y"), ("3", "z")]),
+        "{kind:?}: {messages:?}"
+    );
+    assert!(
+        said("Auto-commit committed the 1 change(s) applied before it"),
+        "{kind:?}: {messages:?}"
+    );
+    assert!(
+        said("2 change(s) weren't applied: they wait for Apply"),
+        "{kind:?}: {messages:?}"
+    );
+
+    // Applied again, the two go in once.
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let (rows, updates, _, _, messages) = part(&mut h);
+    assert!(
+        !messages.iter().any(|m| m.starts_with("Conflict")),
+        "{kind:?}: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("Changes applied")),
+        "{kind:?}: {messages:?}"
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "y"), ("3", "z")]),
+        "{kind:?}"
+    );
+    assert!(updates.is_empty(), "{kind:?}");
+    assert_eq!(
+        stored(&mut locker),
+        [text("x"), text("y"), text("z")],
+        "{kind:?}"
+    );
+    h.state_mut().test_close_focused();
+    drop(h);
+    locker.run("drop table r72_auto");
+}
+
+/// An Apply whose statement after the first is chosen as a deadlock's
+/// victim, on MySQL (`DBCRAFT_TEST_MYSQL`, `DBCRAFT_TEST_MYSQL_DBA`): InnoDB
+/// rolls the whole transaction back, and all the changes wait for Apply
+/// again (#289).
+#[test]
+fn an_apply_rolled_back_by_a_deadlock() {
+    let (Ok(spec), Ok(dba)) = (
+        std::env::var("DBCRAFT_TEST_MYSQL"),
+        std::env::var("DBCRAFT_TEST_MYSQL_DBA"),
+    ) else {
+        eprintln!("DBCRAFT_TEST_MYSQL / DBCRAFT_TEST_MYSQL_DBA not set, skipping");
+        return;
+    };
+    let kind = dbcraft_db::DbKind::MySql;
+    let mut locker = Side::connect(kind, &spec);
+    let mut admin = Side::connect(kind, &dba);
+    locker.run("drop table if exists r52_apply, r52_heavy");
+    locker.run("create table r52_apply (id int primary key, v varchar(10))");
+    locker.run("create table r52_heavy (n int)");
+    locker.run("insert into r52_apply values (1, 'a'), (2, 'b'), (3, 'c')");
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r52_apply order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        for (row, v) in ["x", "y", "z"].into_iter().enumerate() {
+            r.grid.edit_cell(&rows, row, 1, Some(v.into()));
+        }
+    }
+    // The other transaction is the larger one: InnoDB rolls back the
+    // Apply's.
+    locker
+        .session
+        .send(dbcraft_db::DbRequest::SetAutocommit(false));
+    locker.run(
+        "insert into r52_heavy with recursive r (n) as \
+         (select 1 union all select n + 1 from r where n < 200) select n from r",
+    );
+    locker.run("update r52_apply set v = v where id = 2");
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    let started = Instant::now();
+    // Row 2's update waits for the lock.
+    while admin
+        .run(
+            "select 1 from information_schema.processlist \
+             where info like 'update r52_apply set v = ''y''%'",
+        )
+        .is_empty()
+    {
+        h.step();
+        assert!(started.elapsed() < Duration::from_secs(30), "not waiting");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    locker.run("update r52_apply set v = v where id = 1");
+    locker.end(dbcraft_db::DbRequest::Rollback);
+    locker
+        .session
+        .send(dbcraft_db::DbRequest::SetAutocommit(true));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let (rows, updates, _, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.contains("ERROR 1213")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "a"), ("2", "b"), ("3", "c")]),
+        "{messages:?}"
+    );
+    assert_eq!(
+        updates,
+        pairs(&[("1", "x"), ("2", "y"), ("3", "z")]),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m
+                .starts_with("The transaction was rolled back with it: the 1 change(s) applied")),
+        "{messages:?}"
+    );
+    h.state_mut().test_rollback();
+    h.state_mut().test_close_focused();
+    locker.run("drop table r52_apply, r52_heavy");
+}
+
+/// Types `.` after a table alias in a real editor and waits for the
+/// completion popup, which needs a round trip to the dictionary.
+#[test]
+fn completion_popup() {
+    let Some((profile, password)) = profile() else {
+        eprintln!("DBCRAFT_TEST_DB not set, skipping");
+        return;
+    };
+    for dark in [true, false] {
+        let mut h = harness(dark);
+        h.state_mut()
+            .test_connect(profile.clone(), password.clone());
+        wait_until(&mut h, "connection", |app| app.test_connected());
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "dbcraft@FREEPDB1".into(),
+            text: "select e\n  from demo_employees e\n where e.department_id = 20".into(),
+            run: false,
+        });
+        h.run_steps(3);
+        h.state_mut().test_sql_window().editor.select(8..8);
+        h.run_steps(3);
+        h.event(egui::Event::Text(".".into()));
+        wait_until(&mut h, "completion popup", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.completion_visible_with("SALARY"))
+        });
+        save(
+            &mut h,
+            &format!("08-completion-{}", if dark { "dark" } else { "light" }),
+        );
+    }
+}
+
+/// Imports a CSV with a decimal comma, European dates and NULLs into a new
+/// table and checks the converted values in the database.
+#[test]
+fn import_csv() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("dbcraft-import-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("orders 2024.csv");
+    std::fs::write(&path, "Order id;Customer;Amount;Order date\n1;Acme;1.234,50;31.12.2024\n2;;7;01.01.2025\n3;Globex;-0,5;15.06.2024\n").unwrap();
+
+    let mut h = harness(true);
+    h.state_mut()
+        .test_connect(profile.clone(), password.clone());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin execute immediate 'drop table dbcraft_import_t purge'; exception when others then null; end;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+
+    h.state_mut().test_import(path, "dbcraft_import_t");
+    wait_until(&mut h, "import", |app| !app.test_focused_busy());
+    let message = h.state().test_import_message();
+    assert!(
+        matches!(&message, Some((false, m)) if m.starts_with("Imported 3 rows")),
+        "{message:?}"
+    );
+    save(&mut h, "11-import-dark");
+
+    let (cred, db) = std::env::var("DBCRAFT_TEST_DB")
+        .unwrap()
+        .rsplit_once('@')
+        .map(|(c, d)| (c.to_owned(), d.to_owned()))
+        .unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, &db).unwrap();
+    let rows: Vec<(i64, Option<String>, f64, String)> = conn
+        .query_as("select order_id, customer, amount, to_char(order_date, 'YYYY-MM-DD') from dbcraft_import_t order by order_id", &[])
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (1, Some("Acme".into()), 1234.5, "2024-12-31".into()),
+            (2, None, 7.0, "2025-01-01".into()),
+            (3, Some("Globex".into()), -0.5, "2024-06-15".into()),
+        ]
+    );
+    conn.execute("drop table dbcraft_import_t purge", &[])
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Imports into new tables named as given: a quoted name keeps its case,
+/// and columns that read quoted (a reserved word, a letter that isn't
+/// ASCII) are created as they are inserted into (#335). Café is CAFÉ, as
+/// Oracle reads café (#380).
+#[test]
+fn import_keeps_quoted_names() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("dbcraft-import-r71-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r71.csv");
+    std::fs::write(&path, "Id;Date;Café\n1;31.12.2024;x\n2;01.01.2025;y\n").unwrap();
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["r71_import", "\"R71_My Table\"", "\"r71_my table\""];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    for table in ["r71_import", "\"R71_My Table\""] {
+        h.state_mut().test_import(path.clone(), table);
+        wait_until(&mut h, "import", |app| !app.test_focused_busy());
+        let message = h.state().test_import_message();
+        assert!(
+            matches!(&message, Some((false, m)) if m.starts_with("Imported 2 rows")),
+            "{table}: {message:?}"
+        );
+        let rows: Vec<(i64, String, String)> = conn
+            .query_as(
+                &format!(
+                    "select id, to_char(\"DATE\", 'YYYY-MM-DD'), café from {table} order by id"
+                ),
+                &[],
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (1, "2024-12-31".into(), "x".into()),
+                (2, "2025-01-01".into(), "y".into())
+            ],
+            "{table}"
+        );
+    }
+    let made: Vec<String> = conn
+        .query_as(
+            "select table_name from user_tables \
+              where upper(table_name) in ('R71_IMPORT', 'R71_MY TABLE') order by table_name",
+            &[],
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(made, ["R71_IMPORT", "R71_My Table"]);
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Imports into new tables named with a dot in their quotes, as Oracle
+/// reads them: `"R83.Dot"` and `dbcraft."R83.Dot2"` are tables of the
+/// session's schema and of DBCRAFT (#369).
+#[test]
+fn import_reads_the_table_as_typed() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("dbcraft-import-r83-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r83.csv");
+    std::fs::write(&path, "Id;Name\n1;x\n2;y\n").unwrap();
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["\"R83.Dot\"", "\"R83.Dot2\""];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let mut imported = Vec::new();
+    for table in ["\"R83.Dot\"", "dbcraft.\"R83.Dot2\""] {
+        h.state_mut().test_import(path.clone(), table);
+        wait_until(&mut h, "import", |app| !app.test_focused_busy());
+        imported.push(h.state().test_import_message());
+    }
+    let made: Vec<String> = conn
+        .query_as(
+            "select table_name from user_tables where table_name like 'R83.Dot%' \
+              order by table_name",
+            &[],
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let rows = |table: &str| {
+        conn.query_row_as::<i64>(&format!("select count(*) from {table}"), &[])
+            .ok()
+    };
+    let counts: Vec<Option<i64>> = tables.iter().map(|t| rows(t)).collect();
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    for message in &imported {
+        assert!(
+            matches!(message, Some((false, m)) if m.starts_with("Imported 2 rows")),
+            "{imported:?}"
+        );
+    }
+    assert_eq!(made, ["R83.Dot", "R83.Dot2"]);
+    assert_eq!(counts, [Some(2), Some(2)]);
+}
+
+/// Debugs a block calling `demo_pkg.raise_salary` with a breakpoint in the
+/// package body: stops at the line, shows variables, steps and finishes.
+/// A debug run whose session can't connect to the debugger (no network ACL
+/// entry names its host) ends instead of waiting for it.
+#[test]
+fn debug_run_that_cannot_connect() {
+    let Some((profile, password)) = profile() else {
+        eprintln!("DBCRAFT_TEST_DB not set, skipping");
+        return;
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_settings_mut().debug_host = "no-acl.invalid".into();
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin\n  null;\nend;".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "the run to end", |app| !app.test_debug_running());
+    h.run_steps(2);
+    let debug = h.state().test_debug();
+    assert_eq!(
+        debug.state,
+        dbcraft_debugger::ui::State::Finished,
+        "{:?}",
+        debug.log
+    );
+    // The panel says why, and the setup opens for it.
+    let problem = debug.problem.clone().expect("the problem");
+    assert!(
+        problem.starts_with("No network ACL entry lets the database connect to no-acl.invalid"),
+        "{problem}"
+    );
+    let setup = h.state_mut().test_setup_window();
+    assert!(setup.open);
+    assert_eq!(setup.test_reason(), Some(problem.as_str()));
+}
+
+/// The debugger setup, end to end: a user without a network ACL entry
+/// starts debugging; the setup opens by itself, finds that every host
+/// fails on the ACL, offers the entry, runs it as the DBA, and then
+/// debugging works.
+#[test]
+fn debugger_setup_fixes_the_acl() {
+    let (Some((profile, _)), Ok(dba)) = (profile(), std::env::var("DBCRAFT_TEST_DB_DBA")) else {
+        eprintln!("DBCRAFT_TEST_DB / DBCRAFT_TEST_DB_DBA not set, skipping");
+        return;
+    };
+    let _accounts = crate::test_db::ACCOUNTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Entries outlive their user: drop those of an earlier run too.
+    let cleanup = [
+        "begin
+           for a in (select host, lower_port, upper_port from dba_host_aces
+                      where principal = 'DBCRAFT_DBG_SETUP') loop
+             dbms_network_acl_admin.remove_host_ace(host => a.host,
+               lower_port => a.lower_port, upper_port => a.upper_port,
+               ace => xs$ace_type(privilege_list => xs$name_list('jdwp'),
+                                  principal_name => 'DBCRAFT_DBG_SETUP',
+                                  principal_type => xs_acl.ptype_db),
+               remove_empty_acl => true);
+           end loop;
+         end;",
+        "begin
+           for s in (select sid, serial# from v$session
+                      where username = 'DBCRAFT_DBG_SETUP') loop
+             execute immediate 'alter system kill session '''
+               || s.sid || ',' || s.serial# || ''' immediate';
+           end loop;
+           execute immediate 'drop user dbcraft_dbg_setup cascade';
+         exception when others then
+           if sqlcode != -1918 then raise; end if;
+         end;",
+    ];
+    crate::test_db::as_dba(&cleanup);
+    crate::test_db::as_dba(&[
+        "create user dbcraft_dbg_setup identified by dbcraft",
+        "grant create session, debug connect session to dbcraft_dbg_setup",
+    ]);
+    let user = ConnectionProfile {
+        name: "dbcraft_dbg_setup@FREEPDB1".into(),
+        username: "dbcraft_dbg_setup".into(),
+        ..profile
+    };
+    let mut h = harness(true).alone();
+    h.state_mut().test_connect(user, "dbcraft".into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft_dbg_setup@FREEPDB1".into(),
+        text: "begin\n  null;\nend;".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "the run to end", |app| !app.test_debug_running());
+    wait_until(&mut h, "the setup's checks", |app| {
+        let setup = app.test_setup_window_ref();
+        setup.open && setup.test_done()
+    });
+    let setup = h.state_mut().test_setup_window();
+    let hosts = setup.test_hosts();
+    assert!(
+        hosts.iter().all(|(_, probe)| matches!(
+            probe,
+            Some(dbcraft_debugger::setup::Probe::Failed {
+                problem: dbcraft_debugger::setup::Problem::Acl,
+                ..
+            })
+        )),
+        "{hosts:?}"
+    );
+    // Only the entry: the user has the privilege. It's for the address the
+    // database sees for this computer.
+    let fix = setup.test_fix().expect("a fix");
+    assert_eq!(fix.len(), 1, "{fix:?}");
+    assert!(fix[0].contains("append_host_ace("), "{fix:?}");
+    assert!(
+        fix[0].contains("principal_name => 'DBCRAFT_DBG_SETUP'"),
+        "{fix:?}"
+    );
+    save(&mut h, "debug-setup-acl");
+
+    let (credentials, _) = dba.rsplit_once('@').unwrap();
+    let (dba_user, dba_password) = credentials.split_once('/').unwrap();
+    h.state_mut()
+        .test_setup_window()
+        .test_run_as(dba_user, dba_password);
+    h.run_steps(2);
+    h.get_by_label("Run statements").scroll_to_me();
+    // The scroll is animated: click where the button ends up.
+    h.run_steps(30);
+    h.get_by_label("Run statements").click();
+    h.run_steps(2);
+    let start = Instant::now();
+    loop {
+        let setup = h.state().test_setup_window_ref();
+        if setup.test_done() && setup.test_works() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "after the fix: {:?} {:?}",
+            setup.test_notice(),
+            setup.test_hosts()
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    save(&mut h, "debug-setup-works");
+
+    // Debugging works now, with the host the entry is for.
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "the second run to end", |app| {
+        !app.test_debug_running()
+    });
+    let debug = h.state().test_debug();
+    assert_eq!(debug.problem, None, "{:?}", debug.log);
+    assert!(
+        debug.log.iter().any(|l| l.starts_with("Connected")),
+        "{:?}",
+        debug.log
+    );
+    drop(h);
+    crate::test_db::as_dba(&cleanup);
+}
+
+/// Needs DEBUG CONNECT SESSION / DEBUG ANY PROCEDURE and a JDWP ACL for the
+/// test user (see dbcraft-debugger's setup script) and DBCRAFT_DEBUG_HOST.
+#[test]
+fn debugger_session() {
+    let (Some((profile, password)), Ok(host)) = (profile(), std::env::var("DBCRAFT_DEBUG_HOST"))
+    else {
+        eprintln!("DBCRAFT_TEST_DB / DBCRAFT_DEBUG_HOST not set, skipping");
+        return;
+    };
+    debug_setup(&profile.username, &host);
+    use dbcraft_debugger::{Unit, UnitType};
+    let mut h = harness(true).alone();
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let unit = Unit::new("DBCRAFT", "DEMO_PKG", UnitType::PackageBody);
+    // Line 4 of the body: the UPDATE inside raise_salary. It only stops for
+    // employee 1 (the condition skips the first call).
+    h.state_mut().test_debug_setup(&host, unit.clone(), 4);
+    let bp = dbcraft_debugger::Breakpoint {
+        unit: unit.clone(),
+        line: 4,
+    };
+    {
+        let debug = h.state_mut().test_debug_mut();
+        debug.set_options(
+            &bp,
+            dbcraft_debugger::BreakpointOptions {
+                condition: Some("p_employee_id = 1".into()),
+                hit_count: None,
+            },
+        );
+        debug.add_watch("p_percent");
+        debug.add_watch("p_employee_id * 2");
+    }
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin\n  demo_pkg.raise_salary(p_employee_id => 2, p_percent => 0);\n  \
+               demo_pkg.raise_salary(p_employee_id => 1, p_percent => 0);\n  rollback;\nend;"
+            .into(),
+        run: false,
+    });
+    h.run_steps(2);
+    let sql = h.state().test_focused();
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
+    let stack = &h.state().test_debug().stack;
+    assert_eq!(stack[0].location.unit, unit, "{stack:?}");
+    assert_eq!(stack[0].location.line, Some(4));
+    let vars: Vec<String> = h
+        .state()
+        .test_debug()
+        .variables
+        .iter()
+        .map(|v| format!("{}={}", v.name, v.value.as_deref().unwrap_or("NULL")))
+        .collect();
+    assert!(
+        vars.iter()
+            .any(|v| v.eq_ignore_ascii_case("p_employee_id=1")),
+        "condition skipped employee 2: {vars:?}"
+    );
+    let debug = h.state().test_debug();
+    assert_eq!(debug.hits.get(&bp), Some(&1));
+    let watches: Vec<(String, Result<Option<String>, String>)> = debug
+        .watch_values
+        .iter()
+        .map(|w| (w.expression.clone(), w.value.clone().map(|v| v.value)))
+        .collect();
+    assert_eq!(watches[0], ("p_percent".into(), Ok(Some("0".into()))));
+    assert!(
+        watches[1].1.is_err(),
+        "expressions aren't evaluated: {watches:?}"
+    );
+    // Hovering a parameter in the stopped package body shows its value
+    // (once the body's source has loaded).
+    let needle = "where employee_id = p_employee_id";
+    let start = Instant::now();
+    let offset = loop {
+        let program = h.state_mut().test_program();
+        let editor = program.active_editor().expect("package body editor");
+        if let Some(at) = editor.text().find(needle) {
+            break at + "where employee_id = ".len() + 3;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "raise_salary body not shown: {:?}",
+            editor.text()
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+    };
+    let debug = h.state().test_debug();
+    assert_eq!(
+        debug.hover(&unit, "P_EMPLOYEE_ID").map(|(_, v)| v),
+        Some("1".into())
+    );
+    // The app borrows both; take the session out for the call.
+    let mut session = dbcraft_debugger::ui::DebugSession::default();
+    std::mem::swap(&mut session, h.state_mut().test_debug_mut());
+    let program = h.state_mut().test_program();
+    let editor = program.active_editor().unwrap();
+    assert!(crate::editor::debug_hover(editor, offset, &session, &unit));
+    std::mem::swap(&mut session, h.state_mut().test_debug_mut());
+    h.run_steps(6);
+    save(&mut h, "12-debugger-dark");
+
+    // The panel says why a value can't be changed (raise_salary has only
+    // IN parameters; changes themselves are dbcraft-debugger's tests).
+    h.state_mut()
+        .test_debug_mut()
+        .set_value("p_percent", Some("5".into()));
+    wait_until(&mut h, "refused change", |app| {
+        app.test_debug().log.last().map(String::as_str)
+            == Some("Can't set p_percent: it can't be changed (IN parameters are read-only)")
+    });
+
+    // Run to the block's `rollback`, from the cursor in the SQL window.
+    h.state_mut().test_focus(sql);
+    {
+        let editor = &mut h.state_mut().test_sql_window().editor;
+        let at = editor.text().find("rollback").unwrap();
+        editor.select(at..at);
+    }
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugRunToCursor);
+    wait_until(&mut h, "run to cursor", |app| {
+        app.test_debug().is_suspended() || !app.test_debug_running()
+    });
+    let debug = h.state().test_debug();
+    assert_eq!(
+        debug.state,
+        dbcraft_debugger::ui::State::Suspended {
+            reason: dbcraft_debugger::StopReason::Cursor
+        },
+        "{:?}",
+        debug.log
+    );
+    let frame = debug.current_frame().unwrap();
+    assert_eq!(frame.location.unit.unit_type, UnitType::Block);
+    assert_eq!(frame.location.line, Some(4), "the block's 4th line");
+    h.state_mut()
+        .test_debug_mut()
+        .command(dbcraft_debugger::DebugCommand::Resume);
+    wait_until(&mut h, "finish", |app| !app.test_debug_running());
+}
+
+/// The Variables panel keeps its width (#197): its header and NULL boxes
+/// were wider than the widths it laid out, the panel took the extra width,
+/// and the next frame laid out from that, until the editor was gone.
+#[test]
+fn variables_panel_keeps_its_width() {
+    for (text, scale) in [
+        ("select :x from dual", 1.0),
+        ("select :x from dual", 1.25),
+        (
+            "select :a_rather_long_bind_name, &some_substitution from dual",
+            1.5,
+        ),
+    ] {
+        let mut h = headless_harness();
+        h.ctx.set_pixels_per_point(scale);
+        h.run_steps(2);
+        h.get_by_label("New SQL").click();
+        h.run_steps(2);
+        h.event(egui::Event::Text(text.into()));
+        h.run_steps(3);
+        let first = h.get_by_label("Value").rect().left();
+        for i in 0..60 {
+            h.event(egui::Event::PointerMoved(egui::pos2(
+                400.0 + i as f32,
+                300.0,
+            )));
+            h.run_steps(1);
+        }
+        let last = h.get_by_label("Value").rect().left();
+        assert!(
+            (first - last).abs() < 1.0,
+            "{text} at {scale}: {first} → {last}"
+        );
+    }
+}
+
+/// *New SQL* puts the keyboard focus into the new window's editor: typing
+/// right away goes there, from the toolbar button and from Ctrl+N (#157).
+#[test]
+fn new_sql_window_has_the_focus() {
+    let mut h = headless_harness();
+    h.run_steps(2);
+    h.get_by_label("New SQL").click();
+    h.run_steps(2);
+    h.event(egui::Event::Text("select 1".into()));
+    h.run_steps(2);
+    let first = h.state_mut().test_sql_window().title.clone();
+    assert_eq!(h.state_mut().test_sql_window().editor.text(), "select 1");
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+    h.run_steps(2);
+    h.event(egui::Event::Text("select 2".into()));
+    h.run_steps(2);
+    let w = h.state_mut().test_sql_window();
+    assert_ne!(w.title, first, "a new window");
+    assert_eq!(w.editor.text(), "select 2");
+}
+
+/// *View → Variables* is for a SQL window with variables (#168): off
+/// without them, ticked while the panel shows them. Run from elsewhere
+/// without variables, it says so instead of switching the panel off for
+/// the variables typed later.
+#[test]
+fn variables_menu_item() {
+    use egui_kittest::kittest::NodeT;
+    let item = "Variables (SQL window)";
+    // The item's state in the View menu: (enabled, ticked).
+    let state = |h: &mut Ui| {
+        h.get_by_label("View").click();
+        h.run_steps(2);
+        let node = h.get_by_label_contains(item).accesskit_node();
+        let state = (
+            !node.is_disabled(),
+            node.toggled() == Some(egui::accesskit::Toggled::True),
+        );
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        state
+    };
+    let mut h = headless_harness();
+    h.run_steps(2);
+    assert_eq!(state(&mut h), (false, false), "no SQL window");
+    h.get_by_label("New SQL").click();
+    h.run_steps(2);
+    h.event(egui::Event::Text("select 1 from dual".into()));
+    h.run_steps(2);
+    assert_eq!(state(&mut h), (false, false), "no variables");
+
+    h.state_mut()
+        .test_command(crate::commands::Command::ShowVariables);
+    h.run_steps(2);
+    assert!(h.state_mut().test_sql_window().show_variables);
+    assert_eq!(
+        h.state().test_log().last().map(String::as_str),
+        Some("This SQL window has no bind (:name) or substitution (&name) variables")
+    );
+
+    // A bind: the panel opens, and the item hides it.
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text("select 1 from dual where 1 = :id");
+    h.run_steps(2);
+    assert!(h.query_by_label("Variables").is_some(), "the panel");
+    assert_eq!(state(&mut h), (true, true));
+    h.get_by_label("View").click();
+    h.run_steps(2);
+    h.get_by_label_contains(item).click();
+    h.run_steps(2);
+    assert!(!h.state_mut().test_sql_window().show_variables);
+    assert!(h.query_by_label("Variables").is_none(), "hidden");
+    assert_eq!(state(&mut h), (true, false));
+}
+
+/// Orders mostly shipped, a few new: without a histogram the optimizer
+/// expects half of them new.
+const SHOP: &[&str] = &[
+    "create table shop_customers as
+       select level id, 'Customer ' || level name from dual connect by level <= 500",
+    "create table shop_orders as
+       select level id, mod(level, 500) + 1 customer_id,
+              case when level <= 200 then 'NEW' else 'SHIPPED' end status,
+              rpad('x', 60, 'x') note
+         from dual connect by level <= 50000",
+    "begin
+       dbms_stats.gather_table_stats(user, 'SHOP_CUSTOMERS');
+       dbms_stats.gather_table_stats(user, 'SHOP_ORDERS', method_opt => 'for all columns size 1');
+     end;",
+    "create or replace procedure ship_new_orders is
+  l_shipped pls_integer := 0;
+begin
+  for o in (select o.id, c.name
+              from shop_orders o
+              join shop_customers c on c.id = o.customer_id
+             where o.status = 'NEW') loop
+    l_shipped := l_shipped + 1;
+  end loop;
+  dbms_output.put_line(l_shipped || ' orders shipped');
+end;",
+];
+
+/// The SQL panel while stopped: the loop's statement, matched to its line,
+/// with the estimated and actual rows of its plan.
+#[test]
+fn debugger_sql_panel() {
+    let (Some((profile, password)), Ok(host)) = (profile(), std::env::var("DBCRAFT_DEBUG_HOST"))
+    else {
+        eprintln!("DBCRAFT_TEST_DB / DBCRAFT_DEBUG_HOST not set, skipping");
+        return;
+    };
+    debug_setup(&profile.username, &host);
+    // The SQL panel's views, before any session connects (#154).
+    crate::test_db::as_dba(&["grant select_catalog_role to {user}"]);
+    let conn = crate::test_db::connect("DBCRAFT_TEST_DB").unwrap();
+    for drop in [
+        "drop table shop_orders purge",
+        "drop table shop_customers purge",
+    ] {
+        let _ = conn.execute(drop, &[]);
+    }
+    for ddl in SHOP {
+        conn.execute(ddl, &[])
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    use crate::app::Tab;
+    use dbcraft_debugger::{Unit, UnitType};
+    let unit = Unit::new("DBCRAFT", "SHIP_NEW_ORDERS", UnitType::Procedure);
+    let mut h = Ui {
+        harness: new_harness(true, out_dir().is_some(), egui::vec2(1440.0, 1000.0)),
+        lock: Some(UI_LOCK.alone()),
+    };
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    // After the loop.
+    h.state_mut().test_debug_setup(&host, unit.clone(), 10);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin\n  ship_new_orders;\nend;".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
+    h.run_steps(2);
+    // The window the debugger opened leaves the code its width (#170).
+    let program = h.state_mut().test_program();
+    assert_eq!(program.object.name, "SHIP_NEW_ORDERS");
+    assert!(!program.show_outline, "no outline");
+    // Closed; a statement whose estimates are off is flagged in the
+    // gutter (#162) and by the plan button, but the plan doesn't open
+    // (#169).
+    assert!(!h.state().test_debug().sql_shown());
+    wait_until(&mut h, "the loop's flag", |app| {
+        app.test_debug().sql_flag_count() > 0
+    });
+    h.run_steps(2);
+    assert!(!h.state().test_debug().sql_shown(), "stays closed");
+    assert!(h.state().test_tab(Tab::DebugSql).is_none());
+    // Opened, it shows the flagged statement.
+    h.get_by_label("SQL plan").click();
+    wait_until(&mut h, "the loop's plan", |app| {
+        app.test_debug().sql_plan().is_some_and(|p| p.measured())
+    });
+    assert!(
+        h.state()
+            .test_tab(Tab::DebugSql)
+            .is_some_and(|(_, front)| front),
+        "in front"
+    );
+    let debug = h.state().test_debug();
+    assert!(debug.sql_shown());
+    let flags = debug.sql_flags(Some(&unit));
+    assert_eq!(flags.len(), 1, "{flags:?}");
+    assert_eq!(flags[0].0, 4);
+    assert!(flags[0].1.contains("DBCRAFT.SHOP_ORDERS"), "{flags:?}");
+    let statement = &debug.sql_statements()[0];
+    assert_eq!(
+        (statement.unit.as_ref(), statement.line),
+        (Some(&unit), 4),
+        "{:?}",
+        debug.sql_statements()
+    );
+    let plan = debug.sql_plan().unwrap();
+    assert!(
+        plan.text.contains("WHERE O.STATUS = 'NEW'"),
+        "{}",
+        plan.text
+    );
+    let worst = dbcraft_ui::plan::worst_misestimate(&plan.rows).expect("a misestimate");
+    assert_eq!(worst.object, "DBCRAFT.SHOP_ORDERS", "{worst:?}");
+    assert_eq!(worst.actual_rows, Some(200.0));
+    assert!(worst.misestimate().unwrap() >= 100.0, "{worst:?}");
+    save(&mut h, "13-debugger-sql-plan-dark");
+    h.state_mut()
+        .test_debug_mut()
+        .command(dbcraft_debugger::DebugCommand::Resume);
+    wait_until(&mut h, "finish", |app| !app.test_debug_running());
+    drop(h);
+    let _ = conn.execute("drop procedure ship_new_orders", &[]);
+    for drop in [
+        "drop table shop_orders purge",
+        "drop table shop_customers purge",
+    ] {
+        let _ = conn.execute(drop, &[]);
+    }
+}
+
+/// The monitor's SQL details of a statement that collected row source
+/// statistics: the plan as a tree with E-Rows and A-Rows (#152).
+#[test]
+fn monitor_plan_with_actual_rows() {
+    let Some((profile, password)) = profile() else {
+        eprintln!("DBCRAFT_TEST_DB not set, skipping");
+        return;
+    };
+    // The plan views, before any session connects (#154).
+    crate::test_db::as_dba(&["grant select_catalog_role to {user}"]);
+    let conn = crate::test_db::connect("DBCRAFT_TEST_DB").unwrap();
+    let marker = format!(
+        "dbcraft_monplan_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    // Estimated at 1% of the rows, all of them match.
+    let sql = format!(
+        "select /*+ gather_plan_statistics */ /* {marker} */ count(*) \
+           from (select level n from dual connect by level <= 3000) \
+          where upper(to_char(n)) = to_char(n)"
+    );
+    let run = || conn.query_row_as::<i64>(&sql, &[]).unwrap();
+    // It can leave the pool before it's looked up, too (#167): run it again.
+    let sql_id: String = (0..10)
+        .find_map(|_| {
+            assert_eq!(run(), 3000);
+            conn.query_as::<String>(
+                "select sql_id from v$sql where sql_text like '%' || :1 || '%' \
+                   and sql_text not like '%v$sql%' and rownum = 1",
+                &[&marker],
+            )
+            .unwrap()
+            .next()
+            .map(Result::unwrap)
+        })
+        .expect("the statement in V$SQL");
+    // Tall enough for the plan below the totals.
+    let mut h = sized_harness(egui::vec2(1440.0, 1450.0));
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Monitor {
+        connection: "dbcraft@FREEPDB1".into(),
+        start: crate::monitor_window::MonitorStart::Sessions,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_monitor_window()
+        .test_monitor()
+        .open_sql(sql_id.clone());
+    // The details read, with the plan's statistics.
+    let measured = |app: &DbCraftApp| -> Result<bool, String> {
+        let Some(view) = app
+            .test_monitor_window_ref()
+            .test_monitor_ref()
+            .and_then(|m| m.sql_detail(&sql_id))
+        else {
+            return Ok(false);
+        };
+        match view.detail() {
+            Ok(Some(d)) if !d.errors.is_empty() => Err(format!("{:?}", d.errors)),
+            Ok(Some(d)) => Ok(dbcraft_ui::plan::has_actuals(&d.plan_rows)),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.to_owned()),
+        }
+    };
+    // Gone from the shared pool when the details read it (seen with the
+    // whole suite on a fresh database, #154): run it again, read again.
+    // Also when it went between the child cursors and the plan: a child,
+    // but no plan lines, DBMS_XPLAN's "cannot be found" (#167).
+    let gone = |app: &DbCraftApp| {
+        app.test_monitor_window_ref()
+            .test_monitor_ref()
+            .and_then(|m| m.sql_detail(&sql_id))
+            .and_then(|v| v.detail().ok().flatten())
+            .is_some_and(|d| d.plan_rows.is_empty())
+    };
+    let start = Instant::now();
+    let mut rerun = Instant::now();
+    while !measured(h.state()).unwrap_or_else(|e| panic!("SQL details of {sql_id}: {e}")) {
+        if gone(h.state()) && rerun.elapsed() > Duration::from_secs(2) {
+            rerun = Instant::now();
+            run();
+            if let Some(view) = h
+                .state_mut()
+                .test_monitor_window()
+                .test_monitor()
+                .sql_detail_mut(&sql_id)
+            {
+                view.reload();
+            }
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let monitor = h.state().test_monitor_window_ref().test_monitor_ref();
+            let view = monitor.and_then(|m| m.sql_detail(&sql_id));
+            let detail = view.map(|v| {
+                v.detail()
+                    .map(|d| d.map(|d| (&d.child, &d.plan_rows, &d.plan)))
+            });
+            let dba = crate::test_db::connect("DBCRAFT_TEST_DB_DBA");
+            let in_pool: Option<Vec<(i64, String, i64)>> = dba.map(|dba| {
+                dba.query_as::<(i64, String, i64)>(
+                    "select child_number, is_obsolete, invalidations from v$sql where sql_id = :1",
+                    &[&sql_id],
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+            });
+            panic!("no plan with actual rows for {sql_id}: {detail:#?}\nin V$SQL now: {in_pool:?}");
+        }
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    h.run_steps(3);
+    assert!(h.query_by_label("A-Rows").is_some(), "the tree's columns");
+    assert!(
+        h.query_all_by_label_contains("Row estimate off at plan line")
+            .next()
+            .is_some(),
+        "the misestimate is named"
+    );
+    save(&mut h, "07-monitor-sql-plan-dark");
+}
+
+/// One test at a time runs [`debug_setup`]'s statements.
+static DEBUG_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lets `user` debug with the database connecting back to `host`, as the
+/// DBA. One test at a time: adding the same ACL entry from two sessions
+/// collides while it doesn't exist yet (#155). A lock of its own, held for
+/// the statements only: tests call it holding the UI lock, and
+/// `debugger_setup_fixes_the_acl` holds ACCOUNTS while it waits for that.
+fn debug_setup(user: &str, host: &str) {
+    let _setup = DEBUG_SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let setup = dbcraft_debugger::target::setup_statements(user, host);
+    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+/// dbcraft-debugger's debugging scenario: order processing across packages.
+const DEBUG_SCENARIO: &str = include_str!("../../dbcraft-debugger/tests/scenario/orders.sql");
+
+/// The environment of the debugger scenario tests: the test user's profile
+/// and password and the debugger host (the DBA must be set too).
+fn debug_environment() -> Option<(ConnectionProfile, String, String)> {
+    let (Some((profile, password)), Ok(host), Ok(_)) = (
+        profile(),
+        std::env::var("DBCRAFT_DEBUG_HOST"),
+        std::env::var("DBCRAFT_TEST_DB_DBA"),
+    ) else {
+        eprintln!("DBCRAFT_TEST_DB / DBCRAFT_TEST_DB_DBA / DBCRAFT_DEBUG_HOST not set, skipping");
+        return None;
+    };
+    Some((profile, password, host))
+}
+
+/// Lets the test user debug (with the database connecting back to `host`)
+/// and installs [`DEBUG_SCENARIO`], compiled without debug information.
+/// Returns a connection of the test user. The tests share the scenario:
+/// create the harness first, [alone](Ui::alone).
+fn install_debug_scenario(host: &str) -> dbcraft_db::oracle::Connection {
+    let connect = |spec: &str| {
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap()
+    };
+    debug_setup("dbcraft", host);
+    let conn = connect(&std::env::var("DBCRAFT_TEST_DB").unwrap());
+    for drop in [
+        "drop trigger dbgx_orders_bu",
+        "drop package dbgx_orders_api",
+        "drop package dbgx_pricing",
+        "drop package dbgx_types",
+        "drop type dbgx_money force",
+        "drop type dbgx_codes force",
+        "drop table dbgx_audit purge",
+        "drop table dbgx_order_lines purge",
+        "drop table dbgx_orders purge",
+        "drop table dbgx_customers purge",
+    ] {
+        let _ = conn.execute(drop, &[]);
+    }
+    for stmt in dbcraft_plsql::split_statements(DEBUG_SCENARIO) {
+        let sql = stmt.text(DEBUG_SCENARIO);
+        conn.execute(sql, &[])
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    conn
+}
+
+/// Line of a `-- @name` marker in the scenario's statement that starts
+/// with `head` (e.g. `create or replace trigger dbgx_orders_bu`).
+fn scenario_marker(head: &str, name: &str) -> u32 {
+    let source = dbcraft_plsql::split_statements(DEBUG_SCENARIO)
+        .into_iter()
+        .map(|s| s.text(DEBUG_SCENARIO))
+        .find(|s| s.to_lowercase().starts_with(head))
+        .unwrap();
+    source
+        .lines()
+        .position(|l| l.contains(&format!("-- @{name}")))
+        .unwrap() as u32
+        + 1
+}
+
+/// The debugger scenario from dbcraft-debugger's tests: the editors follow
+/// every stop, from a package body to a trigger and back, and into the SQL
+/// window's block. Needs DBCRAFT_TEST_DB, DBCRAFT_TEST_DB_DBA and
+/// DBCRAFT_DEBUG_HOST.
+#[test]
+fn debugger_follows_execution() {
+    use dbcraft_debugger::{DebugCommand, Unit, UnitType};
+    let Some((profile, password, host)) = debug_environment() else {
+        return;
+    };
+    let mut h = harness(true).alone();
+    // Install the scenario, with debug information everywhere.
+    let conn = install_debug_scenario(&host);
+    let unit = |name: &str, t| Unit::new("DBCRAFT", name, t);
+    let api = unit("DBGX_ORDERS_API", UnitType::PackageBody);
+    let trigger = unit("DBGX_ORDERS_BU", UnitType::Trigger);
+    for u in [
+        &api,
+        &trigger,
+        &unit("DBGX_PRICING", UnitType::PackageBody),
+        &unit("DBGX_MONEY", UnitType::TypeBody),
+    ] {
+        dbcraft_debugger::target::compile_debug(&conn, u).unwrap();
+    }
+    let load_done = scenario_marker(
+        "create or replace package body dbgx_orders_api",
+        "load_done",
+    );
+    let on_update = scenario_marker("create or replace trigger dbgx_orders_bu", "trigger");
+
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut()
+        .test_debug_setup(&host, api.clone(), load_done);
+    h.state_mut()
+        .test_debug_setup(&host, trigger.clone(), on_update);
+    // The block isn't the first statement: its lines start further down.
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "select count(*) from dbgx_orders;\n\n\
+               declare\n  l_count pls_integer;\nbegin\n  dbgx_orders_api.process_all(l_count);\n  \
+               dbms_output.put_line('processed ' || l_count);\n  rollback;\nend;"
+            .into(),
+        run: false,
+    });
+    let sql_doc = h.state().test_focused();
+    h.state_mut().test_sql_window().editor.goto(4, 3);
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+
+    // Waits until the focused editor marks a line containing `needle`.
+    let follow = |h: &mut Ui, needle: &str| -> (String, usize) {
+        let start = Instant::now();
+        loop {
+            let (title, marker, cursor) = h.state().test_execution_marker();
+            if let Some((line, text)) = &marker
+                && text.contains(needle)
+                && h.state().test_debug().is_suspended()
+            {
+                assert_eq!(cursor, *line, "the cursor is on the marked line in {title}");
+                return (title, *line);
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "no marker at {needle}: {title} {marker:?}, log {:?}",
+                h.state().test_debug().log
+            );
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    // Steps and waits for the next stop (commands while running are
+    // ignored, as the toolbar's are disabled then).
+    let step = |h: &mut Ui, command: DebugCommand| {
+        let resume = command == DebugCommand::Resume;
+        h.state_mut().test_debug_mut().command(command);
+        if !resume {
+            wait_until(h, "stop", |app| app.test_debug().is_suspended());
+        }
+    };
+
+    let (title, line) = follow(&mut h, "-- @load_done");
+    assert_eq!(
+        (title.as_str(), line),
+        ("dbgx_orders_api", load_done as usize)
+    );
+    step(&mut h, DebugCommand::StepOver);
+    step(&mut h, DebugCommand::StepOver);
+    // The marker moved within the window (the same breakpoint isn't left).
+    follow(&mut h, "-- @process_loaded");
+    step(&mut h, DebugCommand::Resume);
+    let (title, line) = follow(&mut h, "-- @trigger");
+    assert_eq!(title, "dbgx_orders_bu");
+    assert_eq!(line, on_update as usize, "trigger lines match the editor");
+    step(&mut h, DebugCommand::Resume);
+    // Back to the package for the next order, then out to the block.
+    let (title, _) = follow(&mut h, "-- @load_done");
+    assert_eq!(title, "dbgx_orders_api");
+    for bp in [(api.clone(), load_done), (trigger.clone(), on_update)] {
+        h.state_mut().test_debug_mut().toggle_breakpoint(bp.0, bp.1);
+    }
+    assert!(h.state().test_debug().breakpoints.is_empty());
+    for _ in 0..3 {
+        step(&mut h, DebugCommand::StepOut);
+    }
+    let (title, line) = follow(&mut h, "dbms_output.put_line");
+    assert_eq!(h.state().test_focused(), sql_doc, "{title}");
+    assert_eq!(line, 7, "the block's line 5 in the SQL window");
+    step(&mut h, DebugCommand::Resume);
+    wait_until(&mut h, "finish", |app| !app.test_debug_running());
+    h.run_steps(3);
+    let (_, marker, _) = h.state().test_execution_marker();
+    assert_eq!(marker, None, "no marker once finished");
+}
+
+/// "Compile with debug information" (Settings → Debugger): a package body
+/// compiled in its program window gets debug information without new
+/// messages, and Step into enters it. Selecting the caller in the call
+/// stack shows its source, variables and hover values. Needs
+/// DBCRAFT_TEST_DB, DBCRAFT_TEST_DB_DBA and DBCRAFT_DEBUG_HOST.
+#[test]
+fn debugger_steps_into_unit_compiled_in_program_window() {
+    use dbcraft_debugger::{DebugCommand, Unit, UnitType};
+    let Some((profile, password, host)) = debug_environment() else {
+        return;
+    };
+    let mut h = harness(true).alone();
+    let conn = install_debug_scenario(&host);
+    let api = Unit::new("DBCRAFT", "DBGX_ORDERS_API", UnitType::PackageBody);
+    let pricing = Unit::new("DBCRAFT", "DBGX_PRICING", UnitType::PackageBody);
+    dbcraft_debugger::target::compile_debug(&conn, &api).unwrap();
+    let process_line = scenario_marker(
+        "create or replace package body dbgx_orders_api",
+        "process_line",
+    );
+
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Program {
+        connection: "dbcraft@FREEPDB1".into(),
+        object: ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "DBGX_PRICING".into(),
+            object_type: dbcraft_db::ObjectType::PackageBody,
+        },
+    });
+    wait_until(&mut h, "source", |app| !app.test_focused_busy());
+    let has_debug_info = || dbcraft_debugger::target::has_debug_info(&conn, &pricing).unwrap();
+    let compile = |h: &mut Ui, debug_info: bool| -> String {
+        h.state_mut().test_settings_mut().compile_debug_info = debug_info;
+        h.state_mut().test_execute_focused();
+        wait_until(h, "compile", |app| !app.test_focused_busy());
+        let program = h.state_mut().test_program();
+        let (failed, message) = program.message().expect("compile message");
+        assert!(!failed, "{message}");
+        for part in &program.parts {
+            assert!(part.errors.is_empty(), "{:?}", part.errors);
+        }
+        message
+    };
+    let message = compile(&mut h, false);
+    assert!(!message.contains("debug"), "{message}");
+    assert!(!has_debug_info());
+    let message = compile(&mut h, true);
+    assert!(message.ends_with("(with debug information)"), "{message}");
+    assert!(has_debug_info());
+
+    // Step into the call from the caller's breakpoint.
+    h.state_mut()
+        .test_debug_setup(&host, api.clone(), process_line);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "declare\n  l_count pls_integer;\nbegin\n  dbgx_orders_api.process_all(l_count);\n  \
+               rollback;\nend;"
+            .into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
+    assert_eq!(h.state().test_debug().stack[0].location.unit, api);
+    h.state_mut()
+        .test_debug_mut()
+        .command(DebugCommand::StepInto);
+    wait_until(&mut h, "step", |app| app.test_debug().is_suspended());
+    let debug = h.state().test_debug();
+    assert_eq!(debug.stack[0].location.unit, pricing, "{:?}", debug.stack);
+    assert_eq!(debug.frame, 0);
+    assert!(debug.variables.iter().all(|v| v.name != "L_TOTAL"));
+
+    // The caller, from the call stack.
+    h.get_by_label(&format!("dbgx_orders_api.process:{process_line}"))
+        .click();
+    wait_until(&mut h, "the caller's variables", |app| {
+        let debug = app.test_debug();
+        debug.frame == 1 && debug.variables.iter().any(|v| v.name == "L_TOTAL")
+    });
+    // DBGX_TYPES has no debug information: its record comes without
+    // contents, and the variables view says why.
+    wait_until(&mut h, "why l_order has no contents", |app| {
+        app.test_debug().opaque_reason(&api, "L_ORDER").is_some()
+    });
+    assert_eq!(
+        h.state().test_debug().opaque_reason(&api, "L_ORDER"),
+        Some("T_ORDER is declared in DBGX_TYPES, compiled without debug information")
+    );
+    let (title, _, cursor) = h.state().test_execution_marker();
+    assert_eq!(
+        (title.as_str(), cursor),
+        ("dbgx_orders_api", process_line as usize),
+        "the caller's source"
+    );
+    let debug = h.state().test_debug();
+    assert_eq!(
+        debug.hover(&api, "l_total").map(|(_, v)| v),
+        Some("0".into())
+    );
+    assert_eq!(debug.hover(&pricing, "l_total"), None);
+    // Hovering it in the package body's editor.
+    let mut session = dbcraft_debugger::ui::DebugSession::default();
+    std::mem::swap(&mut session, h.state_mut().test_debug_mut());
+    let editor = h
+        .state_mut()
+        .test_program_editor()
+        .expect("package body editor");
+    let offset = editor.text().find("l_total := l_total").unwrap() + 2;
+    assert!(crate::editor::debug_hover(editor, offset, &session, &api));
+    std::mem::swap(&mut session, h.state_mut().test_debug_mut());
+    save(&mut h, "12b-debugger-caller-dark");
+
+    // Hovering the selected `l_order.lines(i)` (#165): the record is
+    // opaque, and the hover says why it has no elements (#166).
+    let hover_element = |h: &mut Ui| {
+        let mut session = dbcraft_debugger::ui::DebugSession::default();
+        std::mem::swap(&mut session, h.state_mut().test_debug_mut());
+        let editor = h
+            .state_mut()
+            .test_program_editor()
+            .expect("package body editor");
+        let start = editor.text().find("line_amount(l_order").unwrap() + "line_amount(".len();
+        let element = start..start + "l_order.lines(i)".len();
+        editor.inner().select(element.clone());
+        let mouse = editor.inner().offset_pos(element.start + 2).expect("drawn");
+        let shown = crate::editor::debug_hover(editor, element.start + 2, &session, &api);
+        std::mem::swap(&mut session, h.state_mut().test_debug_mut());
+        assert!(shown, "{:?}", h.state().test_debug().variables);
+        // The mouse rests there, so the hover stays (and is asked again).
+        h.hover_at(mouse);
+        h.run_steps(4);
+        h.state()
+            .test_debug()
+            .hover(&api, "l_order.lines(i)")
+            .unwrap()
+    };
+    assert_eq!(
+        hover_element(&mut h),
+        (
+            "l_order.lines(i)".into(),
+            "l_order is OPAQUE: its contents aren't available\n\
+             T_ORDER is declared in DBGX_TYPES, compiled without debug information"
+                .into()
+        )
+    );
+    save(&mut h, "12c-debugger-opaque-element-dark");
+    h.state_mut().test_debug_mut().stop();
+    wait_until(&mut h, "finish", |app| !app.test_debug_running());
+
+    // With debug information for DBGX_TYPES, the element has its fields.
+    let types = Unit::new("DBCRAFT", "DBGX_TYPES", UnitType::Package);
+    dbcraft_debugger::target::compile_debug(&conn, &types).unwrap();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "declare\n  l_count pls_integer;\nbegin\n  dbgx_orders_api.process_all(l_count);\n  \
+               rollback;\nend;"
+            .into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
+    assert_eq!(h.state().test_debug().stack[0].location.unit, api);
+    let (title, body) = hover_element(&mut h);
+    assert_eq!(title, "l_order.lines(i) T_LINE");
+    assert!(body.starts_with("line_no = 1\nproduct = "), "{body}");
+    save(&mut h, "12d-debugger-element-dark");
+
+    h.state_mut().test_debug_mut().stop();
+    wait_until(&mut h, "finish", |app| !app.test_debug_running());
+}
+
+/// Runs a deployment script that includes another (`@@`), continues after
+/// an error (`WHENEVER SQLERROR CONTINUE`) and creates and fills a table.
+#[test]
+fn deployment_script() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("dbcraft-deploy-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(
+        dir.join("install.sql"),
+        "prompt Installing\nwhenever sqlerror continue\ndrop table dbcraft_deploy_t purge;\n@@sub/tables\ninsert into dbcraft_deploy_t values (2);\ncommit;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("sub/tables.sql"),
+        "create table dbcraft_deploy_t (id number);\ninsert into dbcraft_deploy_t values (1);\n",
+    )
+    .unwrap();
+
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    // The script expects the table not to exist (left over by a failed run).
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin
+  for t in (select table_name from user_tables where table_name = 'DBCRAFT_DEPLOY_T') loop
+    execute immediate 'drop table dbcraft_deploy_t purge';
+  end loop;
+end;
+/"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+    h.state_mut().test_open_file(dir.join("install.sql"));
+    h.run_steps(2);
+    save(&mut h, "deployment-script");
+    h.state_mut()
+        .test_command(crate::commands::Command::ExecuteAll);
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("continuing"))
+            || messages.iter().any(|m| m.contains("ORA-00942")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("Running ") && m.contains("tables.sql")),
+        "{messages:?}"
+    );
+    assert_eq!(w.state.output, ["Installing"]);
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "select count(*) from dbcraft_deploy_t;\ndrop table dbcraft_deploy_t purge;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "check", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    assert_eq!(w.state.results[0].rows[0][0].as_deref(), Some("2"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Compiling a package body that someone else changed in the meantime asks
+/// before overwriting.
+#[test]
+fn compile_conflict() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let body = ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: "DEMO_PKG".into(),
+        object_type: dbcraft_db::ObjectType::PackageBody,
+    };
+    h.state_mut().test_open(OpenRequest::Program {
+        connection: "dbcraft@FREEPDB1".into(),
+        object: body.clone(),
+    });
+    wait_until(&mut h, "source", |app| !app.test_focused_busy());
+    let program = h.state().test_focused();
+    let source = h.state_mut().test_program().active_source();
+
+    // Someone else recompiles the body a moment later.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let sql = source
+        .trim_end()
+        .trim_end_matches('/')
+        .trim_end()
+        .to_owned();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: format!(
+            "{}\n/\n",
+            sql.replacen(
+                "end demo_pkg;",
+                "  -- changed by someone else\nend demo_pkg;",
+                1
+            )
+        ),
+        run: true,
+    });
+    wait_until(&mut h, "other compile", |app| !app.test_focused_busy());
+    h.state_mut().test_close_focused();
+    h.state_mut().test_focus(program);
+
+    let effects = h.state_mut().test_program().compile(false, false);
+    h.state_mut().test_apply_focused(effects);
+    wait_until(&mut h, "check", |app| !app.test_focused_busy());
+    assert!(h.state_mut().test_program().has_conflict());
+    save(&mut h, "17-compile-conflict-dark");
+
+    let effects = h.state_mut().test_program().overwrite();
+    h.state_mut().test_apply_focused(effects);
+    wait_until(&mut h, "compile", |app| !app.test_focused_busy());
+    let message = h.state_mut().test_program().message();
+    assert!(
+        matches!(&message, Some((false, m)) if m.contains("compiled")),
+        "{message:?}"
+    );
+}
+
+/// A result shown as a bar chart and as a line chart.
+#[test]
+fn result_chart() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut()
+        .test_connect(profile.clone(), password.clone());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "-- Orders and returns per month
+select to_char(add_months(date '2025-01-01', level - 1), 'Mon YYYY') as month,
+       round(120 + 40 * sin(level / 2) + level * 6) as orders,
+       round(50 + 20 * cos(level / 3) + level * 2) as returns
+  from dual connect by level <= 12"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let result = &mut w.state.results[0];
+    let chart = crate::chart_view::ChartState::guess(&result.columns, result.rows.len());
+    assert_eq!(chart.x, Some(0));
+    assert_eq!(chart.series, vec![1, 2]);
+    result.chart = Some(chart);
+    save(&mut h, "result-chart-bars");
+    let w = h.state_mut().test_sql_window();
+    w.state.results[0].chart.as_mut().unwrap().kind = crate::chart_view::ChartKind::Line;
+    save(&mut h, "result-chart-lines");
+    let text = h.state_mut().test_sql_window().editor.text().to_owned();
+    drop(h);
+
+    // A narrow window: the twelve months' labels thin out evenly (#22).
+    let mut h = sized_harness(egui::vec2(600.0, 700.0));
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text,
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let result = &mut w.state.results[0];
+    result.chart = Some(crate::chart_view::ChartState::guess(
+        &result.columns,
+        result.rows.len(),
+    ));
+    save(&mut h, "result-chart-narrow");
+}
+
+/// A result of a table with foreign keys offers its parent and child rows.
+#[test]
+fn foreign_key_links() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin
+  for t in (select table_name from user_tables where table_name in ('DBCRAFT_FK_C', 'DBCRAFT_FK_P')) loop
+    execute immediate 'drop table ' || t.table_name || ' cascade constraints purge';
+  end loop;
+end;
+/
+create table dbcraft_fk_p (id number primary key, name varchar2(20));
+create table dbcraft_fk_c (id number primary key, p_id number references dbcraft_fk_p);
+insert into dbcraft_fk_p values (1, 'one');
+insert into dbcraft_fk_c values (10, 1);
+select * from dbcraft_fk_c;"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    let start = Instant::now();
+    loop {
+        let w = h.state_mut().test_sql_window();
+        if !w.state.results[0].grid.links.is_empty() {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(30), "no links");
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let w = h.state_mut().test_sql_window();
+    let result = &w.state.results[0];
+    assert_eq!(result.grid.links.len(), 1);
+    assert!(
+        result.grid.links[0]
+            .label
+            .starts_with("DBCRAFT_FK_P via P_ID")
+    );
+    let relation = &result.relations[result.link_relations[0]];
+    let sql = crate::relations::query(relation, &result.columns, &result.rows[0]);
+    assert!(sql.contains("where ID = 1"), "{sql}");
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop table dbcraft_fk_c purge;\ndrop table dbcraft_fk_p purge;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// The scheduler jobs window lists a job, runs it and shows the run.
+#[test]
+fn scheduler_jobs() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    // Before 23ai, a new user can't create jobs.
+    crate::test_db::as_dba(&["grant create job to {user}"]);
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin
+  for j in (select job_name from user_scheduler_jobs
+             where job_name in ('DBCRAFT_NIGHTLY_STATS', 'DBCRAFT_PURGE_LOGS')) loop
+    dbms_scheduler.drop_job(j.job_name, force => true);
+  end loop;
+  dbms_scheduler.create_job('DBCRAFT_NIGHTLY_STATS', 'PLSQL_BLOCK',
+    'declare t timestamp := systimestamp + interval ''0.2'' second; begin while systimestamp < t loop null; end loop; end;',
+    repeat_interval => 'FREQ=DAILY;BYHOUR=2', enabled => true,
+    comments => 'Refreshes optimizer statistics of the schema every night');
+  dbms_scheduler.create_job('DBCRAFT_PURGE_LOGS', 'PLSQL_BLOCK', 'begin null; end;',
+    repeat_interval => 'FREQ=HOURLY', enabled => false);
+end;
+/"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "jobs created", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_command(crate::commands::Command::SchedulerJobs);
+    h.run_steps(2);
+    wait_until(&mut h, "jobs", |app| !app.test_focused_busy());
+    let jobs = h.state_mut().test_jobs_window();
+    assert!(
+        jobs.jobs()
+            .iter()
+            .any(|j| j.name == "DBCRAFT_NIGHTLY_STATS" && j.enabled)
+    );
+    assert!(
+        jobs.jobs()
+            .iter()
+            .any(|j| j.name == "DBCRAFT_PURGE_LOGS" && !j.enabled)
+    );
+    let effects = jobs.select("DBCRAFT", "DBCRAFT_NIGHTLY_STATS");
+    h.state_mut().test_apply(effects);
+    let effects = h.state_mut().test_jobs_window().run_action("run");
+    h.state_mut().test_apply(effects);
+    let start = Instant::now();
+    while h.state_mut().test_jobs_window().runs().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(60), "no run logged");
+        std::thread::sleep(Duration::from_millis(500));
+        let effects = h.state_mut().test_jobs_window().refresh();
+        h.state_mut().test_apply(effects);
+        wait_until(&mut h, "refresh", |app| !app.test_focused_busy());
+    }
+    assert_eq!(
+        h.state_mut().test_jobs_window().runs()[0].status,
+        "SUCCEEDED"
+    );
+    save(&mut h, "scheduler-jobs");
+
+    // Edit… opens the job form; applying it refreshes the window.
+    let jobs_window = h.state().test_focused();
+    h.get_by_label("Edit…").click();
+    h.run_steps(2);
+    wait_until(&mut h, "job form", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    wait_until(&mut h, "next runs", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(
+        h.state().test_focused_title().as_deref(),
+        Some("dbcraft_nightly_stats (job)")
+    );
+    assert!(h.query_by_label_contains("Next runs:").is_some());
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d.downcast_mut::<crate::object_editor::JobDef>().unwrap();
+        d.repeat = "FREQ=DAILY;BYHOUR=3;BYMINUTE=15;BYSECOND=0".into();
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "next runs", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    save(&mut h, "edit-job");
+    assert_eq!(
+        h.state_mut()
+            .test_object_editor()
+            .statements_for_test()
+            .unwrap(),
+        [
+            "begin\n  dbms_scheduler.set_attribute('DBCRAFT.DBCRAFT_NIGHTLY_STATS', \
+          'repeat_interval', 'FREQ=DAILY;BYHOUR=3;BYMINUTE=15;BYSECOND=0');\nend;"
+        ]
+    );
+    let effects = h.state_mut().test_object_editor().apply_for_test();
+    h.state_mut().test_apply(effects);
+    wait_until(&mut h, "applied", |app| !app.test_focused_busy());
+    h.state_mut().test_focus(jobs_window);
+    h.run_steps(2);
+    wait_until(&mut h, "jobs refreshed", |app| !app.test_focused_busy());
+    let schedule = h
+        .state_mut()
+        .test_jobs_window()
+        .jobs()
+        .iter()
+        .find(|j| j.name == "DBCRAFT_NIGHTLY_STATS")
+        .map(|j| j.schedule.clone());
+    assert_eq!(
+        schedule.as_deref(),
+        Some("FREQ=DAILY;BYHOUR=3;BYMINUTE=15;BYSECOND=0")
+    );
+    // New job… opens an empty form for the browser's schema.
+    h.get_by_label("New job…").click();
+    h.run_steps(2);
+    wait_until(&mut h, "new job form", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("New job"));
+    assert_eq!(
+        h.state_mut().test_object_editor().statements_for_test(),
+        Err("Enter a name".into())
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin
+  dbms_scheduler.drop_job('DBCRAFT_NIGHTLY_STATS', force => true);
+  dbms_scheduler.drop_job('DBCRAFT_PURGE_LOGS', force => true);
+end;
+/"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// "Execute to file" streams a query into a file and can be cancelled.
+#[test]
+fn execute_to_file() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let dir = std::env::temp_dir().join(format!("dbcraft-to-file-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let start_export = |h: &mut Harness<'_, DbCraftApp>, sql: &str, path: &std::path::Path| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(path.to_owned())).unwrap();
+        h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+        h.run_steps(2);
+    };
+
+    let path = dir.join("rows.json");
+    start_export(
+        &mut h,
+        "select level as id, 'item ' || level as name from dual connect by level <= 5000",
+        &path,
+    );
+    wait_until(&mut h, "export", |app| !app.test_focused_busy());
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 5000);
+    assert_eq!(json[4999]["ID"], 5000);
+    let w = h.state_mut().test_sql_window();
+    assert!(
+        w.state
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .starts_with("5000 rows written to"),
+        "{:?}",
+        w.state.messages.last().map(|m| &m.text)
+    );
+
+    // Cancel a long export: the incomplete file is removed.
+    let path = dir.join("huge.csv");
+    start_export(
+        &mut h,
+        "select a.n, b.n as m from (select level n from dual connect by level <= 100000) a,
+                (select level n from dual connect by level <= 100000) b",
+        &path,
+    );
+    wait_until(&mut h, "rows", |app| {
+        app.test_sql_window_ref()
+            .and_then(|w| w.state.to_file.as_ref())
+            .is_some_and(|t| t.rows.load(std::sync::atomic::Ordering::Relaxed) > 0)
+    });
+    save(&mut h, "execute-to-file");
+    h.state_mut().test_command(crate::commands::Command::Cancel);
+    wait_until(&mut h, "cancel", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let last = &w.state.messages.last().unwrap().text;
+    assert!(last.contains("ORA-01013"), "{last}");
+    assert!(!path.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// "Execute to file" on a database other than Oracle (here a SQLite file,
+/// so it runs everywhere): the window fetches the result batch by batch
+/// into the file, INSERTs in SQLite's SQL; Break removes the incomplete
+/// file, and a statement that isn't a query writes nothing.
+#[test]
+fn execute_to_file_sqlite() {
+    let connection = "export.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let dir = std::env::temp_dir().join(format!("dbcraft-to-file-sqlite-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let start_export = |h: &mut Harness<'_, DbCraftApp>, sql: &str, path: &std::path::Path| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(path.to_owned())).unwrap();
+        h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+        h.run_steps(2);
+    };
+    let last_message = |h: &mut Harness<'_, DbCraftApp>| {
+        let w = h.state_mut().test_sql_window();
+        w.state
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default()
+    };
+    let series = |n: u32| {
+        format!(
+            "with recursive s(id) as (select 1 union all select id + 1 from s where id < {n}) \
+             select id, 'item ' || id as name from s"
+        )
+    };
+
+    let path = dir.join("rows.json");
+    start_export(&mut h, &series(5000), &path);
+    wait_until(&mut h, "export", |app| !app.test_focused_busy());
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 5000);
+    assert_eq!(json[4999]["id"], 5000);
+    let message = last_message(&mut h);
+    assert!(message.starts_with("5000 rows written to"), "{message}");
+
+    // INSERT statements in SQLite's SQL, into the table the query reads.
+    run_script(
+        &mut h,
+        connection,
+        "create table notes (id integer primary key, note text);
+insert into notes values (1, 'it''s'), (2, null);
+create table files (id integer primary key, data blob, image image, memo blob);
+insert into files values (1, x'313233', x'cafe', 'hello world');
+commit;",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let path = dir.join("notes.sql");
+    start_export(&mut h, "select * from notes order by id", &path);
+    wait_until(&mut h, "inserts", |app| !app.test_focused_busy());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "insert into notes (id, note) values (1, 'it''s');\n\
+         insert into notes (id, note) values (2, NULL);\n"
+    );
+    // Blobs as blobs, by their values: all digits, in an `image` column;
+    // text in a BLOB column as text.
+    start_export(&mut h, "select * from files", &path);
+    wait_until(&mut h, "inserts", |app| !app.test_focused_busy());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "insert into files (id, data, image, memo) values \
+         (1, X'313233', X'CAFE', 'hello world');\n"
+    );
+
+    // Break: the incomplete file is removed.
+    let path = dir.join("huge.csv");
+    start_export(&mut h, &series(100_000_000), &path);
+    wait_until(&mut h, "rows", |app| {
+        app.test_sql_window_ref()
+            .and_then(|w| w.state.to_file.as_ref())
+            .is_some_and(|t| t.rows.load(std::sync::atomic::Ordering::Relaxed) > 0)
+    });
+    h.state_mut().test_command(crate::commands::Command::Cancel);
+    wait_until(&mut h, "cancel", |app| !app.test_focused_busy());
+    let message = last_message(&mut h);
+    assert_eq!(message, "Execute to file failed: Cancelled");
+    assert!(!path.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// "Execute to file" on MySQL, PostgreSQL and SQL Server, those of their
+/// variables that are set: 5000 rows fetched batch by batch into a JSON
+/// file. A boolean is JSON's (#217); MySQL has none, its `=` gives 1 or 0.
+#[test]
+fn execute_to_file_servers() {
+    use dbcraft_config::DbKind;
+    use serde_json::json;
+    // 5000 numbered rows in each database's SQL, and whether they are even.
+    let databases = [
+        (
+            "DBCRAFT_TEST_MYSQL",
+            DbKind::MySql,
+            "select id, id % 2 = 0 as even from (select a.n + b.n * 100 + 1 as id from \
+               (with recursive s(n) as (select 0 union all select n + 1 from s where n < 99) \
+                select n from s) a, \
+               (with recursive s(n) as (select 0 union all select n + 1 from s where n < 49) \
+                select n from s) b) ids order by 1",
+            [json!(0), json!(1)],
+        ),
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            "select id, id % 2 = 0 as even from generate_series(1, 5000) id",
+            [json!(false), json!(true)],
+        ),
+        (
+            "DBCRAFT_TEST_MSSQL",
+            DbKind::SqlServer,
+            "with s(id) as (select 1 union all select id + 1 from s where id < 5000) \
+             select id, cast(1 - id % 2 as bit) as even from s option (maxrecursion 0)",
+            [json!(false), json!(true)],
+        ),
+    ];
+    for (env, kind, sql, even) in databases {
+        let connection = format!("export@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        let path = std::env::temp_dir().join(format!(
+            "dbcraft-to-file-{}-{}.json",
+            std::process::id(),
+            kind.label().replace(' ', "")
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(path.clone())).unwrap();
+        h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+        h.run_steps(2);
+        wait_until(&mut h, "export", |app| !app.test_focused_busy());
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap_or_default())
+                .unwrap_or_else(|e| panic!("{env}: {e}"));
+        let rows = json.as_array().map(Vec::len);
+        assert_eq!(rows, Some(5000), "{env}");
+        assert_eq!(json[4999]["id"], 5000, "{env}");
+        assert_eq!(
+            [&json[4998]["even"], &json[4999]["even"]],
+            [&even[0], &even[1]],
+            "{env}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+/// Writes the rows of `sql` into an INSERT file with Execute to file: its
+/// statements, without their `;`.
+fn insert_file(h: &mut Harness<'_, DbCraftApp>, sql: &str, name: &str) -> Vec<String> {
+    let path = std::env::temp_dir().join(format!("dbcraft-{}-{name}.sql", std::process::id()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Some(path.clone())).unwrap();
+    h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+    h.run_steps(2);
+    wait_until(h, "export", |app| !app.test_focused_busy());
+    let message = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .messages
+        .last()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(message.contains("rows written"), "{name}: {message}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    text.lines()
+        .map(|l| l.trim_end_matches(';').to_owned())
+        .collect()
+}
+
+/// A result's columns and rows, and how its grid exports them.
+type GridRows = (
+    Vec<dbcraft_db::Column>,
+    Vec<Vec<dbcraft_db::Cell>>,
+    dbcraft_data::Options,
+);
+
+/// The rows of `sql` as the grid of a SQL window on `connection` has them.
+fn grid_rows(h: &mut Harness<'_, DbCraftApp>, connection: &str, sql: &str) -> GridRows {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: sql.into(),
+        run: true,
+    });
+    wait_until(h, sql, |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let r = &w.state.results[0];
+    let grid = (r.columns.clone(), r.rows.clone(), r.grid.export_options());
+    h.state_mut().test_close_focused();
+    grid
+}
+
+/// Execute to file writes binary values whole (#204): a 6 MB value of each
+/// database, written as INSERT statements and run back into a copy of its
+/// table, is the same value. The grid holds such a value cut short; its
+/// exports refuse it rather than write what they hold.
+#[test]
+fn execute_to_file_writes_whole_values() {
+    use dbcraft_config::DbKind;
+    let sql = "select id, b from fd_blob order by id";
+    // The fetched value is cut short where it ends in its size.
+    let grid_export_refuses = |name: &str, grid: &GridRows| {
+        let (columns, rows, options) = grid;
+        let cut = rows[0][1]
+            .as_deref()
+            .is_some_and(|v| v.ends_with(" bytes)"));
+        let exported =
+            dbcraft_data::export_to_vec(dbcraft_data::Format::Insert, columns, rows, options);
+        match exported {
+            Err(e) if cut => assert!(e.to_string().contains("Execute to file"), "{name}: {e}"),
+            Ok(_) if !cut => {}
+            other => panic!("{name}: {:?}", other.map(|b| b.len())),
+        }
+    };
+    // 6 MB in each database's binary type: as hex, within MariaDB's
+    // max_allowed_packet (16 MB).
+    let databases = [
+        (
+            "DBCRAFT_TEST_MYSQL",
+            DbKind::MySql,
+            "longblob",
+            "repeat(unhex('89504E470D0A1A0A'), 786432)",
+        ),
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            "bytea",
+            "decode(repeat('89504E470D0A1A0A', 786432), 'hex')",
+        ),
+        (
+            "DBCRAFT_TEST_MSSQL",
+            DbKind::SqlServer,
+            "varbinary(max)",
+            "cast(replicate(cast(0x89504E470D0A1A0A as varchar(max)), 786432) \
+             as varbinary(max))",
+        ),
+    ];
+    for (env, kind, binary, value) in databases {
+        let connection = format!("whole@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        let setup = [
+            "drop table if exists fd_blob".to_owned(),
+            "drop table if exists fd_blob_copy".to_owned(),
+            format!("create table fd_blob (id int primary key, b {binary})"),
+            format!("create table fd_blob_copy (id int primary key, b {binary})"),
+            format!("insert into fd_blob select 1, {value}"),
+            "insert into fd_blob values (2, null)".to_owned(),
+        ];
+        let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+        for result in crate::test_db::execute_on(env, kind, &setup).unwrap() {
+            result.unwrap_or_else(|e| panic!("{env}: {e}"));
+        }
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        let inserts = insert_file(&mut h, sql, kind.label());
+        assert_eq!(inserts.len(), 2, "{env}");
+        h.state_mut().test_close_focused();
+        let copied = crate::test_db::run_on(env, kind, move |client| {
+            for insert in &inserts {
+                let insert =
+                    insert.replacen("insert into fd_blob ", "insert into fd_blob_copy ", 1);
+                client.execute(&insert).unwrap();
+            }
+            let same = client
+                .query(
+                    "select count(*) from fd_blob a join fd_blob_copy c \
+                       on c.id = a.id and c.b = a.b",
+                    &[],
+                )
+                .unwrap();
+            same[0][0].clone()
+        });
+        assert_eq!(copied, Some(Some("1".into())), "{env}");
+        grid_export_refuses(env, &grid_rows(&mut h, &connection, sql));
+        crate::test_db::execute_on(
+            env,
+            kind,
+            &["drop table fd_blob", "drop table fd_blob_copy"],
+        );
+    }
+
+    // SQLite, on a file of its own.
+    let connection = "whole.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table fd_blob (id integer primary key, b blob);
+create table fd_blob_copy (id integer primary key, b blob);
+insert into fd_blob values (1, randomblob(6291456)), (2, null);
+commit;",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let inserts = insert_file(&mut h, sql, "sqlite");
+    h.state_mut().test_close_focused();
+    let path = file.0.display().to_string();
+    let copied = crate::test_db::run_with(DbKind::Sqlite, "", "", &path, move |client| {
+        for insert in &inserts {
+            let insert = insert.replacen("insert into fd_blob ", "insert into fd_blob_copy ", 1);
+            client.execute(&insert).unwrap();
+        }
+        let same = client
+            .query(
+                "select count(*) from fd_blob a join fd_blob_copy c on c.id = a.id and c.b = a.b",
+                &[],
+            )
+            .unwrap();
+        same[0][0].clone()
+    });
+    assert_eq!(copied.as_deref(), Some("1"));
+    grid_export_refuses("SQLite", &grid_rows(&mut h, connection, sql));
+}
+
+/// On Oracle, the INSERTs of *Copy as*, the grid's export and Execute to
+/// file name the columns called like reserved words (`"LEVEL"`, `"SIZE"`,
+/// `"RESOURCE"`) in quotes, as those stored in lowercase or mixed case, of
+/// a table named in quotes too: they run back into it.
+#[test]
+fn oracle_inserts_quote_reserved_words() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let conn = crate::test_db::connect("DBCRAFT_TEST_DB").unwrap();
+    let _ = conn.execute("drop table \"R54_Words\" purge", &[]);
+    conn.execute(
+        "create table \"R54_Words\" (id number, \"LEVEL\" number, \"SIZE\" varchar2(10), \
+         \"RESOURCE\" number, \"level\" number, \"Size\" number)",
+        &[],
+    )
+    .unwrap();
+    conn.execute("insert into \"R54_Words\" values (1, 2, 'x', 3, 4, 5)", &[])
+        .unwrap();
+    conn.commit().unwrap();
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let sql = "select * from \"R54_Words\"";
+    let (columns, rows, options) = grid_rows(&mut h, "dbcraft@FREEPDB1", sql);
+    let copied =
+        dbcraft_data::export_to_vec(dbcraft_data::Format::Insert, &columns, &rows, &options)
+            .unwrap();
+    let copied = String::from_utf8(copied).unwrap();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let written = insert_file(&mut h, sql, "r54-words");
+    let inserts: Vec<&str> = copied
+        .lines()
+        .map(|l| l.trim_end_matches(';'))
+        .chain(written.iter().map(String::as_str))
+        .collect();
+    assert_eq!(inserts.len(), 2, "{inserts:?}");
+    for insert in inserts {
+        conn.execute(insert, &[])
+            .unwrap_or_else(|e| panic!("{e}\n{insert}"));
+    }
+    let copies: i64 = conn
+        .query_row_as(
+            "select count(*) from \"R54_Words\" where id = 1 and \"LEVEL\" = 2 and \"SIZE\" = 'x' \
+             and \"RESOURCE\" = 3 and \"level\" = 4 and \"Size\" = 5",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(copies, 3);
+    conn.execute("drop table \"R54_Words\" purge", &[]).unwrap();
+}
+
+/// MySQL shows a TIMESTAMP in the session's time zone. INSERT statements
+/// of such values, from Execute to file and from the grid, run in a
+/// session of another zone, keep their instant; a DATETIME has no zone.
+#[test]
+fn mysql_timestamps_keep_their_instant() {
+    use dbcraft_config::DbKind;
+    let env = "DBCRAFT_TEST_MYSQL";
+    let connection = "zones@MySQL";
+    let Some(mut h) = connect_to(env, connection, DbKind::MySql) else {
+        return;
+    };
+    let setup = crate::test_db::execute_on(
+        env,
+        DbKind::MySql,
+        &[
+            "drop table if exists fd_ts, fd_ts_copy",
+            "create table fd_ts (id int primary key, ts timestamp null, dt datetime)",
+            "create table fd_ts_copy like fd_ts",
+            "set time_zone = '+11:00'",
+            "insert into fd_ts values (1, '2021-10-07 09:00:00', '2021-10-07 09:00:00'), \
+               (2, null, null)",
+        ],
+    );
+    for result in setup.unwrap() {
+        result.unwrap();
+    }
+    // 2021-10-07 09:00 at +11:00.
+    let instant = "1633557600";
+    let sql = "select * from fd_ts order by id";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!("set time_zone = '+11:00';\n{sql};"),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let (columns, rows, options) = {
+        let w = h.state_mut().test_sql_window();
+        let r = &w.state.results[0];
+        (r.columns.clone(), r.rows.clone(), r.grid.export_options())
+    };
+    assert_eq!(rows[0][1].as_deref(), Some("2021-10-07 09:00:00"));
+    let from_file = insert_file(&mut h, sql, "zones");
+    let from_grid =
+        dbcraft_data::export_to_vec(dbcraft_data::Format::Insert, &columns, &rows, &options)
+            .unwrap();
+    let from_grid: Vec<String> = String::from_utf8(from_grid)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim_end_matches(';').to_owned())
+        .collect();
+    // The file runs in a SQL window, too, the zone set back after it.
+    let script: Vec<String> = from_file
+        .iter()
+        .map(|s| s.replacen("insert into fd_ts ", "insert into fd_ts_copy ", 1))
+        .collect();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!(
+            "set time_zone = '+10:00';\n{};\ncommit;\nselect unix_timestamp(ts), \
+             @@session.time_zone from fd_ts_copy order by id;",
+            script.join(";\n")
+        ),
+        run: true,
+    });
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let errors: Vec<&String> = w
+            .state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| &m.text)
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let r = w.state.results.last().expect("the query's result");
+        assert_eq!(r.rows[0][0].as_deref(), Some(instant));
+        assert_eq!(r.rows[0][1].as_deref(), Some("+10:00"));
+    }
+    for (name, statements) in [("file", from_file), ("grid", from_grid)] {
+        let copied = crate::test_db::run_on(env, DbKind::MySql, move |client| {
+            client.execute("set time_zone = '+10:00'").unwrap();
+            client.execute("delete from fd_ts_copy").unwrap();
+            for statement in &statements {
+                let statement =
+                    statement.replacen("insert into fd_ts ", "insert into fd_ts_copy ", 1);
+                client.execute(&statement).unwrap();
+            }
+            client
+                .query(
+                    "select unix_timestamp(ts), dt, @@session.time_zone from fd_ts_copy \
+                     order by id",
+                    &[],
+                )
+                .unwrap()
+        })
+        .unwrap();
+        let values = |row: &[dbcraft_db::Cell]| -> Vec<Option<String>> { row.to_vec() };
+        assert_eq!(
+            values(&copied[0]),
+            [
+                Some(instant.into()),
+                Some("2021-10-07 09:00:00".into()),
+                Some("+10:00".into())
+            ],
+            "{name}"
+        );
+        assert_eq!(copied[1][..2], [None, None], "{name}");
+    }
+    crate::test_db::execute_on(env, DbKind::MySql, &["drop table fd_ts, fd_ts_copy"]);
+}
+
+/// Tables in the browser show their indexes, constraints and triggers.
+#[test]
+fn browser_table_parts() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin
+  for t in (select table_name from user_tables where table_name in ('ORDER_LINES', 'ORDERS')) loop
+    execute immediate 'drop table ' || t.table_name || ' cascade constraints purge';
+  end loop;
+end;
+/
+create table orders (order_id number primary key, customer varchar2(40) not null,
+  ordered_at date default sysdate not null);
+create table order_lines (
+  order_id number not null constraint order_lines_order_fk references orders,
+  line_no number(4) not null,
+  product varchar2(40) not null,
+  quantity number(6) not null constraint order_lines_qty_ck check (quantity > 0),
+  price number(10,2),
+  constraint order_lines_pk primary key (order_id, line_no));
+create index order_lines_product_ix on order_lines (product);
+create or replace trigger order_lines_audit before insert or update on order_lines
+for each row begin :new.price := round(:new.price, 2); end;
+/"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_expand_browser(&[dbcraft_db::ObjectType::Table]);
+    wait_until(&mut h, "folder", |app| !app.test_browser_loading());
+    h.state_mut().test_expand_table(ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: "ORDER_LINES".into(),
+        object_type: dbcraft_db::ObjectType::Table,
+    });
+    wait_until(&mut h, "parts", |app| !app.test_browser_loading());
+    save(&mut h, "browser-table-parts");
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop table order_lines purge;\ndrop table orders purge;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// A project folder under git: schema export, status, diff with HEAD and
+/// with the database, deployment script.
+#[test]
+fn project_folder() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "create or replace package dbcraft_proj_pkg as
+  function answer return number;
+end dbcraft_proj_pkg;
+/
+create or replace package body dbcraft_proj_pkg as
+  function answer return number is
+  begin
+    return 42;
+  end answer;
+end dbcraft_proj_pkg;
+/"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "package", |app| !app.test_focused_busy());
+
+    let dir = std::env::temp_dir().join(format!("dbcraft-project-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // The panel picks up results while it's visible.
+    h.state_mut()
+        .test_command(crate::commands::Command::ShowProject);
+    let mut actions = Vec::new();
+    h.state_mut()
+        .test_project()
+        .export_schema(dir.clone(), "dbcraft@FREEPDB1", &mut actions);
+    h.state_mut().test_project_actions(actions);
+    let start = Instant::now();
+    while h.state_mut().test_project().is_busy() {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "export {:?}",
+            h.state_mut().test_project().export_progress()
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let message = h
+        .state_mut()
+        .test_project()
+        .message()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(message.starts_with("Exported "), "{message}");
+    let body = dir.join("packages/dbcraft_proj_pkg.pkb");
+    assert!(body.exists());
+
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "T"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "export"]);
+    let text = std::fs::read_to_string(&body).unwrap();
+    std::fs::write(&body, text.replace("return 42;", "return 43;")).unwrap();
+
+    let project = h.state_mut().test_project();
+    project.open_root(dir.clone());
+    project.refresh_now();
+    project.expand(dir.join("packages"));
+    let repo = project.repo().unwrap();
+    let modified = repo.root.join("packages/dbcraft_proj_pkg.pkb");
+    assert_eq!(repo.status[&modified], crate::git::FileStatus::Modified);
+    h.state_mut()
+        .test_command(crate::commands::Command::ShowProject);
+    h.run_steps(3);
+    save(&mut h, "project-panel");
+
+    // Working copy against the database: the changed line differs.
+    let mut actions = Vec::new();
+    h.state_mut()
+        .test_project()
+        .compare_db(&modified, "dbcraft@FREEPDB1", &mut actions);
+    h.state_mut().test_project_actions(actions);
+    let start = Instant::now();
+    while h.state_mut().test_project().is_busy() {
+        assert!(start.elapsed() < Duration::from_secs(30), "compare");
+        h.step();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    h.run_steps(3);
+    let title = h.state().test_focused_title().unwrap_or_default();
+    assert!(title.starts_with("dbcraft_proj_pkg.pkb ↔"), "{title}");
+    save(&mut h, "project-compare-db");
+
+    // And against the last commit.
+    let mut actions = Vec::new();
+    h.state_mut()
+        .test_project()
+        .diff_head(&modified, &mut actions);
+    assert_eq!(actions.len(), 1);
+    h.state_mut().test_project_actions(actions);
+    h.run_steps(3);
+    assert_eq!(
+        h.state().test_focused_title().as_deref(),
+        Some("dbcraft_proj_pkg.pkb (changes)")
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop package dbcraft_proj_pkg;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The keyboard settings list commands with their shortcuts.
+#[test]
+fn settings_keyboard() {
+    if out_dir().is_none() {
+        return;
+    }
+    let mut h = harness(true);
+    h.state_mut().test_settings_keyboard();
+    h.run_steps(3);
+    save(&mut h, "settings-keyboard");
+}
+
+/// Recording a shortcut waits past the modifiers for its key (#176): egui
+/// sends Ctrl and Shift as key presses of their own, and Ctrl became the
+/// shortcut, "Ctrl+ControlLeft".
+#[test]
+fn settings_record_shortcut_with_modifiers() {
+    let mut h = headless_harness();
+    h.state_mut().test_settings_keyboard();
+    h.state_mut().test_filter_keyboard("format code");
+    h.run_steps(3);
+    h.get_by_label("Alt+Shift+F").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Press keys… (Esc cancels)").is_some());
+    // Ctrl+Shift+K as a keyboard sends it: Ctrl, then Shift, then K.
+    let ctrl_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    for (key, modifiers) in [
+        (egui::Key::ControlLeft, egui::Modifiers::COMMAND),
+        (egui::Key::ShiftLeft, ctrl_shift),
+        (egui::Key::K, ctrl_shift),
+    ] {
+        h.event(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+    assert_eq!(
+        h.state_mut()
+            .test_settings_mut()
+            .keybindings
+            .get("Format")
+            .map(String::as_str),
+        Some("Ctrl+Shift+K")
+    );
+    assert!(h.query_by_label("Press keys… (Esc cancels)").is_none());
+}
+
+/// A shortcut can't take a key the editor needs (#191): recording Delete
+/// says so and waits for another key. With Delete, a new SQL window
+/// opened instead of a character being deleted.
+#[test]
+fn settings_refuse_editing_keys() {
+    let mut h = headless_harness();
+    h.state_mut().test_settings_keyboard();
+    h.state_mut().test_filter_keyboard("new sql window");
+    h.run_steps(3);
+    h.get_by_label("Ctrl+N").click();
+    h.run_steps(2);
+    let press = |h: &mut Ui, key, modifiers| {
+        h.event(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        h.run_steps(2);
+    };
+    press(&mut h, egui::Key::Delete, egui::Modifiers::NONE);
+    let bindings = &h.state_mut().test_settings_mut().keybindings;
+    assert_eq!(bindings.get("NewSqlWindow"), None);
+    assert!(
+        h.query_by_label_contains("Delete is for typing and editing")
+            .is_some()
+    );
+    assert!(h.query_by_label("Press keys… (Esc cancels)").is_some());
+    press(&mut h, egui::Key::F3, egui::Modifiers::SHIFT);
+    assert_eq!(
+        h.state_mut()
+            .test_settings_mut()
+            .keybindings
+            .get("NewSqlWindow")
+            .map(String::as_str),
+        Some("Shift+F3")
+    );
+    h.state_mut().test_close_settings();
+    h.run_steps(2);
+
+    // Delete in a SQL window deletes.
+    h.get_by_label("New SQL").click();
+    h.run_steps(2);
+    h.event(egui::Event::Text("select 1".into()));
+    h.run_steps(2);
+    let title = h.state_mut().test_sql_window().title.clone();
+    h.key_press(egui::Key::Home);
+    h.run_steps(1);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    let w = h.state_mut().test_sql_window();
+    assert_eq!(
+        (w.title.as_str(), w.editor.text()),
+        (title.as_str(), "elect 1")
+    );
+}
+
+/// A font file for code replaces Hack; a bad file is reported, not loaded.
+#[test]
+fn code_font() {
+    let font = "/usr/share/fonts/truetype/noto/NotoMono-Regular.ttf";
+    if !std::path::Path::new(font).exists() {
+        return;
+    }
+    let mut h = harness(false);
+    let ctx = h.ctx.clone();
+    h.state_mut().test_code_font(&ctx, font);
+    h.run_steps(3);
+    save(&mut h, "code-font");
+    let bad = not_a_font("code-font");
+    h.state_mut().test_code_font(&ctx, &bad);
+    h.run_steps(2);
+    assert!(
+        h.state()
+            .test_log()
+            .iter()
+            .any(|l| l.contains(&format!("{bad} is not a TrueType or OpenType font")))
+    );
+    let _ = std::fs::remove_file(&bad);
+}
+
+/// Settings → Appearance applies right away: Compact tightens the layout,
+/// a changed value makes it Custom, and an interface font replaces the
+/// built-in one (a bad file is reported, not loaded).
+#[test]
+fn appearance_settings() {
+    use dbcraft_config::Density;
+    let mut h = harness(true);
+    h.state_mut().test_settings_page(0);
+    h.run_steps(3);
+    let margin = |h: &Harness<'_, DbCraftApp>| h.ctx.global_style().spacing.window_margin.left;
+    assert_eq!(margin(&h), 14);
+    assert!(h.query_by_label("Custom").is_none());
+    h.get_by_label("Compact").click();
+    h.run_steps(3);
+    assert_eq!(
+        h.state_mut().test_settings_mut().appearance.density,
+        Density::COMPACT
+    );
+    assert_eq!(margin(&h), 6);
+    h.state_mut().test_settings_mut().appearance.density.indent = 20.0;
+    h.state_mut().test_settings_page(0);
+    h.run_steps(3);
+    assert!(h.query_by_label("Custom").is_some());
+
+    let font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+    if std::path::Path::new(font).exists() {
+        h.state_mut().test_settings_mut().appearance.font_file = font.into();
+        h.state_mut().test_settings_mut().appearance.font_size = 12.0;
+        let ctx = h.ctx.clone();
+        h.state_mut().test_apply_settings(&ctx);
+        h.run_steps(3);
+        let first = h
+            .ctx
+            .fonts(|f| f.definitions().families[&egui::FontFamily::Proportional][0].clone());
+        assert_eq!(first, "ui");
+        assert_eq!(
+            h.ctx.global_style().text_styles[&egui::TextStyle::Body].size,
+            12.0
+        );
+        save(&mut h, "settings-appearance");
+    }
+    let bad = not_a_font("appearance");
+    h.state_mut().test_settings_mut().appearance.font_file = bad.clone();
+    let ctx = h.ctx.clone();
+    h.state_mut().test_apply_settings(&ctx);
+    h.run_steps(2);
+    let log = h.state().test_log();
+    assert!(
+        log.iter()
+            .any(|l| l.contains(&format!("{bad} is not a TrueType or OpenType font"))),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_file(&bad);
+    let first = h
+        .ctx
+        .fonts(|f| f.definitions().families[&egui::FontFamily::Proportional][0].clone());
+    assert_ne!(first, "ui");
+}
+
+/// The SQL window, object browser and result grid as they come, and with
+/// the Compact density, a smaller interface font, object names in it and
+/// lines between rows.
+#[test]
+fn compact_layout() {
+    if out_dir().is_none() {
+        return;
+    }
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: QUERY.into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut().test_expand_browser(&[
+        dbcraft_db::ObjectType::Table,
+        dbcraft_db::ObjectType::Package,
+    ]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    save(&mut h, "comfortable-layout");
+    let settings = h.state_mut().test_settings_mut();
+    settings.appearance.density = dbcraft_config::Density::COMPACT;
+    settings.appearance.font_size = 12.0;
+    settings.appearance.names_in_code_font = false;
+    settings.grid.font_size = 12.0;
+    settings.grid.row_lines = true;
+    settings.grid.null_text = "(null)".into();
+    let ctx = h.ctx.clone();
+    h.state_mut().test_apply_settings(&ctx);
+    save(&mut h, "compact-layout");
+}
+
+/// While a menu of the bar is open, moving onto another title opens that
+/// menu; without an open menu, hovering a title does nothing.
+#[test]
+fn menu_bar_switches_on_hover() {
+    let mut h = headless_harness();
+    h.run_steps(2);
+    h.get_by_label("Edit").hover();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Format Code").is_none());
+    h.get_by_label("File").click();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Save As").is_some());
+    h.get_by_label("Edit").hover();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Format Code").is_some());
+    assert!(h.query_by_label_contains("Save As").is_none());
+}
+
+/// Profiling a call shows where the time went, per subprogram.
+#[test]
+fn profiler() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "create or replace package dbcraft_prof_pkg as
+  function slow_sum(p_n number) return number;
+  procedure report;
+end dbcraft_prof_pkg;
+/
+create or replace package body dbcraft_prof_pkg as
+  function slow_sum(p_n number) return number is
+    l_total number := 0;
+  begin
+    for i in 1 .. p_n loop
+      l_total := l_total + sqrt(i);
+    end loop;
+    return l_total;
+  end slow_sum;
+
+  procedure report is
+    l_count number;
+  begin
+    select count(*) into l_count from all_objects where rownum <= 2000;
+    dbms_output.put_line(slow_sum(200000) + l_count);
+  end report;
+end dbcraft_prof_pkg;
+/"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "package", |app| !app.test_focused_busy());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "exec dbcraft_prof_pkg.report".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::Profile);
+    wait_until(&mut h, "profile", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let Some((_, Some(result))) = &w.state.profile else {
+        panic!("no profile");
+    };
+    match result {
+        Ok(p) => {
+            let names: Vec<String> = p.rows.iter().map(|r| r.title()).collect();
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == "DBCRAFT.DBCRAFT_PROF_PKG.SLOW_SUM"),
+                "{names:?}"
+            );
+            assert!(p.rows.iter().any(|r| r.object().is_some()));
+        }
+        // No EXECUTE on DBMS_HPROF here, or a database before 18c.
+        Err(e) if e.contains("grant execute") || e.contains("needs Oracle 18c") => return,
+        Err(e) => panic!("{e}"),
+    }
+    save(&mut h, "profiler");
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop package dbcraft_prof_pkg;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// "Save as report" takes the query at the cursor.
+#[test]
+fn save_as_report() {
+    if out_dir().is_none() {
+        return;
+    }
+    let mut h = harness(false);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "none".into(),
+        text: "select trunc(ordered_at) as day, count(*) as orders\n  from orders\n where customer = :customer\n group by trunc(ordered_at)".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::SaveAsReport);
+    h.run_steps(3);
+    save(&mut h, "save-as-report");
+}
+
+/// Export tables: pick tables, filters and format, export into a folder.
+#[test]
+fn export_tables() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    let dir = std::env::temp_dir().join(format!("dbcraft-export-tables-{}", std::process::id()));
+    let export = h.state_mut().test_export_tables();
+    export.folder = Some(dir.clone());
+    export.include_ddl = true;
+    export.set_tables(&[
+        ("DEMO_DEPARTMENTS", ""),
+        ("DEMO_EMPLOYEES", "department_id = 20"),
+    ]);
+    h.run_steps(2);
+    save(&mut h, "export-tables");
+    let effects = h.state_mut().test_export_tables().start_now();
+    h.state_mut().test_apply(effects);
+    wait_until(&mut h, "export", |app| !app.test_focused_busy());
+    let message = h.state_mut().test_export_tables().message().cloned();
+    assert!(
+        matches!(&message, Some((false, m)) if m.starts_with("Exported ")),
+        "{message:?}"
+    );
+    assert!(dir.join("demo_employees.csv").exists());
+    assert!(dir.join("demo_departments.ddl.sql").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Views open on their DDL, loaded on the metadata session; the tab chosen
+/// last is where the next view opens. The edit form reads WITH READ ONLY
+/// from the dictionary.
+#[test]
+fn object_view_opens_on_the_ddl() {
+    use crate::object_editor::EditTarget;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "create or replace view dbcraft_ov_a as select 1 x, 'a' y from dual with read only;
+create or replace view dbcraft_ov_b as select 2 z from dual;"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "views", |app| !app.test_focused_busy());
+    let view = |name: &str| ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: name.into(),
+        object_type: dbcraft_db::ObjectType::View,
+    };
+    let open = |h: &mut Harness<'_, DbCraftApp>, name: &str| {
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: "dbcraft@FREEPDB1".into(),
+            object: view(name),
+        });
+        h.run_steps(2);
+        wait_until(h, "object view", |app| !app.test_focused_busy());
+    };
+
+    open(&mut h, "DBCRAFT_OV_A");
+    assert!(h.state().test_meta_session("dbcraft@FREEPDB1"));
+    let v = h.state().test_object_view();
+    assert_eq!(v.tab_for_test(), Some("DDL"));
+    let (ddl, columns) = v.loaded_for_test();
+    assert!(ddl.is_some_and(|d| d.contains("DBCRAFT_OV_A")));
+    assert_eq!(columns, 0, "only the shown tab loads");
+
+    h.get_by_label("Columns").hover();
+    h.run_steps(1);
+    h.get_by_label("Columns").click();
+    h.run_steps(2);
+    wait_until(&mut h, "columns", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 2);
+
+    // The next view opens where the last one was left.
+    open(&mut h, "DBCRAFT_OV_B");
+    let v = h.state().test_object_view();
+    assert_eq!(v.tab_for_test(), Some("Columns"));
+    assert_eq!(v.loaded_for_test(), (None, 1));
+
+    h.state_mut().test_open(OpenRequest::EditObject {
+        connection: "dbcraft@FREEPDB1".into(),
+        target: EditTarget::Edit(view("DBCRAFT_OV_A")),
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "editor", |app| !app.test_focused_busy());
+    let mut loaded = None;
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        loaded = d.downcast_ref::<crate::object_editor::ViewDef>().cloned();
+    });
+    let d = loaded.expect("the view form");
+    assert!(d.read_only && !d.check_option, "{d:?}");
+    assert_eq!(d.query, "select 1 x, 'a' y from dual");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop view dbcraft_ov_a;\ndrop view dbcraft_ov_b;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// The object editors: a new sequence applied through the form, then each
+/// editor on existing objects.
+#[test]
+fn object_editors() {
+    use crate::object_editor::EditTarget;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    // DBCRAFT_OEU_, not DBCRAFT_OE_: the unit test `edits_live_objects`
+    // drops those, and runs at the same time.
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin
+  for o in (select object_name, object_type from user_objects
+             where object_name like 'DBCRAFT\\_OEU\\_%' escape '\\'
+               and object_type in ('TABLE', 'VIEW', 'SEQUENCE', 'SYNONYM')) loop
+    execute immediate 'drop ' || o.object_type || ' ' || o.object_name
+      || case o.object_type when 'TABLE' then ' purge' end;
+  end loop;
+end;
+/
+create table dbcraft_oeu_orders (order_id number primary key, customer varchar2(40) not null,
+  status varchar2(10), ordered_at date default sysdate not null);
+create index dbcraft_oeu_orders_ix on dbcraft_oeu_orders (customer, ordered_at desc);
+create or replace view dbcraft_oeu_open_orders as
+  select order_id, customer, ordered_at from dbcraft_oeu_orders where status = 'OPEN'
+  with check option;
+create synonym dbcraft_oeu_ord for dbcraft_oeu_orders;
+grant select, insert on dbcraft_oeu_orders to public;"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "objects", |app| !app.test_focused_busy());
+    let object = |name: &str, t| ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: name.into(),
+        object_type: t,
+    };
+    let open = |h: &mut Harness<'_, DbCraftApp>, target: EditTarget| {
+        h.state_mut().test_open(OpenRequest::EditObject {
+            connection: "dbcraft@FREEPDB1".into(),
+            target,
+        });
+        h.run_steps(2);
+        wait_until(h, "editor", |app| !app.test_focused_busy());
+    };
+
+    // A new sequence, created through the form.
+    open(
+        &mut h,
+        EditTarget::New {
+            owner: "DBCRAFT".into(),
+            object_type: dbcraft_db::ObjectType::Sequence,
+            from: None,
+        },
+    );
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d
+            .downcast_mut::<crate::object_editor::SequenceDef>()
+            .unwrap();
+        d.name = "dbcraft_oeu_invoice_seq".into();
+        d.start = "1000".into();
+        d.cache = 50;
+    });
+    h.run_steps(2);
+    save(&mut h, "editor-sequence-new");
+    let effects = h.state_mut().test_object_editor().apply_for_test();
+    h.state_mut().test_apply_focused(effects);
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let editor = h.state_mut().test_object_editor();
+    assert_eq!(editor.outcome(), Some(("Applied", true)));
+    assert_eq!(editor.title(), "dbcraft_oeu_invoice_seq (sequence)");
+    // Reloaded from the database: nothing left to apply.
+    assert_eq!(editor.statements_for_test(), Ok(Vec::new()));
+    save(&mut h, "editor-sequence");
+
+    open(
+        &mut h,
+        EditTarget::Edit(object(
+            "DBCRAFT_OEU_OPEN_ORDERS",
+            dbcraft_db::ObjectType::View,
+        )),
+    );
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d.downcast_mut::<crate::object_editor::ViewDef>().unwrap();
+        d.query = "select order_id, customer, ordered_at, status\n  from dbcraft_oeu_orders\n where status in ('OPEN', 'HOLD')".into();
+    });
+    h.run_steps(3);
+    save(&mut h, "editor-view");
+    let s = h
+        .state_mut()
+        .test_object_editor()
+        .statements_for_test()
+        .unwrap();
+    assert!(s[0].ends_with("with check option"), "{s:?}");
+
+    open(
+        &mut h,
+        EditTarget::Edit(object("DBCRAFT_OEU_ORD", dbcraft_db::ObjectType::Synonym)),
+    );
+    save(&mut h, "editor-synonym");
+
+    open(
+        &mut h,
+        EditTarget::Edit(object(
+            "DBCRAFT_OEU_ORDERS_IX",
+            dbcraft_db::ObjectType::Index,
+        )),
+    );
+    h.run_steps(3);
+    wait_until(&mut h, "columns", |app| !app.test_focused_busy());
+    save(&mut h, "editor-index");
+
+    open(
+        &mut h,
+        EditTarget::Grants(object("DBCRAFT_OEU_ORDERS", dbcraft_db::ObjectType::Table)),
+    );
+    save(&mut h, "editor-grants");
+    assert!(
+        h.state_mut()
+            .test_object_editor()
+            .statements_for_test()
+            .unwrap()
+            .is_empty()
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop synonym dbcraft_oeu_ord;
+drop view dbcraft_oeu_open_orders;
+drop sequence dbcraft_oeu_invoice_seq;
+drop table dbcraft_oeu_orders purge;"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// The table builder: a new table from the form, applied in the window,
+/// becomes an edit of the created table, and the browser shows it.
+#[test]
+fn table_builder() {
+    use dbcraft_compare::table::{ColumnDef, ConstraintDef, ConstraintKind, IndexDef};
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let cleanup = "begin
+  for t in (select table_name from user_tables
+             where table_name like 'DBCRAFT\\_TBU\\_%' escape '\\'
+             order by table_name desc) loop
+    execute immediate 'drop table ' || t.table_name || ' cascade constraints purge';
+  end loop;
+end;
+/
+";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: format!(
+            "{cleanup}create table dbcraft_tbu_customers (id number(10) primary key, name varchar2(100));"
+        ),
+        run: true,
+    });
+    wait_until(&mut h, "setup", |app| !app.test_focused_busy());
+
+    h.state_mut().test_open(OpenRequest::NewTable {
+        connection: "dbcraft@FREEPDB1".into(),
+        owner: "DBCRAFT".into(),
+        like: None,
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "builder", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("New table"));
+    let column = |name: &str, data_type: &str, nullable: bool| ColumnDef {
+        name: name.into(),
+        data_type: data_type.into(),
+        nullable,
+        default: None,
+        comment: None,
+        identity: false,
+        generation: Default::default(),
+    };
+    h.state_mut().test_table_editor().edit_for_test(|t| {
+        t.name = "dbcraft_tbu_orders".into();
+        t.columns[0].name = "order_id".into();
+        t.constraints[0].columns = vec!["order_id".into()];
+        t.columns[0].identity = true;
+        t.columns.push(column("customer_id", "NUMBER(10)", false));
+        t.columns.push(ColumnDef {
+            default: Some("'OPEN'".into()),
+            comment: Some("OPEN or DONE".into()),
+            ..column("status", "VARCHAR2(10 CHAR)", false)
+        });
+        t.columns.push(column("total", "NUMBER(12,2)", true));
+        t.comment = Some("Customer orders".into());
+        t.constraints.push(ConstraintDef {
+            name: String::new(),
+            kind: ConstraintKind::Foreign,
+            columns: vec!["customer_id".into()],
+            references: Some(("dbcraft_tbu_customers".into(), vec!["id".into()])),
+            on_delete: Some("CASCADE".into()),
+            condition: None,
+            generated: false,
+        });
+        t.constraints.push(ConstraintDef {
+            name: String::new(),
+            kind: ConstraintKind::Check,
+            columns: Vec::new(),
+            references: None,
+            on_delete: None,
+            condition: Some("status in ('OPEN', 'DONE')".into()),
+            generated: false,
+        });
+        t.indexes.push(IndexDef {
+            name: String::new(),
+            unique: false,
+            columns: vec!["customer_id".into()],
+            generated: false,
+            kind: Default::default(),
+        });
+    });
+    h.run_steps(3);
+    save(&mut h, "table-builder-columns");
+    h.get_by_label("Keys & checks").click();
+    h.run_steps(3);
+    save(&mut h, "table-builder-keys");
+    h.get_by_label("Script •").click();
+    h.run_steps(3);
+    save(&mut h, "table-builder-script");
+
+    let effects = h.state_mut().test_table_editor().apply_for_test();
+    h.state_mut().test_apply_focused(effects);
+    h.run_steps(2);
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let editor = h.state_mut().test_table_editor();
+    assert_eq!(editor.outcome(), Some(("Applied", true)));
+    assert_eq!(editor.title(), "dbcraft_tbu_orders (edit)");
+    assert_eq!(editor.statements_for_test(), Ok(Vec::new()));
+    // The browser lists and selects the new table.
+    assert_eq!(
+        h.state().test_browser_selected(),
+        Some(ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "DBCRAFT_TBU_ORDERS".into(),
+            object_type: dbcraft_db::ObjectType::Table,
+        })
+    );
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    save(&mut h, "table-builder-created");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: cleanup.into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// The table builder's Partitions tab: a range-partitioned table with a
+/// MAXVALUE partition, created and shown as an existing table's partitions.
+#[test]
+fn table_builder_partitions() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let drop = "begin execute immediate 'drop table dbcraft_tbp_sales purge';
+  exception when others then null; end;";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: drop.into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+    h.state_mut().test_open(OpenRequest::NewTable {
+        connection: "dbcraft@FREEPDB1".into(),
+        owner: "DBCRAFT".into(),
+        like: None,
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "builder", |app| !app.test_focused_busy());
+    h.state_mut().test_table_editor().edit_for_test(|t| {
+        t.name = "dbcraft_tbp_sales".into();
+        t.columns.push(dbcraft_compare::table::ColumnDef {
+            name: "SOLD".into(),
+            data_type: "DATE".into(),
+            nullable: false,
+            default: None,
+            comment: None,
+            identity: false,
+            generation: Default::default(),
+        });
+    });
+    h.get_by_label("Partitions").hover();
+    h.run_steps(1);
+    h.get_by_label("Partitions").click();
+    h.run_steps(2);
+    // A combo box shows its choice as its value.
+    h.get_by_value("not partitioned").click();
+    h.run_steps(2);
+    h.get_by_label("range").click();
+    h.run_steps(2);
+    h.state_mut()
+        .test_table_editor()
+        .set_partition_key_for_test("sold");
+    h.get_by_label("Add partition").click();
+    h.run_steps(2);
+    h.get_by_label("Add MAXVALUE partition").click();
+    h.run_steps(2);
+    // The first partition's bound (a hint text isn't a label to find).
+    h.state_mut()
+        .test_table_editor()
+        .edit_partitioning_for_test(|p| p.partitions[0].bound = "DATE '2026-01-01'".into());
+    h.run_steps(3);
+    save(&mut h, "table-builder-partitions");
+    let sql = h
+        .state_mut()
+        .test_table_editor()
+        .statements_for_test()
+        .unwrap();
+    assert!(
+        sql[0].contains("partition by range (sold)\n(\n  partition p1 values less than (DATE '2026-01-01'),\n  partition p_max values less than (MAXVALUE)\n)"),
+        "{}",
+        sql[0]
+    );
+    let effects = h.state_mut().test_table_editor().apply_for_test();
+    h.state_mut().test_apply_focused(effects);
+    h.run_steps(2);
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let editor = h.state_mut().test_table_editor();
+    assert_eq!(editor.outcome(), Some(("Applied", true)));
+    assert_eq!(editor.partition_names_for_test(), ["P1", "P_MAX"]);
+    h.run_steps(3);
+    save(&mut h, "table-editor-partitions");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: drop.into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// Procedures, packages and triggers start from a form whose source opens
+/// in a program window; compiling there creates them.
+#[test]
+fn new_program_units() {
+    use crate::object_editor::EditTarget;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let cleanup = "begin
+  for o in (select object_name, object_type from user_objects
+             where object_name like 'DBCRAFT\\_NPU\\_%' escape '\\'
+               and object_type in ('TABLE', 'PACKAGE', 'PROCEDURE')) loop
+    execute immediate 'drop ' || o.object_type || ' ' || o.object_name
+      || case o.object_type when 'TABLE' then ' purge' end;
+  end loop;
+end;
+/
+";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: format!(
+            "{cleanup}create table dbcraft_npu_orders (id number primary key, status varchar2(10));"
+        ),
+        run: true,
+    });
+    wait_until(&mut h, "setup", |app| !app.test_focused_busy());
+    let table = ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: "DBCRAFT_NPU_ORDERS".into(),
+        object_type: dbcraft_db::ObjectType::Table,
+    };
+    let open = |h: &mut Harness<'_, DbCraftApp>, object_type, from: Option<ObjectRef>| {
+        h.state_mut().test_open(OpenRequest::EditObject {
+            connection: "dbcraft@FREEPDB1".into(),
+            target: EditTarget::New {
+                owner: "DBCRAFT".into(),
+                object_type,
+                from,
+            },
+        });
+        h.run_steps(2);
+        wait_until(h, "form", |app| !app.test_focused_busy());
+    };
+    // Hands the form's source to a program window, which compiles it.
+    let create = |h: &mut Harness<'_, DbCraftApp>, name: &str| {
+        let form = h.state().test_focused();
+        let effects = h
+            .state_mut()
+            .test_object_editor()
+            .open_in_editor_for_test("dbcraft@FREEPDB1");
+        assert!(effects.close);
+        h.state_mut().test_apply_focused(effects);
+        h.run_steps(2);
+        assert_ne!(h.state().test_focused(), form, "the form closed");
+        let program = h.state_mut().test_program();
+        assert!(program.new && program.is_dirty());
+        assert_eq!(program.title(), name);
+        let effects = h.state_mut().test_program().compile(true, false);
+        h.state_mut().test_apply_focused(effects);
+        h.run_steps(2);
+        wait_until(h, "compile", |app| !app.test_focused_busy());
+        let program = h.state_mut().test_program();
+        let message = program.message();
+        assert!(matches!(&message, Some((false, _))), "{name}: {message:?}");
+        assert!(!program.new && !program.is_dirty());
+    };
+
+    // A trigger on the table: the table is filled in.
+    open(&mut h, dbcraft_db::ObjectType::Trigger, Some(table.clone()));
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d
+            .downcast_mut::<crate::object_editor::TriggerDef>()
+            .unwrap();
+        assert_eq!(d.table, "DBCRAFT_NPU_ORDERS");
+        d.update_columns = "status".into();
+    });
+    h.run_steps(3);
+    save(&mut h, "new-trigger");
+    create(&mut h, "dbcraft_npu_orders_biu");
+    save(&mut h, "new-trigger-compiled");
+
+    // A package with a procedure: spec and body with a stub.
+    open(&mut h, dbcraft_db::ObjectType::Package, None);
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d
+            .downcast_mut::<crate::object_editor::ProgramDef>()
+            .unwrap();
+        d.name = "dbcraft_npu_api".into();
+        d.subprograms.push(crate::object_editor::Subprogram {
+            function: false,
+            name: "close_order".into(),
+            params: vec![crate::object_editor::Param {
+                name: "p_id".into(),
+                mode: crate::object_editor::Mode::In,
+                data_type: "dbcraft_npu_orders.id%type".into(),
+                default: String::new(),
+            }],
+            returns: String::new(),
+        });
+    });
+    h.run_steps(3);
+    save(&mut h, "new-package");
+    create(&mut h, "dbcraft_npu_api");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: cleanup.into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// The other forms for new objects open filled in from what they're on
+/// (a view, index or synonym for a table) or with sensible defaults, and
+/// say what's missing before they turn into statements.
+#[test]
+fn new_object_forms() {
+    use crate::object_editor::EditTarget;
+    use dbcraft_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin execute immediate 'drop table dbcraft_nof_items purge';
+  exception when others then null; end;
+/
+create table dbcraft_nof_items (id number primary key, label varchar2(40), price number(10,2));"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "setup", |app| !app.test_focused_busy());
+    let table = ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: "DBCRAFT_NOF_ITEMS".into(),
+        object_type: ObjectType::Table,
+    };
+    let open =
+        |h: &mut Harness<'_, DbCraftApp>, owner: &str, object_type, from: Option<ObjectRef>| {
+            h.state_mut().test_open(OpenRequest::EditObject {
+                connection: "dbcraft@FREEPDB1".into(),
+                target: EditTarget::New {
+                    owner: owner.into(),
+                    object_type,
+                    from,
+                },
+            });
+            h.run_steps(2);
+            wait_until(h, "form", |app| !app.test_focused_busy());
+            h.run_steps(2);
+            h.state_mut().test_object_editor().statements_for_test()
+        };
+
+    let view = open(&mut h, "DBCRAFT", ObjectType::View, Some(table.clone())).unwrap();
+    assert_eq!(
+        view,
+        [
+            "create or replace view DBCRAFT.DBCRAFT_NOF_ITEMS_V as\nselect id,\n       label,\n       price\n  from dbcraft_nof_items"
+        ]
+    );
+    save(&mut h, "new-view-on-table");
+    let index = open(&mut h, "DBCRAFT", ObjectType::Index, Some(table.clone()));
+    assert_eq!(index, Err("Add at least one column".into()));
+    let synonym = open(&mut h, "DBCRAFT", ObjectType::Synonym, Some(table.clone())).unwrap();
+    assert_eq!(
+        synonym,
+        ["create or replace public synonym DBCRAFT_NOF_ITEMS for DBCRAFT.DBCRAFT_NOF_ITEMS"]
+    );
+    let mview = open(&mut h, "DBCRAFT", ObjectType::MaterializedView, None);
+    assert_eq!(mview, Err("Enter a name".into()));
+    save(&mut h, "new-materialized-view");
+    let link = open(&mut h, "DBCRAFT", ObjectType::DatabaseLink, None);
+    assert_eq!(link, Err("Enter a name".into()));
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d.downcast_mut::<crate::object_editor::LinkDef>().unwrap();
+        d.name = "remote_hr".into();
+        d.using = "db2:1521/hr".into();
+        d.user = "hr".into();
+        d.password = "secret".into();
+    });
+    h.run_steps(3);
+    save(&mut h, "new-database-link");
+    let public_link = open(&mut h, "PUBLIC", ObjectType::DatabaseLink, None);
+    assert_eq!(public_link, Err("Enter a name".into()));
+    let user = open(&mut h, "", ObjectType::User, None);
+    assert_eq!(user, Err("Enter a name".into()));
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d
+            .downcast_mut::<crate::object_editor::AccountDef>()
+            .unwrap();
+        d.name = "app_reader".into();
+        d.password = "Secret_1".into();
+        d.quotas = vec![("USERS".into(), "100M".into())];
+        d.default_tablespace = "USERS".into();
+        d.roles.insert("CONNECT".into(), Default::default());
+        d.objects.insert(
+            (
+                "DBCRAFT".into(),
+                "DBCRAFT_NOF_ITEMS".into(),
+                "SELECT".into(),
+            ),
+            false,
+        );
+    });
+    h.run_steps(3);
+    save(&mut h, "new-user");
+    let s = h
+        .state_mut()
+        .test_object_editor()
+        .statements_for_test()
+        .unwrap();
+    assert!(s[0].starts_with("create user APP_READER"), "{s:?}");
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("New user"));
+    let role = open(&mut h, "", ObjectType::Role, None);
+    assert_eq!(role, Err("Enter a name".into()));
+    let new_directory = open(&mut h, "", ObjectType::Directory, None);
+    assert_eq!(new_directory, Err("Enter a name".into()));
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d
+            .downcast_mut::<crate::object_editor::DirectoryDef>()
+            .unwrap();
+        d.name = "exports".into();
+        d.path = "/u01/app/exports".into();
+    });
+    h.run_steps(3);
+    save(&mut h, "new-directory");
+    assert_eq!(
+        h.state_mut()
+            .test_object_editor()
+            .statements_for_test()
+            .unwrap(),
+        ["create or replace directory EXPORTS as '/u01/app/exports'"]
+    );
+    assert!(
+        h.query_by_label_contains("doesn't have CREATE ANY DIRECTORY")
+            .is_some()
+    );
+    let new_profile = open(&mut h, "", ObjectType::Profile, None);
+    assert_eq!(new_profile, Err("Enter a name".into()));
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d
+            .downcast_mut::<crate::object_editor::ProfileDef>()
+            .unwrap();
+        d.name = "app_users".into();
+        for l in &mut d.limits {
+            match l.resource.as_str() {
+                "FAILED_LOGIN_ATTEMPTS" => l.value = "5".into(),
+                "PASSWORD_LIFE_TIME" => l.value = "90".into(),
+                "SESSIONS_PER_USER" => l.value = "2".into(),
+                _ => {}
+            }
+        }
+    });
+    h.run_steps(3);
+    save(&mut h, "new-profile");
+    let s = h
+        .state_mut()
+        .test_object_editor()
+        .statements_for_test()
+        .unwrap();
+    assert_eq!(
+        s,
+        [
+            "create profile APP_USERS limit\n  failed_login_attempts 5\n  \
+          password_life_time 90\n  sessions_per_user 2"
+        ]
+    );
+    assert_eq!(
+        h.state().test_focused_title().as_deref(),
+        Some("New profile")
+    );
+    let ty = open(&mut h, "DBCRAFT", ObjectType::Type, None);
+    assert_eq!(ty, Err("Enter a name".into()));
+    let procedure = open(&mut h, "DBCRAFT", ObjectType::Procedure, None);
+    assert_eq!(procedure, Err("Enter a name".into()));
+    // A name that's taken: the form says compiling replaces it.
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "create or replace procedure dbcraft_nof_proc is begin null; end;\n/".into(),
+        run: true,
+    });
+    wait_until(&mut h, "procedure", |app| !app.test_focused_busy());
+    open(&mut h, "DBCRAFT", ObjectType::Procedure, None).ok();
+    h.state_mut().test_object_editor().edit_for_test(|d| {
+        let d = d
+            .downcast_mut::<crate::object_editor::ProgramDef>()
+            .unwrap();
+        d.name = "dbcraft_nof_proc".into();
+    });
+    h.run_steps(3);
+    assert!(
+        h.query_by_label_contains("compiling the new source replaces it")
+            .is_some()
+    );
+    save(&mut h, "new-procedure");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop table dbcraft_nof_items purge;\ndrop procedure dbcraft_nof_proc;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// A name picked in a form, or read into it, is written as SQL reads it:
+/// the trigger's column "Mixed", the job's "R83_JobPkg"."R83_Run" and the
+/// index's tablespace "r83_ts" keep their case (#365).
+#[test]
+fn forms_take_names_as_picked() {
+    use crate::object_editor::{EditTarget, IndexDef, JobDef, TriggerDef};
+    use dbcraft_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let _ = conn.execute("drop table \"R83_Trg\" purge", &[]);
+    for ddl in [
+        "create table \"R83_Trg\" (id number, \"Mixed\" number)",
+        "create or replace package \"R83_JobPkg\" as procedure \"R83_Run\"; end;",
+        "create or replace package body \"R83_JobPkg\" as\n  \
+         procedure \"R83_Run\" is begin null; end;\nend;",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    // A tablespace of lowercase letters, which only a DBA makes.
+    let dba = crate::test_db::connect("DBCRAFT_TEST_DB_DBA");
+    if let Some(dba) = &dba {
+        let _ = dba.execute(
+            "drop tablespace \"r83_ts\" including contents and datafiles",
+            &[],
+        );
+        let file: String = dba
+            .query_row_as(
+                "select substr(file_name, 1, instr(file_name, '/', -1)) from dba_data_files \
+                  where tablespace_name = 'USERS'",
+                &[],
+            )
+            .unwrap();
+        for sql in [
+            format!("create tablespace \"r83_ts\" datafile '{file}r83_ts01.dbf' size 8m"),
+            format!("alter user {user} quota 1m on \"r83_ts\""),
+        ] {
+            dba.execute(&sql, &[]).unwrap();
+        }
+    }
+    let table = ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: "R83_Trg".into(),
+        object_type: ObjectType::Table,
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let open = |h: &mut Ui, target| {
+        h.state_mut().test_open(OpenRequest::EditObject {
+            connection: "dbcraft@FREEPDB1".into(),
+            target,
+        });
+        h.run_steps(2);
+        wait_until(h, "form", |app| !app.test_focused_busy());
+        h.run_steps(2);
+    };
+    let new = |object_type, from: Option<&ObjectRef>| EditTarget::New {
+        owner: "DBCRAFT".into(),
+        object_type,
+        from: from.cloned(),
+    };
+    // Opens the `nth` picker of the form, once it shows, and picks `item`,
+    // typed into its filter (a long list scrolls).
+    let pick = |h: &mut Ui, nth: usize, item: &str| {
+        let start = Instant::now();
+        while h.query_all_by_label("▾").count() <= nth {
+            assert!(start.elapsed() < Duration::from_secs(30), "no picker {nth}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        h.query_all_by_label("▾").nth(nth).unwrap().click();
+        h.run_steps(2);
+        h.event(egui::Event::Text(item.into()));
+        h.run_steps(2);
+        h.get_by_label(item).click();
+        h.run_steps(2);
+    };
+    fn field<T: 'static>(h: &mut Ui, read: impl Fn(&T) -> String) -> String {
+        let mut value = String::new();
+        h.state_mut()
+            .test_object_editor()
+            .edit_for_test(|d| value = read(d.downcast_mut::<T>().unwrap()));
+        value
+    }
+
+    // The trigger's On and Update of.
+    open(&mut h, new(ObjectType::Trigger, Some(&table)));
+    pick(&mut h, 1, "Mixed");
+    let columns = field(&mut h, |d: &TriggerDef| d.update_columns.clone());
+    assert_eq!(columns, "\"Mixed\"");
+
+    // The job's stored procedure.
+    open(&mut h, new(ObjectType::Job, None));
+    h.get_by_label("stored procedure").click();
+    h.run_steps(2);
+    pick(&mut h, 0, "\"R83_JobPkg\".\"R83_Run\"");
+    let action = field(&mut h, |d: &JobDef| d.action.clone());
+    assert_eq!(action, "\"R83_JobPkg\".\"R83_Run\"");
+
+    // The index's Table and Tablespace; an index there reads so.
+    if let Some(dba) = &dba {
+        open(&mut h, new(ObjectType::Index, Some(&table)));
+        pick(&mut h, 1, "r83_ts");
+        let tablespace = field(&mut h, |d: &IndexDef| d.tablespace.clone());
+        assert_eq!(tablespace, "\"r83_ts\"");
+        conn.execute(
+            "create index r83_trg_ix on \"R83_Trg\" (id) tablespace \"r83_ts\"",
+            &[],
+        )
+        .unwrap();
+        open(
+            &mut h,
+            EditTarget::Edit(ObjectRef {
+                owner: "DBCRAFT".into(),
+                name: "R83_TRG_IX".into(),
+                object_type: ObjectType::Index,
+            }),
+        );
+        let tablespace = field(&mut h, |d: &IndexDef| d.tablespace.clone());
+        assert_eq!(tablespace, "\"r83_ts\"");
+        conn.execute("drop table \"R83_Trg\" purge", &[]).unwrap();
+        for sql in [
+            format!("alter user {user} quota 0 on \"r83_ts\""),
+            "drop tablespace \"r83_ts\" including contents and datafiles".to_owned(),
+        ] {
+            dba.execute(&sql, &[]).unwrap();
+        }
+    } else {
+        conn.execute("drop table \"R83_Trg\" purge", &[]).unwrap();
+    }
+    conn.execute("drop package \"R83_JobPkg\"", &[]).unwrap();
+}
+
+/// The object browser's right-click menus open the forms: New table… on
+/// the Tables folder, New ▸ Index on this table… on a table, New user… on
+/// Users.
+#[test]
+fn browser_new_menus() {
+    use crate::object_editor::EditTarget;
+    use dbcraft_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin execute immediate 'drop table dbcraft_bnm_t purge';
+  exception when others then null; end;
+/
+create table dbcraft_bnm_t (id number primary key);"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "setup", |app| !app.test_focused_busy());
+    // Directories show their path; Grants… is in their menu.
+    let dba = std::env::var("DBCRAFT_TEST_DB_DBA").ok().map(|spec| {
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap()
+    });
+    if let Some(dba) = &dba {
+        dba.execute(
+            "create or replace directory dbcraft_bnm_dir as '/tmp/dbcraft_bnm'",
+            &[],
+        )
+        .unwrap();
+        dba.execute("grant read on directory dbcraft_bnm_dir to dbcraft", &[])
+            .unwrap();
+        h.state_mut().test_browser().set_filter("DBCRAFT_BNM_DIR");
+        h.run_steps(2);
+        wait_until(&mut h, "directories", |app| !app.test_browser_loading());
+        h.get_by_label("Directories").click();
+        h.run_steps(2);
+        wait_until(&mut h, "directories", |app| !app.test_browser_loading());
+        assert!(h.query_by_label("/tmp/dbcraft_bnm").is_some());
+        save(&mut h, "browser-directories");
+        h.get_by_label("dbcraft_bnm_dir").click_secondary();
+        h.run_steps(2);
+        assert!(h.query_by_label("Edit directory…").is_some());
+        h.get_by_label("Grants…").click();
+        h.run_steps(2);
+        wait_until(&mut h, "grants", |app| !app.test_focused_busy());
+        assert_eq!(
+            h.state().test_focused_title().as_deref(),
+            Some("dbcraft_bnm_dir grants")
+        );
+        assert!(
+            h.query_by_label("Grants on directory DBCRAFT_BNM_DIR")
+                .is_some()
+        );
+        dba.execute("drop directory dbcraft_bnm_dir", &[]).unwrap();
+    }
+    // Users and roles are listed below the folders.
+    h.state_mut().test_browser().set_filter("DBCRAFT");
+    h.run_steps(2);
+    h.get_by_label("Users").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("New user…").click();
+    h.run_steps(2);
+    wait_until(&mut h, "user form", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("New user"));
+    h.get_by_label("Users").click();
+    h.run_steps(2);
+    wait_until(&mut h, "users", |app| !app.test_browser_loading());
+    h.get_by_label("dbcraft").click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("Edit user…").is_some());
+    assert!(h.query_by_label("Show schema").is_some());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // So are profiles; DEFAULT can't be dropped.
+    h.state_mut().test_browser().set_filter("DEFAULT");
+    h.run_steps(2);
+    h.get_by_label("Profiles").click();
+    h.run_steps(2);
+    wait_until(&mut h, "profiles", |app| !app.test_browser_loading());
+    h.get_by_label("default").click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("New profile…").is_some());
+    assert!(h.query_by_label("Drop…").is_none());
+    h.get_by_label("Edit profile…").click();
+    h.run_steps(2);
+    wait_until(&mut h, "profile form", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(
+        h.state().test_focused_title().as_deref(),
+        Some("default (profile)")
+    );
+    save(&mut h, "edit-default-profile");
+
+    h.state_mut().test_browser().set_filter("DBCRAFT_BNM");
+    h.run_steps(2);
+
+    h.get_by_label("Tables").click_secondary();
+    h.run_steps(2);
+    save(&mut h, "browser-new-folder-menu");
+    h.get_by_label("New table…").click();
+    h.run_steps(2);
+    wait_until(&mut h, "table builder", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("New table"));
+
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "tables", |app| !app.test_browser_loading());
+    h.get_by_label("dbcraft_bnm_t").click_secondary();
+    h.run_steps(2);
+    // Submenus carry their arrow in the label.
+    h.get_by_label("New ⏵").hover();
+    h.run_steps(2);
+    save(&mut h, "browser-new-submenu");
+    h.get_by_label("Index on this table…").click();
+    h.run_steps(2);
+    wait_until(&mut h, "index form", |app| !app.test_focused_busy());
+    let table = ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: "DBCRAFT_BNM_T".into(),
+        object_type: ObjectType::Table,
+    };
+    assert_eq!(
+        h.state_mut().test_object_editor().target,
+        EditTarget::New {
+            owner: "DBCRAFT".into(),
+            object_type: ObjectType::Index,
+            from: Some(table),
+        }
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop table dbcraft_bnm_t purge;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// The result grid's columns: dragging a header moves its column, the
+/// header menu freezes columns (which stay in step when scrolling), and
+/// copies follow the order shown.
+#[test]
+fn grid_columns() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "select level id, 'name ' || level name_col, level * 10 amount,
+       date '2026-01-01' + level created
+  from dual connect by level <= 40"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.run_steps(3);
+    let order = |h: &Harness<'_, DbCraftApp>| {
+        h.state().test_sql_window_ref().unwrap().state.results[0]
+            .grid
+            .visible_columns(4)
+    };
+    assert_eq!(order(&h), [0, 1, 2, 3]);
+
+    // Drag CREATED onto the left half of NAME_COL: it lands before it.
+    let from = h.get_by_label("CREATED").rect().center();
+    let to = h.get_by_label("NAME_COL").rect().left_center() + egui::vec2(3.0, 0.0);
+    h.hover_at(from);
+    h.run_steps(1);
+    h.drag_at(from);
+    h.run_steps(1);
+    for step in 1..=4 {
+        h.hover_at(from + (to - from) * (step as f32 / 4.0));
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+    save(&mut h, "grid-column-drag");
+    h.event(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(2);
+    h.remove_cursor();
+    h.run_steps(2);
+    assert_eq!(order(&h), [0, 3, 1, 2]);
+
+    // Freeze up to CREATED (now second): ID and CREATED stay in place.
+    h.get_by_label("CREATED").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Columns ⏵").hover();
+    h.run_steps(2);
+    save(&mut h, "grid-header-menu");
+    h.get_by_label("Freeze up to CREATED").click();
+    h.run_steps(3);
+    let grid = &h.state().test_sql_window_ref().unwrap().state.results[0].grid;
+    assert_eq!(grid.frozen_columns(4), 2);
+    // CREATED kept its width (fitted to the dates) through the move and
+    // into the frozen part. A label's rect is only what's shown, so measure
+    // the column against 19 monospace characters (from a 6-character value).
+    let date = h.get_by_label("2026-01-02 00:00:00").rect();
+    let column = h.get_by_label("name 1").rect().left() - date.left();
+    let needed = 19.0 * h.get_by_label("name 1").rect().width() / 6.0;
+    assert!(column > needed, "the date is cut off: {column} < {needed}");
+    save(&mut h, "grid-frozen");
+
+    // Scrolling the other part down takes the frozen part along: row 40
+    // shows in both (its number and ID left, its amount right).
+    let at = h.get_by_label("NAME_COL").rect().center() + egui::vec2(0.0, 60.0);
+    h.hover_at(at);
+    for _ in 0..6 {
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -20.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        h.run_steps(2);
+    }
+    h.run_steps(10);
+    save(&mut h, "grid-frozen-scrolled");
+    assert!(h.query_by_label("400").is_some(), "the right part scrolled");
+    assert!(
+        h.query_all_by_label("40").count() >= 2,
+        "row number and ID of row 40 in the frozen part"
+    );
+
+    // Copies and exports go by the order shown.
+    let w = h.state().test_sql_window_ref().unwrap();
+    let r = &w.state.results[0];
+    let (columns, _) = dbcraft_ui::shown_data(&r.columns, &r.rows, &r.grid).unwrap();
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["ID", "CREATED", "NAME_COL", "AMOUNT"]);
+}
+
+/// Closing a window with an uncommitted transaction asks first: Cancel
+/// keeps it, Roll back and close or Commit and close end it (#35).
+#[test]
+fn close_with_open_transaction() {
+    use crate::commands::Command;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let run = |h: &mut Harness<'_, DbCraftApp>, text: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "dbcraft@FREEPDB1".into(),
+            text: text.into(),
+            run: true,
+        });
+        wait_until(h, text, |app| !app.test_focused_busy());
+    };
+    run(
+        &mut h,
+        "begin execute immediate 'drop table dbcraft_ctx_t purge';
+  exception when others then null; end;
+/
+create table dbcraft_ctx_t (id number);",
+    );
+    // What another session sees, once it's there.
+    let count = |h: &mut Harness<'_, DbCraftApp>, expected: &str| {
+        let start = Instant::now();
+        loop {
+            run(h, "select count(*) from dbcraft_ctx_t");
+            let seen = h.state().test_sql_window_ref().unwrap().state.results[0].rows[0][0]
+                .clone()
+                .unwrap_or_default();
+            h.state_mut().test_command(Command::CloseTab);
+            h.run_steps(2);
+            if seen == expected || start.elapsed() > Duration::from_secs(10) {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+
+    run(&mut h, "insert into dbcraft_ctx_t values (1)");
+    let window = h.state().test_focused();
+    assert!(h.state().test_pending_tx());
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    assert!(h.query_by_label("Commit and close").is_some());
+    h.get_by_label_contains("has uncommitted changes");
+    save(&mut h, "close-open-transaction");
+
+    // Cancel: the window and its transaction stay.
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused(), window);
+    assert!(h.state().test_pending_tx());
+
+    // Roll back and close.
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    h.get_by_label("Roll back and close").click();
+    h.run_steps(2);
+    assert!(!h.state().test_pending_tx());
+    assert_ne!(h.state().test_focused(), window, "closed");
+    assert_eq!(count(&mut h, "0"), "0");
+
+    // Commit and close.
+    run(&mut h, "insert into dbcraft_ctx_t values (2)");
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    h.get_by_label("Commit and close").click();
+    h.run_steps(2);
+    assert_eq!(count(&mut h, "1"), "1");
+
+    run(&mut h, "drop table dbcraft_ctx_t purge");
+}
+
+/// The ✕ of `tab`, from where the pointer turns into a hand along its tab
+/// bar: its left and right end, and its middle's height.
+fn close_button(h: &mut Ui, tab: crate::app::Tab) -> (f32, f32, f32) {
+    let (bar, index) = h.state().test_tab_bar(tab).expect("tab bar");
+    let y = bar.center().y;
+    let mut buttons: Vec<(f32, f32)> = Vec::new();
+    let mut inside = false;
+    let mut x = bar.min.x;
+    while x < bar.max.x && buttons.len() <= index + 1 {
+        h.event(egui::Event::PointerMoved(egui::pos2(x, y)));
+        h.step();
+        let hand = h.output().platform_output.cursor_icon == egui::CursorIcon::PointingHand;
+        if hand && !inside {
+            buttons.push((x, x));
+        } else if hand && let Some(button) = buttons.last_mut() {
+            button.1 = x;
+        }
+        inside = hand;
+        x += 1.0;
+    }
+    let (from, to) = buttons[index];
+    (from, to, y)
+}
+
+/// Presses (or releases) the primary button at `pos`, for a step: held
+/// longer, a press is no click.
+fn press(h: &mut Ui, pos: egui::Pos2, pressed: bool) {
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+}
+
+/// A tab's ✕ closes it when it is released on the ✕ (#244): pressed and
+/// released a few points beside it, the tab was closed too.
+#[test]
+fn tab_closes_when_released_on_its_close_button() {
+    let connection = "tabs.db";
+    let (mut h, _file) = sqlite_file(connection);
+    for text in ["select 1", "select 2"] {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: text.into(),
+            run: false,
+        });
+    }
+    h.run_steps(3);
+    let tab = crate::app::Tab::Doc(h.state().test_focused());
+    let (from, to, y) = close_button(&mut h, tab);
+    let windows = |h: &Ui| h.state().test_window_connections().len();
+    let open = windows(&h);
+    // Released 4 pt beside it: within egui's distance for a click.
+    press(&mut h, egui::pos2(to - 1.0, y), true);
+    press(&mut h, egui::pos2(to + 3.0, y), false);
+    h.run_steps(2);
+    assert_eq!(windows(&h), open, "released beside the ✕");
+    press(&mut h, egui::pos2((from + to) / 2.0, y), true);
+    press(&mut h, egui::pos2((from + to) / 2.0 + 2.0, y), false);
+    h.run_steps(2);
+    assert_eq!(windows(&h), open - 1, "clicked");
+}
+
+/// Format Code reads a SQL window's text as its database does (#259): on
+/// SQLite and SQL Server `[Order]` became `[ order ]`, and on MySQL a
+/// string with `\'` got a line break inside, leaving the ORDER BY as it
+/// was. MySQL, PostgreSQL and SQL Server when their test databases are
+/// set.
+#[test]
+fn format_reads_each_database_syntax() {
+    use crate::commands::Command;
+    use dbcraft_config::DbKind;
+    let bracketed = (
+        "select * from [Order] where [Select] = 'From' order by [Group]",
+        "select *\nfrom [Order]\nwhere [Select] = 'From'\norder by [Group]",
+    );
+    let format = |h: &mut Ui, connection: &str, (text, expected): (&str, &str)| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: text.into(),
+            run: false,
+        });
+        h.run_steps(2);
+        h.state_mut().test_command(Command::Format);
+        h.run_steps(2);
+        assert_eq!(
+            h.state_mut().test_sql_window().editor.text(),
+            expected,
+            "{connection}"
+        );
+        h.state_mut().test_sql_window().editor.set_text("");
+        h.state_mut().test_close_focused();
+    };
+    let (mut h, _file) = sqlite_file("format.db");
+    format(&mut h, "format.db", bracketed);
+    drop(h);
+    let servers = [
+        (
+            "DBCRAFT_TEST_MYSQL",
+            DbKind::MySql,
+            (
+                "select * from t where a = 'it\\'s FROM here' order by a",
+                "select *\nfrom t\nwhere a = 'it\\'s FROM here'\norder by a",
+            ),
+        ),
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            (
+                "select $$it's FROM here$$ as s from t order by 1",
+                "select $$it's FROM here$$ as s\nfrom t\norder by 1",
+            ),
+        ),
+        ("DBCRAFT_TEST_MSSQL", DbKind::SqlServer, bracketed),
+    ];
+    for (env, kind, case) in servers {
+        let connection = format!("format@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        format(&mut h, &connection, case);
+    }
+}
+
+/// What a window's statements and Explain plan answer, step by step.
+struct ExplainCase {
+    /// Changes what the window's session sees (a temporary table, the
+    /// search path, the current schema).
+    setup: &'static str,
+    /// A query on what only the window sees, and the name its plan shows.
+    explain: &'static str,
+    object: &'static str,
+    /// Opens the window's transaction, and counts what it changed: 1.
+    change: &'static str,
+    count: &'static str,
+}
+
+/// Runs `sql` in the focused SQL window; returns the first cell of its
+/// last result, after checking that nothing failed.
+fn run_in_window(h: &mut Ui, sql: &str) -> Option<String> {
+    h.state_mut().test_sql_window().editor.set_text(sql);
+    h.state_mut().test_execute_focused();
+    wait_until(h, sql, |app| !app.test_focused_busy());
+    let w = h.state().test_sql_window_ref().unwrap();
+    let errors: Vec<&str> = w
+        .state
+        .messages
+        .iter()
+        .filter(|m| m.level == crate::sql_window::Level::Error)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(errors.is_empty(), "{sql}: {errors:?}");
+    w.state.results.last()?.rows.first()?.first()?.clone()
+}
+
+/// Explain plan of `sql` in the focused SQL window: its steps as
+/// `operation object`, or why there is no plan.
+fn explain_in_window(h: &mut Ui, sql: &str) -> Result<Vec<String>, String> {
+    h.state_mut().test_sql_window().editor.set_text(sql);
+    h.state_mut()
+        .test_command(crate::commands::Command::ExplainPlan);
+    wait_until(h, "plan", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.plan.as_ref().is_some_and(|p| p.result.is_some()))
+    });
+    let w = h.state().test_sql_window_ref().unwrap();
+    let plan = w
+        .state
+        .plan
+        .as_ref()
+        .and_then(|p| p.result.clone())
+        .unwrap();
+    plan.map(|rows| {
+        rows.into_iter()
+            .map(|r| format!("{} {}", r.operation, r.object))
+            .collect()
+    })
+}
+
+/// The case on `connection`, in a window of its own: Explain plan sees what
+/// the window does, and leaves its transaction as it was, also when there
+/// is no plan.
+fn explain_case(h: &mut Ui, connection: &str, case: &ExplainCase) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(h, case.setup);
+    let plan = explain_in_window(h, case.explain);
+    assert!(
+        plan.as_ref()
+            .is_ok_and(|steps| steps.iter().any(|s| s.to_lowercase().contains(case.object))),
+        "{connection}: {plan:?}"
+    );
+    run_in_window(h, case.change);
+    assert!(h.state().test_pending_tx(), "{connection}");
+    for sql in [case.explain, "select * from r51_no_such_table"] {
+        let plan = explain_in_window(h, sql);
+        assert_eq!(plan.is_ok(), sql == case.explain, "{connection}: {plan:?}");
+        assert!(h.state().test_pending_tx(), "{connection}: {sql}");
+        assert_eq!(
+            run_in_window(h, case.count).as_deref(),
+            Some("1"),
+            "{connection}: {sql}"
+        );
+    }
+    h.state_mut().test_rollback();
+    wait_until(h, "rollback", |app| !app.test_pending_tx());
+}
+
+/// Runs `sql` in a new window on `connection` and steps frames, as the app
+/// draws them, until it is done: the frames it took, and the messages.
+fn frames_to_run(h: &mut Ui, connection: &str, sql: String) -> (usize, Vec<String>) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: sql,
+        run: true,
+    });
+    let mut frames = 0;
+    loop {
+        h.step();
+        frames += 1;
+        if !h.state().test_focused_busy() {
+            break;
+        }
+        assert!(frames < 1000, "still running after {frames} frames");
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let w = h.state().test_sql_window_ref().unwrap();
+    let messages = w.state.messages.iter().map(|m| m.text.clone()).collect();
+    (frames, messages)
+}
+
+/// A script runs at the session's pace, not a statement per frame (#291):
+/// 4,000 statements took 4,001 frames, 55 s here, and in the app as long
+/// as the window took to draw them. What a script does stays: a message
+/// per statement, its results, stopping at an error or going on after
+/// WHENEVER SQLERROR CONTINUE, and Break.
+#[test]
+fn scripts_run_at_the_sessions_pace() {
+    let connection = "r51_script.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r51_t (id integer primary key)",
+    );
+    let inserts = |from: usize, to: usize| {
+        (from..=to)
+            .map(|i| format!("insert into r51_t values ({i});\n"))
+            .collect::<String>()
+    };
+    // In the script's window, its transaction.
+    let count = |h: &mut Ui| run_in_window(h, "select count(*) from r51_t");
+
+    let script = format!(
+        "{}select count(*) from r51_t;\nselect max(id) from r51_t;\n",
+        inserts(1, 4000)
+    );
+    let (frames, messages) = frames_to_run(&mut h, connection, script);
+    assert!(frames < 200, "{frames} frames");
+    let inserted = messages
+        .iter()
+        .filter(|m| m.starts_with("INSERT: 1 row affected in "))
+        .count();
+    assert_eq!(inserted, 4000);
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<(&str, Option<&str>)> = w
+        .state
+        .results
+        .iter()
+        .map(|r| (r.title.as_str(), r.rows[0][0].as_deref()))
+        .collect();
+    assert_eq!(
+        results,
+        [("Result 1", Some("4000")), ("Result 2", Some("4000"))]
+    );
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // An error stops the script: the statements after it don't run.
+    let script = format!(
+        "{}insert into r51_t values (1);\n{}",
+        inserts(1, 10),
+        inserts(11, 2000)
+    );
+    let (_, messages) = frames_to_run(&mut h, connection, script);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("UNIQUE constraint failed"))
+            && messages.contains(&"1990 remaining statement(s) skipped".to_owned()),
+        "{:?}",
+        &messages[messages.len().saturating_sub(4)..]
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("10"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // After WHENEVER SQLERROR CONTINUE, they do.
+    let script = format!(
+        "whenever sqlerror continue\n{}insert into r51_t values (1);\n{}",
+        inserts(1, 10),
+        inserts(11, 2000)
+    );
+    let (_, messages) = frames_to_run(&mut h, connection, script);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("UNIQUE constraint failed")),
+        "{messages:?}"
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("2000"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // Break stops the statement running and skips the others.
+    let slow = "with recursive r (n) as (select 1 union all select n + 1 from r) \
+                select count(*) from r;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!("{slow}{}", inserts(1, 100)),
+        run: true,
+    });
+    h.run_steps(5);
+    assert!(h.state().test_focused_busy());
+    h.state_mut().test_command(crate::commands::Command::Cancel);
+    wait_until(&mut h, "break", |app| !app.test_focused_busy());
+    let w = h.state().test_sql_window_ref().unwrap();
+    let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+    assert!(
+        messages.contains(&"100 remaining statement(s) skipped"),
+        "{messages:?}"
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("0"));
+}
+
+/// The Messages tab lays out the messages it shows, not all of them
+/// (#291): with 40,000 a frame took 268 ms. The last one shows, at the
+/// bottom.
+#[test]
+fn messages_lay_out_what_shows() {
+    let connection = "r51_messages.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    for i in 0..40_000 {
+        h.state_mut()
+            .test_sql_window()
+            .info(format!("message {i:05}"));
+    }
+    h.run_steps(3);
+    let laid_out = h.query_all_by_label_contains("message ").count();
+    assert!(laid_out < 200, "{laid_out} messages laid out");
+    assert!(h.query_by_label("message 39999").is_some());
+}
+
+/// The Output tab lays out the lines it shows, not all of them (#321):
+/// with 40,000 lines of DBMS_OUTPUT a frame took 101 ms. The last one
+/// shows, at the bottom, and lines that come later too.
+#[test]
+fn output_lays_out_what_shows() {
+    let connection = "r66_output.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let w = h.state_mut().test_sql_window();
+    w.state
+        .output
+        .extend((0..40_000).map(|i| format!("line {i:05}")));
+    w.state.bottom = crate::sql_window::BottomTab::Output;
+    h.run_steps(3);
+    let laid_out = h.query_all_by_label_contains("line ").count();
+    assert!(laid_out < 200, "{laid_out} lines laid out");
+    assert!(h.query_by_label("line 39999").is_some());
+    h.state_mut()
+        .test_sql_window()
+        .state
+        .output
+        .push("line 40000".into());
+    h.run_steps(3);
+    assert!(h.query_by_label("line 40000").is_some());
+}
+
+/// On MySQL a statement with several results shows each in a tab of its
+/// own (#290): a procedure's SELECTs, and statements kept together after
+/// DELIMITER, also with an error after the first. Only the first showed,
+/// and the error was lost. MariaDB's `BEGIN NOT ATOMIC` too, when the test
+/// database is MariaDB.
+#[test]
+fn mysql_statements_show_every_result() {
+    let connection = "r51@mysql";
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_MYSQL",
+        connection,
+        dbcraft_config::DbKind::MySql,
+    ) else {
+        return;
+    };
+    let mariadb = h.state().test_mariadb(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(&mut h, "drop procedure if exists r51_p");
+    run_in_window(
+        &mut h,
+        "create procedure r51_p() begin select 1 as a; select 'x' as b, 2 as c; end",
+    );
+    // Each result's title and first row, and the messages.
+    let shown = |h: &mut Ui, sql: &str| {
+        h.state_mut().test_sql_window().editor.set_text(sql);
+        h.state_mut().test_execute_focused();
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let results: Vec<String> = w
+            .state
+            .results
+            .iter()
+            .map(|r| {
+                let row: Vec<&str> = r.rows[0]
+                    .iter()
+                    .map(|c| c.as_deref().unwrap_or(""))
+                    .collect();
+                format!("{}: {}", r.title, row.join(" "))
+            })
+            .collect();
+        let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        (results, messages)
+    };
+    let two = ["Result 1: 1", "Result 2: x 2"];
+    let mut cases = vec![
+        "call r51_p()",
+        "DELIMITER //\nselect 1 as a; select 'x' as b, 2 as c //\nDELIMITER ;",
+    ];
+    if mariadb {
+        cases.push("begin not atomic select 1 as a; select 'x' as b, 2 as c; end;");
+    }
+    for sql in cases {
+        let (results, messages) = shown(&mut h, sql);
+        assert_eq!(results, two, "{sql}: {messages:?}");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains("1 row selected"))
+                .count(),
+            2,
+            "{sql}: {messages:?}"
+        );
+    }
+    let (results, messages) = shown(
+        &mut h,
+        "DELIMITER //\nselect 1 as a; select * from r51_no_such_table //\nselect 2 //",
+    );
+    assert_eq!(results, ["Result 1: 1"], "{messages:?}");
+    assert!(
+        messages.iter().any(|m| m.contains("1146"))
+            && messages
+                .iter()
+                .any(|m| m.contains("1 remaining statement(s) skipped")),
+        "{messages:?}"
+    );
+    run_in_window(&mut h, "drop procedure r51_p");
+}
+
+/// Break while SQL Server fetches a result's rows fails that result's
+/// statement (#347). The session sends the rows it read, which end the
+/// statement, and then the failure: the window took it for the failure of
+/// the statement a script sent after it (counted as failed, not skipped:
+/// 1 of the 2 skipped), and when it fetched more of a result later for a
+/// statement's failing ("Failed after"), which WHENEVER SQLERROR EXIT
+/// ROLLBACK rolled back for, as it doesn't for a failure while fetching.
+#[test]
+fn break_while_fetching_fails_the_result() {
+    use crate::commands::Command;
+    let connection = "r75@SQL Server";
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_MSSQL",
+        connection,
+        dbcraft_config::DbKind::SqlServer,
+    ) else {
+        return;
+    };
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    // A batch whose result's rows are read before it waits: the server
+    // sends them then (WITH NOWAIT).
+    let slow = |values: &str| {
+        format!(
+            "declare @n int = 1;\nselect n from (values {values}) v (n);\n\
+             raiserror('r75', 0, 1) with nowait;\nwaitfor delay '00:01:00';\nselect 2 as m"
+        )
+    };
+    let messages = |h: &Ui| -> Vec<String> {
+        let w = h.state().test_sql_window_ref().unwrap();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+    let cancelled = |h: &mut Ui| {
+        // The session is in the batch's wait.
+        std::thread::sleep(Duration::from_millis(500));
+        h.state_mut().test_command(Command::Cancel);
+        wait_until(h, "Break", |app| {
+            !app.test_focused_busy()
+                && app.test_sql_window_ref().is_some_and(|w| {
+                    w.state
+                        .messages
+                        .iter()
+                        .any(|m| m.text == "Cancelled while fetching")
+                })
+        });
+    };
+
+    let script = format!("{}\nGO\nselect 2\nGO\nselect 3", slow("(1)"));
+    h.state_mut().test_sql_window().editor.set_text(&script);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the first result", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| !w.state.results.is_empty())
+    });
+    cancelled(&mut h);
+    let said = messages(&h);
+    assert!(
+        said.iter().any(|m| m == "2 remaining statement(s) skipped"),
+        "{said:?}"
+    );
+    assert_eq!(
+        h.state().test_sql_window_ref().unwrap().state.results.len(),
+        1
+    );
+
+    // Its first rows, fewer than the grid shows: it fetches the next ones.
+    h.state_mut().test_settings_mut().fetch_size = 2;
+    let script = format!("whenever sqlerror exit rollback\n{}", slow("(1), (2), (3)"));
+    h.state_mut().test_sql_window().editor.set_text(&script);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the next rows", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.running.is_none() && w.state.fetching.is_some())
+    });
+    let before = messages(&h).len();
+    cancelled(&mut h);
+    h.run_steps(5);
+    h.state_mut().test_settings_mut().fetch_size = dbcraft_config::Settings::default().fetch_size;
+    let said = messages(&h);
+    assert!(
+        !said[before..]
+            .iter()
+            .any(|m| m.starts_with("Failed after") || m.starts_with("Rolling back")),
+        "{said:?}"
+    );
+    let w = h.state().test_sql_window_ref().unwrap();
+    assert_eq!(w.state.results[0].rows.len(), 3, "{said:?}");
+}
+
+/// PostgreSQL: a rule whose actions are in parentheses is one statement
+/// (#346). The script ended it at their first `;` and sent `create rule …
+/// do also (select 1 as a`, which failed with "syntax error at end of
+/// input"; the rest went as a statement of its own.
+#[test]
+fn postgres_rules_with_several_actions() {
+    let connection = "r75@PostgreSQL";
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_POSTGRES",
+        connection,
+        dbcraft_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(
+        &mut h,
+        "drop table if exists r75_r;\ncreate table r75_r (id int);\n\
+         create rule r75_a as on insert to r75_r do also (select 1 as a; select 2 as b);\n\
+         commit",
+    );
+    run_in_window(&mut h, "insert into r75_r values (1)");
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<String> = w
+        .state
+        .results
+        .iter()
+        .map(|r| {
+            let column = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
+            let value = r
+                .rows
+                .first()
+                .and_then(|row| row.first().cloned().flatten());
+            format!("{column} = {}", value.unwrap_or_default())
+        })
+        .collect();
+    assert_eq!(results, ["a = 1", "b = 2"]);
+    run_in_window(&mut h, "rollback;\ndrop table r75_r;\ncommit");
+}
+
+/// Oracle: a query's PL/SQL declarations, `with function … end; select …`,
+/// are one statement with it (#358), also in an INSERT and in an UPDATE's
+/// subquery. The script ended it at the first `;` of the function and sent
+/// `with function f(n number) return number is\n  v number := n`, which
+/// failed with ORA-02000: missing AS keyword, and the rest as statements of
+/// their own.
+#[test]
+fn oracle_queries_with_plsql_declarations() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection,
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let _ = run_in_window(
+        &mut h,
+        "begin execute immediate 'drop table r84_w purge'; exception when others then null; end;",
+    );
+    run_in_window(&mut h, "create table r84_w (x number)");
+    run_in_window(
+        &mut h,
+        "with function f(n number) return number is\n  v number := n;\nbegin\n  v := v * 2;\n  return v;\nend;\n\
+         select f(21) a from dual;\n\
+         insert /*+ with_plsql */ into r84_w\nwith function g return number is begin return 5; end;\n\
+         select g from dual;\n\
+         update /*+ with_plsql */ r84_w set x = x + (with function k return number is begin return 1; end;\n\
+         select k from dual);\n\
+         with function h return varchar2 is begin return 'end;'; end;\nselect h() b from dual\n/\n\
+         select x c from r84_w",
+    );
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<String> = w
+        .state
+        .results
+        .iter()
+        .map(|r| {
+            let column = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
+            let value = r
+                .rows
+                .first()
+                .and_then(|row| row.first().cloned().flatten());
+            format!("{column} = {}", value.unwrap_or_default())
+        })
+        .collect();
+    assert_eq!(results, ["A = 42", "B = end;", "C = 6"]);
+    run_in_window(&mut h, "rollback");
+    run_in_window(&mut h, "drop table r84_w purge");
+}
+
+/// On SQL Server and PostgreSQL a statement with several results shows
+/// each in a tab of its own (#316), as on MySQL (#290): a T-SQL batch that
+/// DECLAREs, a procedure's result sets, the SELECTs rules add to an
+/// INSERT. SQL Server showed the first with a notice, PostgreSQL the rows
+/// of all under the first one's columns; an error after the first didn't
+/// fail the statement, and now stops the script.
+#[test]
+fn batches_show_every_result() {
+    use dbcraft_config::DbKind;
+    // Each result's title, columns and first row, and the messages.
+    let shown = |h: &mut Ui, sql: &str| {
+        h.state_mut().test_sql_window().editor.set_text(sql);
+        h.state_mut().test_execute_focused();
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let results: Vec<String> = w
+            .state
+            .results
+            .iter()
+            .map(|r| {
+                let columns: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+                let row: Vec<&str> = r.rows.first().map_or(Vec::new(), |row| {
+                    row.iter().map(|c| c.as_deref().unwrap_or("")).collect()
+                });
+                format!("{}: {} = {}", r.title, columns.join(" "), row.join(" "))
+            })
+            .collect();
+        let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        (results, messages)
+    };
+    let two = ["Result 1: a = 1", "Result 2: b c = x 2"];
+    let cases = [
+        (
+            "DBCRAFT_TEST_MSSQL",
+            DbKind::SqlServer,
+            vec![
+                "declare @n int = 1; select @n as a; select 'x' as b, @n + 1 as c",
+                "exec r66_p",
+            ],
+            "create or alter procedure r66_p as begin select 1 as a; select 'x' as b, 2 as c; end",
+            "declare @n int = 1; select @n as a; select 1 / 0 as b\nGO\nselect 2",
+            // The EXEC's transaction would take the DROP back.
+            "if @@trancount > 0 rollback;\ndrop procedure r66_p",
+        ),
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            vec!["insert into r66_r values (1)"],
+            "drop table if exists r66_r;\ndrop table if exists r66_f;\n\
+             create table r66_r (id int);\ncreate table r66_f (id int);\n\
+             create rule r66_a as on insert to r66_r do also select 1 as a;\n\
+             create rule r66_b as on insert to r66_r do also select 'x' as b, 2 as c;\n\
+             create rule r66_fa as on insert to r66_f do also select 1 as a;\n\
+             create rule r66_fb as on insert to r66_f do also select 1 / 0 as b;\ncommit",
+            "insert into r66_f values (1);\nselect 2",
+            "drop table r66_r;\ndrop table r66_f;\ncommit",
+        ),
+    ];
+    for (env, kind, two_results, setup, failing, cleanup) in cases {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        run_in_window(&mut h, setup);
+        for sql in two_results {
+            let (results, messages) = shown(&mut h, sql);
+            assert_eq!(results, two, "{sql}: {messages:?}");
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.contains("1 row selected"))
+                    .count(),
+                2,
+                "{sql}: {messages:?}"
+            );
+            assert!(
+                !messages.iter().any(|m| m.contains("more result set")),
+                "{messages:?}"
+            );
+        }
+        let (results, messages) = shown(&mut h, failing);
+        assert!(
+            results.len() <= 2 && !results.iter().any(|r| r.ends_with("= 2")),
+            "{connection}: {results:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.starts_with("Failed after"))
+                && messages
+                    .iter()
+                    .any(|m| m.contains("1 remaining statement(s) skipped")),
+            "{connection}: {messages:?}"
+        );
+        run_in_window(&mut h, cleanup);
+    }
+}
+
+/// On SQLite `&` is an operator: completion after `1&c.` offers the
+/// alias's columns (#287), which it didn't, reading `&c.` as a
+/// substitution variable. After `SET DEFINE ON` it is one, for the
+/// editor's highlighting too, whose setting this is (#322).
+#[test]
+fn completion_after_a_bitwise_and() {
+    let connection = "r51_and.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r51_t (id integer primary key, note text)",
+    );
+    let text = "select * from r51_t c where 1&c";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .select(text.len()..text.len());
+    h.run_steps(3);
+    h.event(egui::Event::Text(".".into()));
+    wait_until(&mut h, "completion popup", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with("note"))
+    });
+    assert!(
+        !h.state()
+            .test_sql_window_ref()
+            .unwrap()
+            .editor
+            .substitution()
+    );
+    run_in_window(&mut h, "set define on");
+    h.run_steps(2);
+    assert!(
+        h.state()
+            .test_sql_window_ref()
+            .unwrap()
+            .editor
+            .substitution()
+    );
+}
+
+/// Explain plan runs in the window's session, so it sees what Execute in
+/// that window sees (#269): a temporary table, PostgreSQL's search path,
+/// Oracle's current schema. On the connection's main session it said there
+/// was no such table, or explained another schema's. The window's
+/// transaction stays as it was. SQLite, and the servers whose test
+/// databases are set.
+#[test]
+fn explain_runs_in_the_windows_session() {
+    use dbcraft_config::DbKind;
+    let temp = |create: &'static str| ExplainCase {
+        setup: create,
+        explain: "select * from r51_t where name = 'x'",
+        object: "r51_t",
+        change: "insert into r51_t values (1, 'x')",
+        count: "select count(*) from r51_t",
+    };
+    let (mut h, _file) = sqlite_file("r51_explain.db");
+    explain_case(
+        &mut h,
+        "r51_explain.db",
+        &temp("create temp table r51_t (id integer primary key, name text)"),
+    );
+    drop(h);
+    let servers = [
+        (
+            "DBCRAFT_TEST_MYSQL",
+            DbKind::MySql,
+            temp("create temporary table r51_t (id int primary key, name varchar(10))"),
+        ),
+        (
+            "DBCRAFT_TEST_MSSQL",
+            DbKind::SqlServer,
+            ExplainCase {
+                setup: "create table #r51_t (id int primary key, name varchar(10))",
+                explain: "select * from #r51_t where name = 'x'",
+                object: "#r51_t",
+                change: "insert into #r51_t values (1, 'x')",
+                count: "select count(*) from #r51_t",
+            },
+        ),
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            ExplainCase {
+                setup: "create schema if not exists r51_s;\n\
+                        create table if not exists r51_s.r51_p (id int, name text);\n\
+                        set search_path = r51_s",
+                explain: "select * from r51_p where name = 'x'",
+                object: "r51_p",
+                change: "insert into r51_p values (1, 'x')",
+                count: "select count(*) from r51_p",
+            },
+        ),
+    ];
+    for (env, kind, case) in servers {
+        let connection = format!("r51@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        explain_case(&mut h, &connection, &case);
+        if kind == DbKind::Postgres {
+            run_in_window(&mut h, "drop schema r51_s cascade");
+        }
+    }
+    // Oracle: a private temporary table, and the current schema.
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    crate::test_db::as_dba(&[
+        "begin execute immediate 'drop table system.r51_p purge'; \
+         exception when others then null; end;",
+        "create table system.r51_p (id number, name varchar2(10))",
+        "grant select, insert on system.r51_p to {user}",
+    ]);
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    explain_case(
+        &mut h,
+        &connection,
+        &ExplainCase {
+            setup: "create private temporary table ora$ptt_r51 (id number, name varchar2(10)) \
+                    on commit preserve definition",
+            explain: "select * from ora$ptt_r51 where name = 'x'",
+            object: "ora$ptt_r51",
+            change: "insert into ora$ptt_r51 values (1, 'x')",
+            count: "select count(*) from ora$ptt_r51",
+        },
+    );
+    explain_case(
+        &mut h,
+        &connection,
+        &ExplainCase {
+            setup: "alter session set current_schema = system",
+            explain: "select * from r51_p where name = 'x'",
+            object: "system.r51_p",
+            change: "insert into r51_p values (1, 'x')",
+            count: "select count(*) from r51_p",
+        },
+    );
+    drop(h);
+    crate::test_db::as_dba(&["drop table system.r51_p purge"]);
+}
+
+/// A result whose query was closed with rows left says so and keeps its
+/// `+` (#312): the next statement of a script closes it, and on MySQL,
+/// PostgreSQL, SQL Server and SQLite, which read one result at a time, so
+/// does a Rollback. Fetch all found nothing more there, and the result
+/// looked complete with 500 of its 1,000 rows; on Oracle it waited for
+/// rows that never came. Oracle keeps a query open over a Rollback: Fetch
+/// all fetches the rest. SQLite, and the servers whose test databases are
+/// set.
+#[test]
+fn closed_queries_say_so() {
+    use dbcraft_config::DbKind;
+    let (mut h, _file) = sqlite_file("r66_closed.db");
+    closed_case(
+        &mut h,
+        "r66_closed.db",
+        "with recursive n(n) as (select 1 union all select n + 1 from n where n < 1000) \
+         select n from n",
+        false,
+    );
+    drop(h);
+    let servers = [
+        (
+            "DBCRAFT_TEST_MYSQL",
+            DbKind::MySql,
+            "with recursive n (n) as (select 1 union all select n + 1 from n where n < 1000) \
+             select n from n",
+        ),
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            "select generate_series(1, 1000) as n",
+        ),
+        (
+            "DBCRAFT_TEST_MSSQL",
+            DbKind::SqlServer,
+            "select top 1000 row_number() over (order by (select null)) as n \
+             from sys.all_objects a cross join sys.all_objects b",
+        ),
+    ];
+    for (env, kind, rows) in servers {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        closed_case(&mut h, &connection, rows, false);
+    }
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    closed_case(
+        &mut h,
+        &connection,
+        "select level as n from dual connect by level <= 1000",
+        true,
+    );
+}
+
+/// Result 1 of `rows` and another statement, and of `rows` and a
+/// Rollback, in a window of its own on `connection`.
+fn closed_case(h: &mut Ui, connection: &str, rows: &str, oracle: bool) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    // Its rows, its +, whether its query ended.
+    let first = |h: &Ui| {
+        let r = &h.state().test_sql_window_ref().unwrap().state.results[0];
+        (r.rows.len(), r.more, r.ended)
+    };
+    let said = |h: &Ui, text: &str| {
+        let w = h.state().test_sql_window_ref().unwrap();
+        w.state.messages.iter().any(|m| m.text.starts_with(text))
+    };
+    let shows = "Result 1 shows the 500 rows fetched";
+
+    run_in_window(h, &format!("{rows};\nselect 1"));
+    assert_eq!(
+        h.state().test_sql_window_ref().unwrap().state.results.len(),
+        2,
+        "{connection}"
+    );
+    let clicked = fetch_all(h, 0);
+    assert_eq!(first(h), (500, true, true), "{connection}: fetched all");
+    assert!(!clicked && said(h, shows), "{connection}");
+    // A Fetch all on its way meanwhile is answered.
+    let id = h.state().test_sql_window_ref().unwrap().state.results[0].id;
+    h.state_mut().test_on_sql_window(|w, _| {
+        w.state.fetching = Some(id);
+        let mut effects = crate::documents::Effects::default();
+        effects.request(
+            crate::documents::Target::Own,
+            dbcraft_db::DbRequest::FetchMore {
+                id,
+                max_rows: usize::MAX,
+            },
+        );
+        effects
+    });
+    wait_until(h, "the closed query's answer", |app| {
+        !app.test_focused_busy()
+    });
+    assert_eq!(first(h), (500, true, true), "{connection}: answered");
+
+    run_in_window(h, rows);
+    h.state_mut().test_rollback();
+    wait_until(h, "rollback", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.messages.iter().any(|m| m.text == "Rolled back"))
+    });
+    if oracle {
+        assert_eq!(first(h), (500, true, false), "{connection}: rolled back");
+        assert!(fetch_all(h, 0), "{connection}");
+        assert_eq!(first(h), (1000, false, false), "{connection}: fetched all");
+    } else {
+        assert!(!fetch_all(h, 0), "{connection}");
+        assert_eq!(first(h), (500, true, true), "{connection}: rolled back");
+        assert!(said(h, shows), "{connection}");
+    }
+    h.state_mut().test_close_focused();
+    h.run_steps(2);
+}
+
+/// Completion in a SQL window looks names up in what its statements made
+/// them refer to (#320), on the connection's main session: its current
+/// schema, database, search path or attached databases; another window
+/// completes those of the connection. Only its temporary tables are looked
+/// up in its own session, while it is idle: with a result open (rows left)
+/// completion goes without them, rather than ending the result or waiting,
+/// except on Oracle, which keeps a query open meanwhile. Before, the
+/// windows completed the main session's names, and no temporary table's.
+/// SQLite, and the servers whose test databases are set.
+#[test]
+fn completion_in_the_windows_context() {
+    use dbcraft_config::DbKind;
+    let (mut h, _file) = sqlite_file("r75_context.db");
+    let other = SqliteFile(
+        std::env::temp_dir().join(format!("dbcraft-ui-{}-r75-other.db", std::process::id())),
+    );
+    let _ = std::fs::remove_file(&other.0);
+    rusqlite::Connection::open(&other.0)
+        .unwrap()
+        .execute_batch("create table r75_only (id integer primary key, in_context text);")
+        .unwrap();
+    context_case(
+        &mut h,
+        "r75_context.db",
+        &ContextCase {
+            setup: "create table r75_t (id integer primary key, in_default text)".into(),
+            change: format!("attach '{}' as r75_o", other.0.display()),
+            undo: None,
+            table: "r75_only",
+            temporary: "create temp table r75_tmp (id integer primary key, note text)",
+            temporary_name: "r75_tmp",
+            one: "select 1",
+            rows: "with recursive n(n) as (select 1 union all select n + 1 from n where n < 1000) \
+                   select n from n",
+            cleanup: "drop table r75_t".into(),
+            oracle: false,
+        },
+    );
+    drop(h);
+    let mysql = |env| {
+        (
+            env,
+            DbKind::MySql,
+            ContextCase {
+                setup: "drop database if exists r75_db;\ncreate database r75_db;\n\
+                        create table r75_db.r75_t (id int primary key, in_context int);\n\
+                        drop table if exists r75_t;\n\
+                        create table r75_t (id int primary key, in_default int)"
+                    .into(),
+                change: "use r75_db".into(),
+                undo: None,
+                table: "r75_t",
+                temporary: "create temporary table r75_tmp (id int primary key, note varchar(10))",
+                temporary_name: "r75_tmp",
+                one: "select 1",
+                rows: "with recursive n (n) as \
+                       (select 1 union all select n + 1 from n where n < 1000) select n from n",
+                cleanup: "drop database r75_db;\ndrop table r75_t".into(),
+                oracle: false,
+            },
+        )
+    };
+    let postgres = |change: &str| {
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            ContextCase {
+                setup: "drop schema if exists r75_s cascade;\ncreate schema r75_s;\n\
+                        create table r75_s.r75_t (id int, in_context int);\n\
+                        drop table if exists r75_t;\ncreate table r75_t (id int, in_default int);\n\
+                        commit"
+                    .into(),
+                change: change.into(),
+                undo: None,
+                table: "r75_t",
+                temporary: "create temp table r75_tmp (id int, note text)",
+                temporary_name: "r75_tmp",
+                one: "select 1",
+                rows: "select generate_series(1, 1000) as n",
+                cleanup: "drop schema r75_s cascade;\ndrop table r75_t;\ncommit".into(),
+                oracle: false,
+            },
+        )
+    };
+    let servers = [
+        mysql("DBCRAFT_TEST_MYSQL_DBA"),
+        postgres("set search_path to r75_s"),
+        // As SET does (#362).
+        postgres("select set_config('search_path', 'r75_s', false)"),
+        (
+            "DBCRAFT_TEST_MSSQL",
+            DbKind::SqlServer,
+            ContextCase {
+                setup: "drop table if exists r75_s.r75_t;\ndrop table if exists dbo.r75_t;\n\
+                        drop user if exists r75_u;\ndrop schema if exists r75_s;\n\
+                        create schema r75_s;\n\
+                        create table r75_s.r75_t (id int, in_context int);\n\
+                        create table dbo.r75_t (id int, in_default int);\n\
+                        create user r75_u without login with default_schema = r75_s;\n\
+                        grant select on schema::r75_s to r75_u;\n\
+                        grant select on schema::dbo to r75_u"
+                    .into(),
+                change: "execute as user = 'r75_u'".into(),
+                undo: Some("revert"),
+                table: "r75_t",
+                temporary: "create table #r75_tmp (id int primary key, note varchar(10))",
+                temporary_name: "#r75_tmp",
+                one: "select 1",
+                rows: "select top 1000 row_number() over (order by (select null)) as n \
+                       from sys.all_objects a cross join sys.all_objects b",
+                cleanup: "drop table r75_s.r75_t;\ndrop table dbo.r75_t;\ndrop user r75_u;\n\
+                          drop schema r75_s"
+                    .into(),
+                oracle: false,
+            },
+        ),
+    ];
+    for (env, kind, case) in servers {
+        let connection = format!("r75@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        context_case(&mut h, &connection, &case);
+    }
+    // Oracle: the current schema, and a private temporary table.
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    crate::test_db::as_dba(&[
+        "begin execute immediate 'drop table system.r75_t purge'; \
+         exception when others then null; end;",
+        "create table system.r75_t (id number, in_context number)",
+        "grant select on system.r75_t to {user}",
+    ]);
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    context_case(
+        &mut h,
+        &connection,
+        &ContextCase {
+            setup: "begin execute immediate 'drop table r75_t purge'; \
+                    exception when others then null; end;\n/\n\
+                    create table r75_t (id number, in_default number)"
+                .into(),
+            change: "alter session set current_schema = system".into(),
+            undo: None,
+            table: "r75_t",
+            temporary: "create private temporary table ora$ptt_r75 \
+                        (id number, note varchar2(10)) on commit preserve definition",
+            temporary_name: "ora$ptt_r75",
+            one: "select 1 from dual",
+            rows: "select level as n from dual connect by level <= 1000",
+            cleanup: "drop table r75_t purge".into(),
+            oracle: true,
+        },
+    );
+    drop(h);
+    crate::test_db::as_dba(&["drop table system.r75_t purge"]);
+}
+
+/// What [`context_case`] makes and runs: a table `r75_t` with a column
+/// `in_default` where the connection's names are, the context's table with
+/// `in_context`, and a temporary table with `note`.
+struct ContextCase {
+    setup: String,
+    /// Changes what the window's names refer to, and changes it back
+    /// where closing the window doesn't.
+    change: String,
+    undo: Option<&'static str>,
+    /// The context's table: `r75_t`, or SQLite's of the attached file only.
+    table: &'static str,
+    /// Makes the temporary table, which is named `temporary_name`.
+    temporary: &'static str,
+    temporary_name: &'static str,
+    /// A query of a row.
+    one: &'static str,
+    /// A query of 1,000 rows.
+    rows: &'static str,
+    cleanup: String,
+    /// The session keeps a query open over other requests.
+    oracle: bool,
+}
+
+/// The case on `connection`: a window whose context changed, another in the
+/// connection's, a temporary table with a result open and without.
+fn context_case(h: &mut Ui, connection: &str, case: &ContextCase) {
+    let open = |h: &mut Ui| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        h.state().test_focused()
+    };
+    let close = |h: &mut Ui, id| {
+        h.state_mut().test_focus(id);
+        h.run_steps(1);
+        if h.state().test_window_pending_tx(id) {
+            h.state_mut().test_rollback();
+            wait_until(h, "rollback", |app| !app.test_window_pending_tx(id));
+        }
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    };
+    let changed = open(h);
+    run_in_window(h, &case.setup);
+    run_in_window(h, &case.change);
+    let table = format!("select * from {} c where c", case.table);
+    let labels = completed_with(h, &table, "in_context");
+    assert!(
+        !labels.iter().any(|l| l == "in_default"),
+        "{connection}: {labels:?}"
+    );
+    if let Some(undo) = case.undo {
+        run_in_window(h, undo);
+    }
+    close(h, changed);
+
+    let default = open(h);
+    run_in_window(h, case.one);
+    let labels = completed_with(h, "select * from r75_t c where c", "in_default");
+    assert!(
+        !labels.iter().any(|l| l == "in_context"),
+        "{connection}: {labels:?}"
+    );
+    if case.table != "r75_t" {
+        let labels = completed(h, &table);
+        assert!(labels.is_empty(), "{connection}: {labels:?}");
+    }
+    close(h, default);
+
+    // Its rows, its +, whether its query ended.
+    let first = |h: &Ui| {
+        let r = &h.state().test_sql_window_ref().unwrap().state.results[0];
+        (r.rows.len(), r.more, r.ended)
+    };
+    let temporary_window = open(h);
+    run_in_window(h, case.temporary);
+    run_in_window(h, case.rows);
+    assert_eq!(first(h), (500, true, false), "{connection}");
+    completed_with(h, "select * from r75_t c where c", "in_default");
+    let temporary = format!("select * from {} c where c", case.temporary_name);
+    let labels = completed(h, &temporary);
+    assert_eq!(
+        labels.iter().any(|l| l == "note"),
+        case.oracle,
+        "{connection}: {labels:?}"
+    );
+    assert_eq!(first(h), (500, true, false), "{connection}");
+    assert!(fetch_all(h, 0), "{connection}");
+    assert_eq!(first(h), (1000, false, false), "{connection}");
+    completed_with(h, &temporary, "note");
+    close(h, temporary_window);
+
+    let cleanup = open(h);
+    run_in_window(h, &case.cleanup);
+    if h.state().test_pending_tx() {
+        h.state_mut().test_commit();
+        wait_until(h, "commit", |app| !app.test_pending_tx());
+    }
+    close(h, cleanup);
+}
+
+/// Types `.` after `text` in the focused SQL window, as the editor's
+/// whole text.
+fn type_dot(h: &mut Ui, text: &str) {
+    h.state_mut().test_sql_window().editor.set_text(text);
+    h.run_steps(2);
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .select(text.len()..text.len());
+    h.run_steps(2);
+    h.event(egui::Event::Text(".".into()));
+}
+
+/// What completion offers, and closes it.
+fn completion_closed(h: &mut Ui) -> Vec<String> {
+    let w = h.state().test_sql_window_ref().unwrap();
+    let labels = w
+        .editor
+        .completion_labels()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    labels
+}
+
+/// Completion after `text` and a `.` once it offers `label`: what it offers.
+fn completed_with(h: &mut Ui, text: &str, label: &str) -> Vec<String> {
+    type_dot(h, text);
+    wait_until(h, &format!("{label} after {text}."), |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with(label))
+    });
+    completion_closed(h)
+}
+
+/// What completion after `text` and a `.` offers once it looked up all it
+/// needed.
+fn completed(h: &mut Ui, text: &str) -> Vec<String> {
+    type_dot(h, text);
+    let mut settled = 0;
+    let start = Instant::now();
+    while settled < 10 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "timed out completing {text}."
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+        settled = if h.state().test_catalog_settled() {
+            settled + 1
+        } else {
+            0
+        };
+    }
+    completion_closed(h)
+}
+
+/// A window whose session couldn't connect opens a new one for its next
+/// statement (#424): the failed one was kept, its worker gone, and the
+/// window ran for ever. SQLite's file, renamed away and back, stands for a
+/// server that was down. Not on Windows, which renames no file another
+/// session holds open.
+#[test]
+#[cfg(unix)]
+fn a_failed_window_session_is_opened_again() {
+    let dir = std::env::temp_dir().join(format!("dbcraft-r99-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("r99.db");
+    let moved = dir.join("r99-away.db");
+    rusqlite::Connection::open(&file)
+        .unwrap()
+        .execute_batch("create table t (n integer); insert into t values (7);")
+        .unwrap();
+    let connection = "r99-failed-session".to_owned();
+    let profile = ConnectionProfile {
+        name: connection.clone(),
+        kind: dbcraft_config::DbKind::Sqlite,
+        connect_string: file.display().to_string(),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.clone(),
+        text: "select n from t".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    let run = |h: &mut Ui| {
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the window", |app| !app.test_focused_busy());
+    };
+    std::fs::rename(&file, &moved).unwrap();
+    run(&mut h);
+    let failed = h.state().test_sql_window_ref().unwrap().state.results.len();
+    std::fs::rename(&moved, &file).unwrap();
+    run(&mut h);
+    let w = h.state().test_sql_window_ref().unwrap();
+    let rows: Vec<Vec<Option<String>>> = w
+        .state
+        .results
+        .last()
+        .map(|r| r.rows.clone())
+        .unwrap_or_default();
+    assert_eq!(failed, 0);
+    assert_eq!(rows, [vec![Some("7".to_owned())]]);
+    h.state_mut().test_close_focused();
+    h.run_steps(2);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A SQLite database in memory is the connection's, as a file is: its
+/// windows, its object browser and completion all have a window's table.
+/// `:memory:` is one database for all of them; a `file:` URI of memory
+/// without `cache=` made one for each session (#364), so the browser and
+/// completion looked at the empty one of the connection's main session,
+/// and another window at one of its own: "no such table".
+#[test]
+fn memory_databases_are_the_connections() {
+    use dbcraft_db::ObjectType;
+    for (n, memory) in [":memory:", "file::memory:", "file:r85_memory?mode=memory"]
+        .into_iter()
+        .enumerate()
+    {
+        let connection = format!("r85-memory-{n}");
+        let profile = ConnectionProfile {
+            name: connection.clone(),
+            kind: dbcraft_config::DbKind::Sqlite,
+            connect_string: memory.into(),
+            ..Default::default()
+        };
+        let mut h = harness(true);
+        h.state_mut().test_connect(profile, String::new());
+        wait_until(&mut h, "connection", |app| app.test_connected());
+        let open = |h: &mut Ui| {
+            h.state_mut().test_open(OpenRequest::Sql {
+                connection: connection.clone(),
+                text: String::new(),
+                run: false,
+            });
+            h.run_steps(2);
+        };
+        open(&mut h);
+        run_in_window(
+            &mut h,
+            "create table r85_m (id integer primary key, in_window text)",
+        );
+        // Another window.
+        open(&mut h);
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text("select count(*) from r85_m");
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "the other window", |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let other: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        // Completion, from the main session.
+        let labels = completed(&mut h, "select * from r85_m c where c");
+        // The browser, also the main session's.
+        h.state_mut().test_expand_browser(&[ObjectType::Table]);
+        h.state_mut().test_refresh_browser();
+        wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        let listed = h.query_by_label("r85_m").is_some();
+        run_in_window(&mut h, "drop table if exists r85_m");
+        let seen = (
+            other.iter().any(|m| m.contains("1 row selected")),
+            labels.iter().any(|l| l == "in_window"),
+            listed,
+        );
+        assert_eq!(
+            seen,
+            (true, true, true),
+            "{memory}: another window, completion, the browser: {other:?}, {labels:?}"
+        );
+        h.state_mut().test_close_focused();
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    }
+}
+
+/// DESCRIBE takes a name as Oracle reads it: `"R83_Desc"` as written,
+/// `r83_desc` in uppercase, `dbcraft."R83.Desc"` with the dot in its quotes
+/// (#369).
+#[test]
+fn describe_takes_names_as_typed() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["\"R83_Desc\"", "r83_desc", "\"R83.Desc\"", "r83_straße"];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+    for ddl in [
+        "create table \"R83_Desc\" (id number(4) not null, \"Mixed\" varchar2(5))",
+        "create table r83_desc (plain date)",
+        "create table \"R83.Desc\" (described number)",
+        "create table r83_straße (lang varchar2(2))",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let mut described = Vec::new();
+    for name in [
+        "\"R83_Desc\"",
+        "r83_desc",
+        "dbcraft.\"R83.Desc\"",
+        "\"R83.Desc\"",
+        // R83_STRAßE, as Oracle folds it (#380).
+        "r83_straße",
+    ] {
+        let (_, rows, _) = grid_rows(&mut h, "dbcraft@FREEPDB1", &format!("desc {name}"));
+        let columns: Vec<String> = rows
+            .iter()
+            .map(|r| r[0].clone().unwrap_or_default())
+            .collect();
+        described.push((name, columns.join(", ")));
+    }
+    for t in tables {
+        conn.execute(&format!("drop table {t} purge"), &[]).unwrap();
+    }
+    assert_eq!(
+        described,
+        [
+            ("\"R83_Desc\"", "ID, Mixed".to_owned()),
+            ("r83_desc", "PLAIN".to_owned()),
+            ("dbcraft.\"R83.Desc\"", "DESCRIBED".to_owned()),
+            ("\"R83.Desc\"", "DESCRIBED".to_owned()),
+            ("r83_straße", "LANG".to_owned()),
+        ]
+    );
+}
+
+/// A lone `;` is no statement (#313): `select 1;;` sent `;` to the
+/// database, which failed on MySQL (ERROR 1065), Oracle (ORA-00900) and
+/// SQLite and stopped the script, and said "; executed" on PostgreSQL and
+/// SQL Server; a `;` on a line of its own went with the next statement,
+/// which failed on MySQL and Oracle. SQLite, and the servers whose test
+/// databases are set.
+#[test]
+fn lone_semicolons_are_skipped() {
+    use dbcraft_config::DbKind;
+    let script = |from_dual: &str| {
+        format!("select 1{from_dual};;\nselect 2{from_dual};\n;\nselect 3{from_dual};")
+    };
+    let check = |h: &mut Ui, connection: &str, from_dual: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        assert_eq!(
+            run_in_window(h, &script(from_dual)).as_deref(),
+            Some("3"),
+            "{connection}"
+        );
+        let w = h.state().test_sql_window_ref().unwrap();
+        let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(w.state.results.len(), 3, "{connection}: {messages:?}");
+        assert!(
+            messages.iter().all(|m| m.contains("1 row selected")),
+            "{connection}: {messages:?}"
+        );
+        run_in_window(h, ";\n");
+        let w = h.state().test_sql_window_ref().unwrap();
+        let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(messages, ["Nothing to execute"], "{connection}");
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    };
+    let (mut h, _file) = sqlite_file("r66_semicolons.db");
+    check(&mut h, "r66_semicolons.db", "");
+    drop(h);
+    for (env, kind) in [
+        ("DBCRAFT_TEST_MYSQL", DbKind::MySql),
+        ("DBCRAFT_TEST_POSTGRES", DbKind::Postgres),
+        ("DBCRAFT_TEST_MSSQL", DbKind::SqlServer),
+    ] {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        check(&mut h, &connection, "");
+    }
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    check(&mut h, &connection, " from dual");
+}
+
+/// Clicks Fetch all on result `index` and waits for its rows; false if the
+/// result doesn't offer it.
+fn fetch_all(h: &mut Ui, index: usize) -> bool {
+    h.state_mut().test_sql_window().state.bottom = crate::sql_window::BottomTab::Result(index);
+    h.run_steps(2);
+    let Some(button) = h
+        .query_by_label("Fetch all")
+        .or_else(|| h.query_by_label("All"))
+    else {
+        return false;
+    };
+    button.click();
+    h.run_steps(1);
+    wait_until(h, "Fetch all", |app| !app.test_focused_busy());
+    true
+}
+
+/// Closing a SQL window, or DbCraft, with changes to its results that
+/// weren't applied asks first (#245): a value being typed into a cell, and
+/// the changes waiting for Apply, were dropped without a word.
+#[test]
+fn unapplied_result_changes_are_asked_about() {
+    use crate::commands::Command;
+    let connection = "unapplied.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table ua_t (id integer primary key, name text);\n\
+         insert into ua_t values (1, 'one'), (2, 'two');\ncommit;",
+    );
+    let editable = |h: &mut Ui| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: "select id, name from ua_t order by id".into(),
+            run: true,
+        });
+        wait_until(h, "query", |app| !app.test_focused_busy());
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+        wait_until(h, "editing", |app| !app.test_focused_busy());
+        h.run_steps(2);
+        h.state().test_focused()
+    };
+    let asked = |h: &Ui| h.query_by_label_contains("weren't applied").is_some();
+
+    // Typing into a cell, then Ctrl+W: asked, Cancel keeps the window.
+    let window = editable(&mut h);
+    h.get_by_label("one").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    h.event(egui::Event::Text("changed".into()));
+    h.run_steps(2);
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    assert!(asked(&h), "a value being typed");
+    save(&mut h, "close-unapplied-changes");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused(), window);
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    h.get_by_label("Discard and close").click();
+    h.run_steps(2);
+    assert_ne!(h.state().test_focused(), window, "closed");
+
+    // A change waiting for Apply, and the tab's close button.
+    let window = editable(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 1, Some("edited".into()));
+    }
+    let (from, to, y) = close_button(&mut h, crate::app::Tab::Doc(window));
+    press(&mut h, egui::pos2((from + to) / 2.0, y), true);
+    press(&mut h, egui::pos2((from + to) / 2.0, y), false);
+    h.run_steps(2);
+    assert!(asked(&h), "a change to apply");
+    assert_eq!(h.state().test_focused(), window);
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+
+    // Exiting DbCraft.
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    h.step();
+    let commands = |h: &Ui| -> Vec<egui::ViewportCommand> {
+        h.output()
+            .viewport_output
+            .values()
+            .flat_map(|v| v.commands.clone())
+            .collect()
+    };
+    assert!(commands(&h).contains(&egui::ViewportCommand::CancelClose));
+    if let Some(root) = h.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
+        root.events.clear();
+    }
+    h.run_steps(2);
+    assert!(asked(&h), "exiting");
+    h.get_by_label("Exit and discard").click();
+    h.step();
+    assert!(commands(&h).contains(&egui::ViewportCommand::Close));
+}
+
+/// Favorites, recently opened objects and the invalid-only filter.
+#[test]
+fn browser_marks() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let object = |name: &str, t| ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: name.into(),
+        object_type: t,
+    };
+    h.state_mut().test_open(OpenRequest::Program {
+        connection: "dbcraft@FREEPDB1".into(),
+        object: object("DEMO_PKG", dbcraft_db::ObjectType::PackageBody),
+    });
+    wait_until(&mut h, "program", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_browser()
+        .test_marks(object("DEMO_EMPLOYEES", dbcraft_db::ObjectType::Table));
+    h.state_mut().test_expand_browser(&[
+        dbcraft_db::ObjectType::Procedure,
+        dbcraft_db::ObjectType::Package,
+        dbcraft_db::ObjectType::PackageBody,
+    ]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    save(&mut h, "browser-marks");
+    let marks = &h.state_mut().test_browser().marks;
+    assert_eq!(marks.recent["dbcraft@FREEPDB1"][0].name, "DEMO_PKG");
+    assert_eq!(
+        marks.favorites["dbcraft@FREEPDB1"][0].name,
+        "DEMO_EMPLOYEES"
+    );
+}
+
+/// Dragging a table from the browser into the editor inserts its name.
+#[test]
+fn drag_object_into_editor() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "select * from ".into(),
+        run: false,
+    });
+    h.state_mut()
+        .test_expand_browser(&[dbcraft_db::ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    let from = h.get_by_label("demo_employees").rect().center();
+    let to = egui::pos2(900.0, 250.0);
+    h.hover_at(from);
+    h.run_steps(1);
+    h.drag_at(from);
+    h.run_steps(1);
+    for i in 1..=10 {
+        h.hover_at(from + (to - from) * (i as f32 / 10.0));
+        h.run_steps(1);
+    }
+    h.drop_at(to);
+    h.run_steps(3);
+    let text = h.state_mut().test_sql_window().editor.text().to_owned();
+    assert!(text.contains("demo_employees"), "{text:?}");
+    // Rows still take clicks.
+    h.get_by_label("demo_departments").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state_mut()
+            .test_browser()
+            .selected()
+            .map(|o| o.name.as_str()),
+        Some("DEMO_DEPARTMENTS")
+    );
+}
+
+/// A PostgreSQL table's columns show and drag as they are written in SQL,
+/// quoted where the name needs it: `"Order Date"`, and `"Id"` beside `id`.
+#[test]
+fn drag_column_into_editor() {
+    use dbcraft_db::ObjectType;
+    let connection = "dbcraft@postgres";
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_POSTGRES",
+        connection,
+        dbcraft_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    run_script(
+        &mut h,
+        connection,
+        "drop table if exists drag_cols;\n\
+         create table drag_cols (\"Id\" int, \"Order Date\" date, id int);",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: "select  from drag_cols".into(),
+        run: false,
+    });
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.state_mut().test_expand_table(ObjectRef {
+        owner: "public".into(),
+        name: "drag_cols".into(),
+        object_type: ObjectType::Table,
+    });
+    wait_until(&mut h, "columns", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    for column in ["\"Id\"", "id"] {
+        assert!(h.query_by_label(column).is_some(), "{column}");
+    }
+    let from = h.get_by_label("\"Order Date\"").rect().center();
+    let to = egui::pos2(900.0, 250.0);
+    h.hover_at(from);
+    h.run_steps(1);
+    h.drag_at(from);
+    h.run_steps(1);
+    for i in 1..=10 {
+        h.hover_at(from + (to - from) * (i as f32 / 10.0));
+        h.run_steps(1);
+    }
+    h.drop_at(to);
+    h.run_steps(3);
+    let text = h.state_mut().test_sql_window().editor.text().to_owned();
+    assert!(text.contains("\"Order Date\""), "{text:?}");
+    run_script(&mut h, connection, "drop table drag_cols");
+}
+
+/// Debug… on a subprogram's name in a program window: in the spec and in
+/// the body for what the spec declares, not for the body's private
+/// subprograms. It opens a SQL window with a block that calls the
+/// procedure and debugs it right away: the body gets debug information and
+/// the run stops on entry to the procedure, once.
+#[test]
+fn debug_from_package_spec() {
+    let (Some((profile, password)), Ok(host)) = (profile(), std::env::var("DBCRAFT_DEBUG_HOST"))
+    else {
+        eprintln!("DBCRAFT_TEST_DB / DBCRAFT_DEBUG_HOST not set, skipping");
+        return;
+    };
+    debug_setup(&profile.username, &host);
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    for ddl in [
+        "create or replace package dbcraft_entry_pkg as\n  procedure run;\nend;",
+        "create or replace package body dbcraft_entry_pkg as\n  \
+         function helper(p_n number) return number is\n  begin\n    return p_n * 2;\n  end;\n\n  \
+         procedure run is\n    l_total number := 0;\n  begin\n    for i in 1 .. 3 loop\n      \
+         l_total := l_total + helper(i);\n    end loop;\n  end;\nend;",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    use dbcraft_debugger::{StopReason, Unit, UnitType};
+    let body = Unit::new("DBCRAFT", "DBCRAFT_ENTRY_PKG", UnitType::PackageBody);
+    assert!(!dbcraft_debugger::target::has_debug_info(&conn, &body).unwrap());
+
+    let mut h = harness(true);
+    h.state_mut().test_settings_mut().debug_host = host;
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Program {
+        connection: "dbcraft@FREEPDB1".into(),
+        object: ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "DBCRAFT_ENTRY_PKG".into(),
+            object_type: dbcraft_db::ObjectType::Package,
+        },
+    });
+    wait_until(&mut h, "source", |app| !app.test_focused_busy());
+    let right_click = |h: &mut Ui, word: &str| {
+        let editor = h.state_mut().test_program_editor().expect("program editor");
+        let offset = editor.text().find(word).expect(word) + 2;
+        let pos = editor.inner().offset_pos(offset).expect("drawn");
+        h.event(egui::Event::PointerMoved(pos));
+        h.step();
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Default::default(),
+            });
+            h.step();
+        }
+    };
+    // Waits until the menu shows `label`, maybe with a shortcut (the outline
+    // is worked out shortly after the source loaded).
+    let menu_item = |h: &mut Ui, label: &str| {
+        let start = Instant::now();
+        while h.query_by_label_contains(label).is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "no menu item {label}"
+            );
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+
+    // The body: its public procedure, not the private helper.
+    h.state_mut().test_program().active = 1;
+    h.run_steps(2);
+    right_click(&mut h, "run is");
+    menu_item(&mut h, "Debug…");
+    assert!(h.query_by_label("Test…").is_some());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    right_click(&mut h, "helper(p_n");
+    menu_item(&mut h, "Copy");
+    assert!(h.query_by_label("Debug…").is_none(), "private");
+    h.key_press(egui::Key::Escape);
+
+    // The spec: Debug… on the procedure.
+    h.state_mut().test_program().active = 0;
+    h.run_steps(2);
+    right_click(&mut h, "run;");
+    menu_item(&mut h, "Debug…");
+    save(&mut h, "debug-from-spec-menu");
+    h.get_by_label("Debug…").click();
+    wait_until(&mut h, "stop on entry", |app| {
+        app.test_debug().is_suspended()
+    });
+    let debug = h.state().test_debug();
+    assert_eq!(
+        debug.state,
+        dbcraft_debugger::ui::State::Suspended {
+            reason: StopReason::Entry
+        },
+        "{:?}",
+        debug.log
+    );
+    assert_eq!(debug.stack[0].location.unit, body, "{:?}", debug.stack);
+    assert_eq!(debug.stack[0].method, "RUN");
+    assert_eq!(
+        debug.stack[0].location.line,
+        Some(7),
+        "the procedure's header"
+    );
+    assert!(dbcraft_debugger::target::has_debug_info(&conn, &body).unwrap());
+    assert_eq!(debug.entry, Some((body.clone(), "RUN".to_owned())));
+    h.state_mut()
+        .test_debug_mut()
+        .command(dbcraft_debugger::DebugCommand::Resume);
+    wait_until(&mut h, "finish", |app| !app.test_debug_running());
+
+    conn.execute("drop package dbcraft_entry_pkg", &[]).unwrap();
+}
+
+/// Right-clicking a name in an editor offers what the object browser offers
+/// for it, without Drop; package members open at the subprogram.
+#[test]
+fn editor_context_menu() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let _ = conn.execute("drop table dbcraft_menu_t purge", &[]);
+    for ddl in [
+        "create table dbcraft_menu_t (id number)",
+        "create or replace package dbcraft_menu_pkg as\n  procedure do_it;\nend;",
+        "create or replace package body dbcraft_menu_pkg as\n  procedure helper is begin null; end;\n  procedure do_it is\n  begin\n    helper;\n  end;\nend;",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let text = "select * from dbcraft_menu_t;\nbegin\n  dbcraft_menu_pkg.do_it;\nend;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    let right_click = |h: &mut Ui, word: &str| {
+        let offset = text.find(word).unwrap() + 2;
+        let pos = h
+            .state_mut()
+            .test_sql_window()
+            .editor
+            .inner()
+            .offset_pos(offset)
+            .expect("drawn");
+        h.event(egui::Event::PointerMoved(pos));
+        h.step();
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Default::default(),
+            });
+            h.step();
+        }
+    };
+    // Waits until the menu shows `label` (names are looked up in the background).
+    let menu_item = |h: &mut Ui, label: &str| {
+        let start = Instant::now();
+        while h.query_by_label(label).is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "no menu item {label}"
+            );
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+
+    right_click(&mut h, "dbcraft_menu_t");
+    menu_item(&mut h, "Query data");
+    for label in ["Edit table…", "Describe", "Show in object browser"] {
+        assert!(h.query_by_label(label).is_some(), "{label}");
+    }
+    // With a submenu arrow or a shortcut in the label.
+    for label in ["Generate", "Cut", "Paste", "Toggle comment"] {
+        assert!(h.query_by_label_contains(label).is_some(), "{label}");
+    }
+    assert!(h.query_by_label("Drop…").is_none(), "no Drop in editors");
+    save(&mut h, "17-editor-context-menu-dark");
+    h.get_by_label("Show in object browser").click();
+    let table = ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: "DBCRAFT_MENU_T".into(),
+        object_type: dbcraft_db::ObjectType::Table,
+    };
+    wait_until(&mut h, "revealed", |app| {
+        app.test_browser_selected().as_ref() == Some(&table)
+    });
+
+    right_click(&mut h, "do_it");
+    menu_item(&mut h, "Edit do_it");
+    assert!(h.query_by_label("Test…").is_some());
+    h.get_by_label("Edit do_it").click();
+    let start = Instant::now();
+    loop {
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+        if let Some(editor) = h.state_mut().test_program_editor()
+            && let Some(range) = editor.selection()
+        {
+            assert_eq!(&editor.text()[range.clone()], "do_it");
+            assert!(
+                editor
+                    .text()
+                    .to_lowercase()
+                    .starts_with("create or replace package body")
+            );
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "package body not opened at do_it"
+        );
+    }
+    conn.execute("drop package dbcraft_menu_pkg", &[]).unwrap();
+    conn.execute("drop table dbcraft_menu_t purge", &[])
+        .unwrap();
+}
+
+/// A package's quoted subprogram reads as Oracle's SQL writes it, not in
+/// lowercase: in an editor's context menu, the program window's outline
+/// and its messages (#336).
+#[test]
+fn quoted_subprograms_keep_their_case() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let body = "create or replace package body \"R71_Pkg\" as\n  \
+                procedure \"R71_MyProc\" is begin null; end;\n  \
+                procedure r71_plain is begin null; end;\nend;";
+    for ddl in [
+        "create or replace package \"R71_Pkg\" as\n  procedure \"R71_MyProc\";\n  \
+         procedure r71_plain;\nend;",
+        body,
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let text = "begin\n  \"R71_Pkg\".\"R71_MyProc\";\nend;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    let offset = text.find("R71_MyProc").unwrap() + 2;
+    let pos = h
+        .state_mut()
+        .test_sql_window()
+        .editor
+        .inner()
+        .offset_pos(offset)
+        .expect("drawn");
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+    // Waits until `label` shows (names are looked up in the background, the
+    // outline worked out once the source loaded).
+    let shown = |h: &mut Ui, label: &str| {
+        let start = Instant::now();
+        while h.query_by_label(label).is_none() {
+            assert!(start.elapsed() < Duration::from_secs(30), "no {label}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    shown(&mut h, "Edit \"R71_MyProc\"");
+    assert!(
+        h.query_by_label("dbcraft.\"R71_Pkg\".\"R71_MyProc\"")
+            .is_some()
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    h.state_mut().test_open(OpenRequest::ProgramMember {
+        connection: "dbcraft@FREEPDB1".into(),
+        object: ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "R71_Pkg".into(),
+            object_type: dbcraft_db::ObjectType::Package,
+        },
+        member: "R71_Gone".into(),
+        parameter: None,
+    });
+    wait_until(&mut h, "source", |app| !app.test_focused_busy());
+    assert_eq!(
+        h.state_mut().test_program().message(),
+        Some((false, "\"R71_Gone\" not found".into()))
+    );
+    shown(&mut h, "\"R71_MyProc\"");
+    for label in ["r71_plain", "\"R71_Pkg\""] {
+        assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+    }
+    // Go to body of a procedure the body (as edited) leaves out.
+    h.state_mut().test_program().parts[1]
+        .editor
+        .set_text(body.replace("\"R71_MyProc\"", "r71_other"));
+    h.run_steps(3);
+    h.get_by_label("\"R71_MyProc\"").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Go to body").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state_mut().test_program().message(),
+        Some((false, "\"R71_MyProc\" isn't in the body".into()))
+    );
+    h.state_mut().test_program().parts[1].editor.set_text(body);
+    conn.execute("drop package \"R71_Pkg\"", &[]).unwrap();
+}
+
+/// A package's quoted subprogram is the one of its source: Edit "R83_MyProc"
+/// from an editor's menu opens the body at it, and Test… and Debug… from
+/// the outline call it with its parameters, not "R83_MYPROC" (#359).
+#[test]
+fn quoted_subprograms_open_test_and_debug() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let host = std::env::var("DBCRAFT_DEBUG_HOST").ok();
+    if let Some(host) = &host {
+        debug_setup(&profile.username, host);
+    }
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let body = "create or replace package body \"R83_Pkg\" as\n  \
+                procedure \"r83_myproc\"(p_d date) is begin null; end;\n  \
+                procedure \"R83_MyProc\"(p_n number) is\n    l_n number := p_n;\n  \
+                begin\n    l_n := l_n + 1;\n  end;\nend;";
+    for ddl in [
+        "create or replace package \"R83_Pkg\" as\n  procedure \"R83_MyProc\"(p_n number);\n  \
+         procedure \"r83_myproc\"(p_d date);\nend;",
+        body,
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    if let Some(host) = &host {
+        h.state_mut().test_settings_mut().debug_host = host.clone();
+    }
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let text = "begin\n  \"R83_Pkg\".\"R83_MyProc\"(1);\nend;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    let offset = text.find("R83_MyProc").unwrap() + 2;
+    let pos = h
+        .state_mut()
+        .test_sql_window()
+        .editor
+        .inner()
+        .offset_pos(offset)
+        .expect("drawn");
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+    // Waits until `label` shows (names are looked up in the background, the
+    // outline worked out once the source loaded).
+    let shown = |h: &mut Ui, label: &str| {
+        let start = Instant::now();
+        while h.query_by_label(label).is_none() {
+            assert!(start.elapsed() < Duration::from_secs(30), "no {label}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    shown(&mut h, "Edit \"R83_MyProc\"");
+    h.get_by_label("Edit \"R83_MyProc\"").click();
+    h.run_steps(2);
+    wait_until(&mut h, "source", |app| app.test_program_loaded());
+    let program = h.state_mut().test_program();
+    assert_eq!(program.message(), None);
+    let at = body.find("\"R83_MyProc\"").unwrap();
+    assert_eq!(
+        (program.active, program.active_editor().unwrap().selection()),
+        (1, Some(at..at + "\"R83_MyProc\"".len()))
+    );
+
+    shown(&mut h, "\"R83_MyProc\"");
+    h.get_by_label("\"R83_MyProc\"").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Test…").click();
+    wait_until(&mut h, "test block", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("R83_Pkg"))
+    });
+    let block = h.state_mut().test_sql_window().editor.text().to_owned();
+    // Its parameter, not "r83_myproc"'s too.
+    assert!(
+        block.contains("dbcraft.\"R83_Pkg\".\"R83_MyProc\"(")
+            && block.contains("p_n =>")
+            && !block.contains("p_d"),
+        "{block}"
+    );
+    h.state_mut().test_close_focused();
+    h.run_steps(3);
+
+    if host.is_some() {
+        h.state_mut().test_open(OpenRequest::Program {
+            connection: "dbcraft@FREEPDB1".into(),
+            object: ObjectRef {
+                owner: "DBCRAFT".into(),
+                name: "R83_Pkg".into(),
+                object_type: dbcraft_db::ObjectType::Package,
+            },
+        });
+        h.run_steps(3);
+        wait_until(&mut h, "program window", |app| app.test_program_loaded());
+        h.get_by_label("\"R83_MyProc\"").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Debug…").click();
+        wait_until(&mut h, "values", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.waiting_for_values())
+        });
+        h.state_mut()
+            .test_sql_window()
+            .bind_values
+            .insert("p_n".into(), Some("1".into()));
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "stop on entry or the end", |app| {
+            let debug = app.test_debug();
+            debug.is_suspended() || debug.state == dbcraft_debugger::ui::State::Finished
+        });
+        let debug = h.state().test_debug();
+        assert!(debug.is_suspended(), "{:?}", debug.log);
+        let unit = dbcraft_debugger::Unit::new(
+            "DBCRAFT",
+            "R83_Pkg",
+            dbcraft_debugger::UnitType::PackageBody,
+        );
+        assert_eq!(debug.stack[0].method, "R83_MyProc", "{:?}", debug.stack);
+        assert_eq!(debug.entry, Some((unit, "R83_MyProc".to_owned())));
+        h.state_mut()
+            .test_debug_mut()
+            .command(dbcraft_debugger::DebugCommand::Resume);
+        wait_until(&mut h, "finish", |app| !app.test_debug_running());
+    }
+    conn.execute("drop package \"R83_Pkg\"", &[]).unwrap();
+}
+
+/// Go to definition, Back/Forward, Switch Spec/Body, Go to Symbol and Find
+/// References in a package's program window, across its spec and body.
+#[test]
+fn navigation_across_spec_and_body() {
+    use crate::commands::Command;
+    let spec = "create or replace package nav_pkg as\n  -- The limit.\n  g_limit number := 10;\n  \
+                procedure raise(p_id number, p_pct number);\n  \
+                procedure raise(p_id number, p_amount number, p_reason varchar2);\nend nav_pkg;";
+    let body = "create or replace package body nav_pkg as\n  \
+                procedure raise(p_id number, p_pct number) is\n  begin\n    \
+                if p_pct > g_limit then\n      raise(p_id, p_pct, 'too much');\n    end if;\n  end;\n  \
+                procedure raise(p_id number, p_amount number, p_reason varchar2) is\n  begin\n    \
+                null;\n  end;\nend nav_pkg;";
+    let mut h = harness(true);
+    h.state_mut().test_program_with(
+        ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "NAV_PKG".into(),
+            object_type: dbcraft_db::ObjectType::PackageBody,
+        },
+        spec,
+        body,
+    );
+    h.run_steps(3);
+    // (active part, selection or caret) of the program window.
+    let state = |h: &mut Ui| {
+        let w = h.state_mut().test_program();
+        let part = w.active;
+        let editor = w.active_editor().unwrap();
+        (
+            part,
+            editor
+                .selection()
+                .unwrap_or(editor.cursor()..editor.cursor()),
+        )
+    };
+    let place = |h: &mut Ui, part: usize, at: usize| {
+        h.state_mut().test_program().goto_position(part, at..at);
+        h.run_steps(2);
+    };
+    let run = |h: &mut Ui, command: Command| {
+        h.state_mut().test_command(command);
+        h.run_steps(3);
+    };
+
+    // A spec variable used in the body → its declaration in the spec.
+    let use_at = body.find("g_limit").unwrap() + 2;
+    place(&mut h, 1, use_at);
+    run(&mut h, Command::GoToDefinition);
+    let decl = spec.find("g_limit").unwrap();
+    assert_eq!(state(&mut h), (0, decl..decl + 7));
+    run(&mut h, Command::NavigateBack);
+    assert_eq!(state(&mut h), (1, use_at..use_at));
+    run(&mut h, Command::NavigateForward);
+    assert_eq!(state(&mut h).0, 0);
+
+    // Peek shows the declaration (and its comment) in place.
+    place(&mut h, 1, use_at);
+    run(&mut h, Command::PeekDefinition);
+    assert_eq!(state(&mut h), (1, use_at..use_at), "peeking doesn't move");
+    assert!(h.query_by_label_contains("spec, line 3").is_some());
+
+    // The overload the call's arguments fit.
+    let call = body.find("raise(p_id, p_pct, 'too much')").unwrap() + 1;
+    place(&mut h, 1, call);
+    run(&mut h, Command::GoToDefinition);
+    let second = body.rfind("procedure raise").unwrap() + "procedure ".len();
+    assert_eq!(state(&mut h), (1, second..second + 5));
+
+    // Switch to the spec at the same overload.
+    place(&mut h, 1, body.rfind("null;").unwrap());
+    run(&mut h, Command::SwitchSpecBody);
+    let in_spec = spec.rfind("procedure raise").unwrap() + "procedure ".len();
+    assert_eq!(state(&mut h), (0, in_spec..in_spec + 5));
+
+    // Go to Symbol lists both parts.
+    run(&mut h, Command::GoToSymbol);
+    assert!(h.query_by_label_contains("variable · Spec").is_some());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    // Find References: in both parts, stepped through with the arrows;
+    // Escape goes back.
+    place(&mut h, 1, use_at);
+    run(&mut h, Command::FindReferences);
+    assert!(h.state().test_reference_rows());
+    assert!(
+        h.query_by_label_contains("if p_pct > g_limit then")
+            .is_some()
+    );
+    assert!(h.query_by_label_contains("g_limit number := 10;").is_some());
+    let first = state(&mut h);
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(2);
+    assert_ne!(state(&mut h), first, "stepping shows the next reference");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(!h.state().test_reference_rows());
+    assert_eq!(state(&mut h), (1, use_at..use_at), "back where it started");
+}
+
+/// The outline's context menu in a package's program window: Go to body
+/// and Go to specification land on the same overload, whatever order the
+/// body has (Back returns), Find references, Copy name. Without a
+/// connection there's nothing to test.
+#[test]
+fn outline_context_menu() {
+    use crate::commands::Command;
+    let spec = "create or replace package outline_pkg as\n  g_limit number := 10;\n  \
+                procedure raise(p_id number, p_pct number);\n  \
+                procedure raise(p_id number, p_amount number, p_reason varchar2);\nend outline_pkg;";
+    let body = "create or replace package body outline_pkg as\n  \
+                procedure raise(p_id number, p_amount number, p_reason varchar2) is\n  begin\n    \
+                null;\n  end;\n  \
+                procedure raise(p_id number, p_pct number) is\n  begin\n    \
+                if p_pct > g_limit then\n      raise(p_id, p_pct, 'too much');\n    end if;\n  end;\n\
+                end outline_pkg;";
+    let mut h = harness(true);
+    h.state_mut().test_program_with(
+        ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "OUTLINE_PKG".into(),
+            object_type: dbcraft_db::ObjectType::Package,
+        },
+        spec,
+        body,
+    );
+    h.run_steps(3);
+    // (active part, selection or caret) of the program window.
+    let state = |h: &mut Ui| {
+        let w = h.state_mut().test_program();
+        let part = w.active;
+        let editor = w.active_editor().unwrap();
+        (
+            part,
+            editor
+                .selection()
+                .unwrap_or(editor.cursor()..editor.cursor()),
+        )
+    };
+    let menu = |h: &mut Ui, name: &str, nth: usize| {
+        h.get_all_by_label(name)
+            .nth(nth)
+            .expect(name)
+            .click_secondary();
+        h.run_steps(2);
+    };
+
+    // The spec's second overload is the body's first.
+    assert_eq!(state(&mut h).0, 0);
+    menu(&mut h, "raise", 1);
+    assert!(h.query_by_label("Find references").is_some());
+    assert!(h.query_by_label("Test…").is_none(), "not connected");
+    save(&mut h, "outline-context-menu");
+    h.get_by_label("Go to body").click();
+    h.run_steps(3);
+    let first = body.find("raise").unwrap();
+    assert_eq!(state(&mut h), (1, first..first + 5));
+    h.state_mut().test_command(Command::NavigateBack);
+    h.run_steps(3);
+    assert_eq!(state(&mut h).0, 0, "Back returns to the spec");
+
+    // And back from the body's second to the spec's first.
+    h.state_mut().test_program().active = 1;
+    h.run_steps(3);
+    menu(&mut h, "raise", 1);
+    h.get_by_label("Go to specification").click();
+    h.run_steps(3);
+    let first = spec.find("raise").unwrap();
+    assert_eq!(state(&mut h), (0, first..first + 5));
+
+    // References to a variable, in both parts.
+    menu(&mut h, "g_limit", 0);
+    assert!(
+        h.query_by_label("Go to body").is_none(),
+        "only for subprograms"
+    );
+    h.get_by_label("Find references").click();
+    h.run_steps(3);
+    assert!(h.state().test_reference_rows());
+    assert!(
+        h.query_by_label_contains("if p_pct > g_limit then")
+            .is_some()
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+
+    menu(&mut h, "g_limit", 0);
+    h.get_by_label("Copy name").click();
+    h.step();
+    let copied = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .any(|c| matches!(c, egui::OutputCommand::CopyText(text) if text == "g_limit"));
+    assert!(copied, "{:?}", h.output().platform_output.commands);
+}
+
+/// A filter narrows a large package's outline to the names that contain
+/// it, with their parents; Enter goes to the first in the code, Escape
+/// clears it (#173).
+#[test]
+fn outline_filter() {
+    let mut body = String::from("create or replace package body pkg as\n");
+    for i in 0..30 {
+        body +=
+            &format!("  procedure add_to_attr_from_rec_{i}___ is\n  begin\n    null;\n  end;\n");
+    }
+    body += "  procedure refresh_lines2_invoice___ is\n  begin\n    null;\n  end;\n\
+             \x20 procedure do_refresh_lines2_invoice is\n  begin\n    refresh_lines2_invoice___;\n  end;\n\
+             end pkg;";
+    let mut h = harness(true);
+    h.state_mut().test_program_with(
+        ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "PKG".into(),
+            object_type: dbcraft_db::ObjectType::PackageBody,
+        },
+        "create or replace package pkg as\n  procedure do_refresh_lines2_invoice;\nend pkg;",
+        &body,
+    );
+    h.state_mut().test_program().active = 1;
+    h.run_steps(3);
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_some());
+
+    let field = |h: &mut Ui| {
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Filter the outline")
+            .focus();
+        h.run_steps(1);
+    };
+    field(&mut h);
+    h.event(egui::Event::Text("Lines2".into()));
+    h.run_steps(2);
+    save(&mut h, "outline-filter");
+    assert!(h.query_by_label("2 matches").is_some());
+    assert!(h.query_by_label("refresh_lines2_invoice___").is_some());
+    assert!(h.query_by_label("do_refresh_lines2_invoice").is_some());
+    assert!(
+        h.query_by_label("pkg").is_some(),
+        "the package, around them"
+    );
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_none());
+
+    // Enter: the first match's name is selected, and typing replaces it.
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    let editor = h.state_mut().test_program().active_editor().unwrap();
+    let start = body.find("refresh_lines2_invoice___").unwrap();
+    assert_eq!(
+        editor.selection(),
+        Some(start..start + "refresh_lines2_invoice___".len())
+    );
+    h.event(egui::Event::Text("renamed".into()));
+    h.run_steps(2);
+    let editor = h.state_mut().test_program().active_editor().unwrap();
+    assert!(
+        editor.text().contains("procedure renamed is"),
+        "the code has the focus"
+    );
+    // The outline follows the code once it's analyzed again.
+    for _ in 0..40 {
+        if h.query_by_label("1 match").is_some() {
+            break;
+        }
+        h.step();
+    }
+    assert!(h.query_by_label("1 match").is_some(), "the outline follows");
+
+    // Escape clears it.
+    field(&mut h);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_some());
+    assert!(h.query_by_label("1 match").is_none());
+    assert_eq!(h.state_mut().test_program().parts[1].outline_filter, "");
+}
+
+/// Test… and Debug… from the outline of a package body: for the
+/// subprograms its spec declares, disabled for a private one. Test… opens
+/// the block that calls it.
+#[test]
+fn test_from_outline() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    for ddl in [
+        "create or replace package dbcraft_outline_pkg as\n  procedure run(p_n number);\nend;",
+        "create or replace package body dbcraft_outline_pkg as\n  \
+         function helper(p_n number) return number is\n  begin\n    return p_n * 2;\n  end;\n\n  \
+         procedure run(p_n number) is\n    l_total number;\n  begin\n    \
+         l_total := helper(p_n);\n  end;\nend;",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Program {
+        connection: "dbcraft@FREEPDB1".into(),
+        object: ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "DBCRAFT_OUTLINE_PKG".into(),
+            object_type: dbcraft_db::ObjectType::PackageBody,
+        },
+    });
+    wait_until(&mut h, "source", |app| !app.test_focused_busy());
+    // The outline is worked out shortly after the source loaded.
+    let start = Instant::now();
+    while h.query_by_label("helper").is_none() {
+        assert!(start.elapsed() < Duration::from_secs(30), "no outline");
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let disabled = |h: &Ui, label: &str| {
+        use egui_kittest::kittest::NodeT;
+        h.get_by_label(label).accesskit_node().is_disabled()
+    };
+
+    h.get_by_label("helper").click_secondary();
+    h.run_steps(2);
+    assert!(disabled(&h, "Test…"), "private");
+    assert!(disabled(&h, "Debug…"), "private");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    h.get_by_label("run").click_secondary();
+    h.run_steps(2);
+    assert!(!disabled(&h, "Debug…"));
+    save(&mut h, "test-from-outline");
+    h.get_by_label("Test…").click();
+    wait_until(&mut h, "test block", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("dbcraft_outline_pkg.run("))
+    });
+
+    conn.execute("drop package dbcraft_outline_pkg", &[])
+        .unwrap();
+}
+
+/// The status bar counts invalid objects; its indicator opens the invalid
+/// objects window, which recompiles them over two sessions.
+#[test]
+fn invalid_objects_indicator_and_recompile() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let drops = [
+        "drop package inv_bad",
+        "drop package inv_p",
+        "drop view inv_v2",
+        "drop view inv_v1",
+        "drop table inv_t purge",
+    ];
+    for sql in drops {
+        let _ = conn.execute(sql, &[]);
+    }
+    for sql in [
+        "create table inv_t (a number, b number)",
+        "create or replace view inv_v1 as select a, b from inv_t",
+        "create or replace view inv_v2 as select a from inv_v1",
+        "create or replace package inv_p as function n return number; end;",
+        "create or replace package body inv_p as function n return number is l number; \
+         begin select count(*) into l from inv_v2; return l; end; end;",
+        "create or replace package inv_bad as procedure p; end;",
+        "create or replace package body inv_bad as procedure p is l number; \
+         begin select b into l from inv_v2; end; end;",
+        "drop table inv_t purge",
+        "create table inv_t (a number, b number)",
+    ] {
+        let _ = conn.execute(sql, &[]);
+    }
+    let invalid_now = || -> u32 {
+        conn.query_row_as::<u32>(
+            "select count(*) from user_objects where status = 'INVALID' and object_name like 'INV\\_%' escape '\\'",
+            &[],
+        )
+        .unwrap()
+    };
+    assert!(invalid_now() >= 4, "set up invalid objects");
+    // Other tests' leftovers count too; ours make a difference of at least 4.
+    let mut h = harness(true).alone();
+    h.state_mut().test_settings_mut().invalid.parallelism = 2;
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    wait_until(&mut h, "invalid count", |app| {
+        app.test_invalid_total("dbcraft@FREEPDB1").is_some()
+    });
+    let total = h.state().test_invalid_total("dbcraft@FREEPDB1").unwrap();
+    assert!(total >= 4, "{total}");
+    h.run_steps(2);
+    h.get_by_label_contains(&format!("{total} invalid")).click();
+    wait_until(&mut h, "invalid objects window", |app| {
+        app.test_invalid_window()
+            .is_some_and(|w| !w.is_busy() && !w.objects().is_empty())
+    });
+    // Other tests make objects invalid and valid again meanwhile: only
+    // this test's objects hold still.
+    let ours = h
+        .state()
+        .test_invalid_window()
+        .unwrap()
+        .objects()
+        .iter()
+        .filter(|o| o.id.name.starts_with("INV_"))
+        .count();
+    assert_eq!(ours as u32, invalid_now());
+    let bad = h
+        .state()
+        .test_invalid_window()
+        .unwrap()
+        .objects()
+        .iter()
+        .find(|o| o.id.name == "INV_BAD" && o.id.object_type == "PACKAGE BODY")
+        .cloned()
+        .expect("listed");
+    assert!(bad.compilable);
+    h.run_steps(2);
+    save(&mut h, "18-invalid-objects-dark");
+    h.get_by_label_contains("Recompile all").click();
+    wait_until(&mut h, "recompiled", |app| {
+        app.test_invalid_window()
+            .is_some_and(|w| !w.is_busy() && w.result().is_some_and(|r| r.contains("valid now")))
+    });
+    let result = h
+        .state()
+        .test_invalid_window()
+        .unwrap()
+        .result()
+        .unwrap()
+        .to_owned();
+    eprintln!("{result}");
+    assert_eq!(invalid_now(), 1, "only inv_bad's body is left: {result}");
+    let left: Vec<String> = h
+        .state()
+        .test_invalid_window()
+        .unwrap()
+        .objects()
+        .iter()
+        .map(|o| o.id.name.clone())
+        .collect();
+    assert!(left.contains(&"INV_BAD".to_owned()), "{left:?}");
+    assert!(!left.contains(&"INV_P".to_owned()), "{left:?}");
+    // The status bar follows (ours went from at least 4 to 1).
+    wait_until(&mut h, "count refreshed", |app| {
+        app.test_invalid_total("dbcraft@FREEPDB1")
+            .is_some_and(|n| n < total)
+    });
+    for sql in drops {
+        conn.execute(sql, &[]).unwrap();
+    }
+}
+
+/// Compiling in a program window updates the status bar's invalid count:
+/// with Compile all, as it is after the body, not after the spec.
+#[test]
+fn program_compile_refreshes_invalid_count() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    // Alone before the package is invalid: another test may compile the
+    // schema's invalid objects meanwhile (#156).
+    let mut h = harness(true).alone();
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let drops = ["drop package icnt_p", "drop table icnt_t purge"];
+    for sql in drops {
+        let _ = conn.execute(sql, &[]);
+    }
+    for sql in [
+        "create table icnt_t (a number)",
+        "create or replace package icnt_p as procedure p(a icnt_t.a%type); end;",
+        "create or replace package body icnt_p as procedure p(a icnt_t.a%type) is \
+         begin null; end; end;",
+        "drop table icnt_t purge",
+        "create table icnt_t (a number)",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let ours = || -> u32 {
+        conn.query_row_as::<u32>(
+            "select count(*) from user_objects where status = 'INVALID' and object_name = 'ICNT_P'",
+            &[],
+        )
+        .unwrap()
+    };
+    assert_eq!(ours(), 2, "spec and body invalid");
+    // Only compiles refresh the count.
+    h.state_mut().test_settings_mut().invalid.refresh_minutes = 0;
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    wait_until(&mut h, "invalid count", |app| {
+        app.test_invalid_total("dbcraft@FREEPDB1").is_some()
+    });
+    let total = h.state().test_invalid_total("dbcraft@FREEPDB1").unwrap();
+    assert!(total >= 2, "{total}");
+    h.state_mut().test_open(OpenRequest::Program {
+        connection: "dbcraft@FREEPDB1".into(),
+        object: ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "ICNT_P".into(),
+            object_type: dbcraft_db::ObjectType::Package,
+        },
+    });
+    wait_until(&mut h, "source", |app| !app.test_focused_busy());
+    let effects = h.state_mut().test_program().compile(true, false);
+    h.state_mut().test_apply_focused(effects);
+    wait_until(&mut h, "compile", |app| !app.test_focused_busy());
+    let message = h.state_mut().test_program().message();
+    assert!(matches!(&message, Some((false, _))), "{message:?}");
+    assert_eq!(ours(), 0, "spec and body valid");
+    // Other tests' objects come and go: the count matches the schema's.
+    let counted = |h: &mut Harness<'_, DbCraftApp>| {
+        wait_until(h, "count refreshed", |app| {
+            let now = conn
+                .query_row_as::<u32>(
+                    "select count(*) from user_objects where status = 'INVALID'",
+                    &[],
+                )
+                .unwrap();
+            app.test_invalid_total("dbcraft@FREEPDB1") == Some(now)
+        });
+    };
+    counted(&mut h);
+
+    // A block in a SQL window compiles the spec: one more than before.
+    for sql in ["drop table icnt_t purge", "create table icnt_t (a number)"] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin\n  execute immediate 'alter package icnt_p compile specification';\nend;\n/\n"
+            .into(),
+        run: true,
+    });
+    wait_until(&mut h, "block", |app| !app.test_focused_busy());
+    assert_eq!(ours(), 1, "only the body invalid");
+    counted(&mut h);
+
+    // A change while a count runs: the app takes that count (from before
+    // the change) only on its next frame, and counts again after it.
+    h.state_mut().test_refresh_invalid("dbcraft@FREEPDB1");
+    std::thread::sleep(Duration::from_secs(1));
+    conn.execute("alter package icnt_p compile body", &[])
+        .unwrap();
+    assert_eq!(ours(), 0, "body valid");
+    h.state_mut().test_refresh_invalid("dbcraft@FREEPDB1");
+    counted(&mut h);
+    for sql in drops {
+        conn.execute(sql, &[]).unwrap();
+    }
+}
+
+/// Formatting while typing and on paste, and learning the formatter
+/// settings from the focused editor.
+#[test]
+fn format_automatically_and_learn_the_style() {
+    let mut h = headless_harness();
+    h.state_mut()
+        .test_settings_mut()
+        .format_auto
+        .on_statement_end = true;
+    h.state_mut().test_settings_mut().format_auto.on_paste = true;
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut().test_sql_window().editor.goto(1, 1);
+    h.run_steps(2);
+    let text = |h: &mut Ui| h.state_mut().test_sql_window().editor.text().to_owned();
+
+    // Typing the `;` that ends a statement formats it.
+    h.event(egui::Event::Text("select a,b   from t".into()));
+    h.run_steps(2);
+    assert_eq!(text(&mut h), "select a,b   from t");
+    h.event(egui::Event::Text(";".into()));
+    h.run_steps(2);
+    assert_eq!(text(&mut h), "select a, b from t;");
+    let caret = h.state_mut().test_sql_window().editor.cursor();
+    assert_eq!(caret, text(&mut h).len(), "the caret stays after the ;");
+
+    // A pasted statement is formatted where it lands.
+    h.key_press(egui::Key::Enter);
+    h.run_steps(1);
+    h.event(egui::Event::Paste("SELECT  x,y FROM z;".into()));
+    h.run_steps(2);
+    assert_eq!(text(&mut h), "select a, b from t;\nselect x, y from z;");
+
+    // Learning: the editor is written in UPPER CASE with 4 spaces.
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "BEGIN\n    IF x > 1 THEN\n        y := 1;\n    END IF;\n    FOR i IN 1..3 LOOP\n        \
+               NULL;\n    END LOOP;\nEND;\n/\nSELECT a, b FROM t WHERE c = 1;\n"
+            .into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut().test_settings(true);
+    h.run_steps(2);
+    // The pointer has never been over the dialog: hover first.
+    h.get_by_label("Focused editor").hover();
+    h.run_steps(1);
+    h.get_by_label("Focused editor").click();
+    h.run_steps(3);
+    assert!(
+        h.query_by_label_contains("Keywords: lower → UPPER")
+            .is_some()
+    );
+    assert!(h.query_by_label_contains("Indent: 2 → 4").is_some());
+    h.get_by_label("Apply").click();
+    h.run_steps(2);
+    let format = h.state_mut().test_settings_mut().format.clone();
+    assert_eq!(format.keyword_case, dbcraft_plsql::Case::Upper);
+    assert_eq!(format.indent, 4);
+
+    // Saved as a profile.
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, "New profile")
+        .focus();
+    h.run_steps(1);
+    h.event(egui::Event::Text("team".into()));
+    h.run_steps(1);
+    h.get_by_label("Save as profile").click();
+    h.run_steps(2);
+    let settings = h.state_mut().test_settings_mut().clone();
+    assert_eq!(settings.format_profile.as_deref(), Some("team"));
+    assert_eq!(settings.format_profiles.get("team"), Some(&format));
+}
+
+/// The schema's stored source teaches the formatter its style.
+#[test]
+fn learn_the_style_from_a_schema() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_settings(true);
+    h.run_steps(2);
+    h.get_by_label("Current schema").hover();
+    h.run_steps(1);
+    h.get_by_label("Current schema").click();
+    h.run_steps(1);
+    assert!(h.state().test_learning());
+    wait_until(&mut h, "learning", |app| !app.test_learning());
+    assert!(
+        h.query_by_label_contains("Learned from schema DBCRAFT")
+            .is_some(),
+        "{:?}",
+        h.query_by_label_contains("Nothing to learn")
+            .map(|n| format!("{n:?}"))
+    );
+}
+
+/// Statements the formatter keeps as written go to the AI with the rules;
+/// an answer is applied only if it changes nothing but the layout.
+#[test]
+fn format_with_ai() {
+    use std::sync::{Arc, Mutex};
+    let mut h = headless_harness();
+    let requests: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen = requests.clone();
+    h.state_mut()
+        .test_ai(Arc::new(move |request: &dbcraft_ai::ChatRequest| {
+            let sent = request.messages.last().unwrap().content.clone();
+            seen.lock().unwrap().push(sent.clone());
+            Ok(if sent.contains("t_a") {
+                "```sql\nCREATE OR REPLACE TRIGGER t_a\n  FOR UPDATE ON t\n  COMPOUND TRIGGER\n  \
+                 BEFORE STATEMENT IS\n  BEGIN\n    NULL;\n  END BEFORE STATEMENT;\nEND t_a;\n```"
+                    .into()
+            } else {
+                // Not just layout: a comment was added.
+                "```sql\ncreate or replace trigger t_b for update on t compound trigger\n\
+                 -- fires once\nbefore statement is begin null; end before statement;\nend t_b;\n```"
+                    .into()
+            })
+        }));
+    let t_b = "create or replace trigger t_b for update on t compound trigger\n\
+               before statement is begin null; end before statement;\nend t_b;";
+    let text = format!(
+        "SELECT 1 FROM dual;\n\
+         create or replace trigger t_a for update on t compound trigger\n\
+         before statement is begin null; end before statement;\nend t_a;\n/\n{t_b}\n/\n"
+    );
+    h.state_mut().test_sql_window().editor.set_text(&text);
+    h.run_steps(2);
+
+    h.state_mut()
+        .test_command(crate::commands::Command::AiFormat);
+    wait_until(&mut h, "the answers", |app| {
+        app.test_log()
+            .iter()
+            .any(|l| l.starts_with("Format with AI: laid out"))
+    });
+    let log = h.state().test_log().last().unwrap().clone();
+    assert_eq!(
+        log,
+        "Format with AI: laid out 1 of 2 statement(s); kept as written: \
+         line 11: the answer changed more than the layout"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0].contains("- Indent by 2 spaces per level"),
+        "{}",
+        requests[0]
+    );
+    assert_eq!(
+        h.state_mut().test_sql_window().editor.text(),
+        format!(
+            "select 1 from dual;\nCREATE OR REPLACE TRIGGER t_a\n  FOR UPDATE ON t\n  COMPOUND TRIGGER\n  \
+             BEFORE STATEMENT IS\n  BEGIN\n    NULL;\n  END BEFORE STATEMENT;\nEND t_a;\n/\n{t_b}\n/\n"
+        )
+    );
+    // One undo step back to what the rules made of it.
+    h.state_mut().test_sql_window().editor.inner().undo();
+    h.run_steps(1);
+    assert!(
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .text()
+            .starts_with("select 1 from dual;\ncreate or replace trigger t_a")
+    );
+}
+
+/// Commit and Rollback follow the focused window's transaction, and never
+/// open a session just to end nothing.
+#[test]
+fn toolbar_follows_the_transaction() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin\n  execute immediate 'drop table dbcraft_toolbar_t';\nexception\n  when others then null;\nend;\n/\n\
+               create table dbcraft_toolbar_t (n number);\n\
+               insert into dbcraft_toolbar_t values (1);\n"
+            .into(),
+        run: false,
+    });
+    h.run_steps(2);
+    assert_eq!(
+        h.state().test_transaction_state(),
+        Err("No transaction in this window")
+    );
+    h.state_mut()
+        .test_command(crate::commands::Command::Rollback);
+    h.state_mut().test_command(crate::commands::Command::Commit);
+    h.run_steps(2);
+    assert!(!h.state().test_has_doc_session(), "no session opened");
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "pending transaction", |app| {
+        app.test_transaction_state().is_ok()
+    });
+    h.state_mut()
+        .test_command(crate::commands::Command::Rollback);
+    wait_until(&mut h, "rolled back", |app| {
+        app.test_transaction_state() == Err("No transaction")
+    });
+}
+
+/// Auto-commit is a setting: SQL windows follow it, also those already
+/// open, and production connections never auto-commit.
+#[test]
+fn autocommit_setting() {
+    use crate::commands::Command;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let script = "begin\n  execute immediate 'drop table dbcraft_autocommit_t';\nexception\n  when others then null;\nend;\n/\n\
+                  create table dbcraft_autocommit_t (n number);\n\
+                  insert into dbcraft_autocommit_t values (1);\n";
+    let open = |h: &mut Ui| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "dbcraft@FREEPDB1".into(),
+            text: script.into(),
+            run: false,
+        });
+        h.run_steps(2);
+    };
+    let run = |h: &mut Ui| {
+        h.state_mut().test_execute_focused();
+        h.run_steps(2);
+        wait_until(h, "script", |app| !app.test_focused_busy());
+    };
+
+    let mut h = harness(true);
+    h.state_mut().test_settings_mut().autocommit = true;
+    h.state_mut()
+        .test_connect(profile.clone(), password.clone());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    open(&mut h);
+    run(&mut h);
+    assert_eq!(h.state().test_transaction_state(), Err("Auto-commit is on"));
+    // Another session sees the row: it was committed.
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let other = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let rows = || {
+        other
+            .query_row_as::<u32>("select count(*) from dbcraft_autocommit_t", &[])
+            .unwrap()
+    };
+    assert_eq!(rows(), 1);
+    // Switched off, the open window's session follows.
+    h.state_mut().test_command(Command::ToggleAutocommit);
+    assert!(!h.state_mut().test_settings_mut().autocommit);
+    run(&mut h);
+    assert_eq!(h.state().test_transaction_state(), Ok(()));
+    assert_eq!(rows(), 0, "the new row isn't committed");
+    h.state_mut().test_command(Command::Rollback);
+    wait_until(&mut h, "rolled back", |app| {
+        app.test_transaction_state() == Err("No transaction")
+    });
+    drop(h);
+
+    let mut h = harness(true);
+    h.state_mut().test_settings_mut().autocommit = true;
+    let production = ConnectionProfile {
+        production: true,
+        ..profile
+    };
+    h.state_mut().test_connect(production, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    open(&mut h);
+    h.state_mut().test_execute_focused();
+    h.run_steps(2);
+    h.get_by_label("Run on production").click();
+    h.run_steps(2);
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_transaction_state(), Ok(()));
+    h.state_mut().test_command(Command::Rollback);
+    wait_until(&mut h, "rolled back", |app| {
+        app.test_transaction_state() == Err("No transaction")
+    });
+}
+
+/// The result toolbar fits narrow SQL windows: its buttons, the filter and
+/// the row count never overlap, and buttons drop their labels when needed.
+#[test]
+fn result_toolbar_fits_narrow_windows() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::By;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    for width in [1440.0, 760.0, 600.0, 480.0] {
+        let mut h = sized_harness(egui::vec2(width, 700.0));
+        h.state_mut()
+            .test_connect(profile.clone(), password.clone());
+        wait_until(&mut h, "connection", |app| app.test_connected());
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "dbcraft@FREEPDB1".into(),
+            text: "select * from demo_employees".into(),
+            run: true,
+        });
+        wait_until(&mut h, "query", |app| !app.test_focused_busy());
+        // The buttons may drop their labels, which takes a frame.
+        h.run_steps(4);
+        save(&mut h, &format!("result-toolbar-{width}"));
+
+        // The toolbar is the row below the result's tab.
+        let tab = h.get_by_label("Result 1").rect();
+        let in_row = |r: &egui::Rect| {
+            let y = r.center().y;
+            y > tab.max.y && y < tab.max.y + 40.0
+        };
+        let filter = h
+            .query_all(By::new().role(Role::TextInput))
+            .map(|n| n.rect())
+            .find(in_row)
+            .expect("filter field");
+        let mut items = vec![("filter", filter)];
+        match h.query_by_label_contains("columns ·") {
+            Some(info) => items.push(("row count", info.rect())),
+            None => assert!(width < 600.0, "{width}: row count"),
+        }
+        for node in h.query_all(By::new().role(Role::Button)) {
+            let r = node.rect();
+            if in_row(&r) && r.min.x >= filter.min.x {
+                items.push(("button", r));
+            }
+        }
+        assert!(items.len() >= 6, "{width}: {items:?}");
+        // Below that the window is too narrow for more than not overlapping.
+        if width >= 600.0 {
+            assert!(filter.width() >= 80.0, "{width}: filter {filter:?}");
+        }
+        for (i, (a, ra)) in items.iter().enumerate() {
+            assert!(ra.max.x <= width, "{width}: {a} outside the window: {ra:?}");
+            for (b, rb) in &items[i + 1..] {
+                assert!(
+                    !ra.shrink(0.5).intersects(rb.shrink(0.5)),
+                    "{width}: {a} {ra:?} overlaps {b} {rb:?}"
+                );
+            }
+        }
+        if width >= 1440.0 {
+            assert!(h.query_by_label("Copy all").is_some(), "{width}: labels");
+        }
+    }
+}
+
+/// One connection for the whole app (#80): connecting makes the new
+/// connection the active one, and the object browser, new SQL windows and
+/// the open SQL windows follow it; windows with a transaction are asked
+/// about first. A program window keeps its connection, which its tab
+/// names. Disconnecting the active connection hands over to another.
+#[test]
+fn one_active_connection() {
+    use crate::commands::Command;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let first = "dbcraft@FREEPDB1";
+    let other = ConnectionProfile {
+        name: "other".into(),
+        color: None,
+        ..profile.clone()
+    };
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let _ = conn.execute("drop table dbcraft_active_t purge", &[]);
+    conn.execute("create table dbcraft_active_t (n number)", &[])
+        .unwrap();
+    let rows = || -> i64 {
+        conn.query_row_as("select count(*) from dbcraft_active_t", &[])
+            .unwrap()
+    };
+
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password.clone());
+    wait_until(&mut h, "first connection", |app| {
+        app.test_connected_to(first)
+    });
+    h.state_mut().test_command(Command::NewSqlWindow);
+    h.run_steps(2);
+    h.state_mut().test_open(OpenRequest::Program {
+        connection: first.into(),
+        object: ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "DEMO_PKG".into(),
+            object_type: dbcraft_db::ObjectType::Package,
+        },
+    });
+    wait_until(&mut h, "package", |app| !app.test_focused_busy());
+    let on = |h: &Ui, prefix: &str| -> Vec<Option<String>> {
+        h.state()
+            .test_window_connections()
+            .into_iter()
+            .filter(|(title, _)| title.starts_with(prefix))
+            .map(|(_, c)| c)
+            .collect()
+    };
+    let some = |c: &str| Some(c.to_owned());
+    // All SQL windows on `connection`: how many.
+    let sql_on = |h: &Ui, connection: &str| -> usize {
+        let windows = on(h, "SQL");
+        assert!(
+            windows.iter().all(|c| c.as_deref() == Some(connection)),
+            "SQL windows on {connection}: {windows:?}"
+        );
+        windows.len()
+    };
+
+    // Connecting: the new connection is the active one; the SQL window
+    // moves, the package stays and its tab says where it is.
+    h.state_mut().test_connect(other, password);
+    wait_until(&mut h, "second connection", |app| {
+        app.test_connected_to("other")
+    });
+    h.run_steps(2);
+    assert_eq!(
+        h.state().test_active_connection(),
+        (some("other"), some("other"))
+    );
+    let windows = sql_on(&h, "other");
+    assert_eq!(on(&h, "demo_pkg"), [some(first)]);
+    assert_eq!(
+        h.state().test_tab_title("demo_pkg"),
+        Some(format!("demo_pkg · {first}")),
+        "the package's tab names its connection"
+    );
+    // New windows open on it, whichever window is focused.
+    h.state_mut().test_command(Command::NewSqlWindow);
+    h.run_steps(2);
+    assert_eq!(sql_on(&h, "other"), windows + 1);
+
+    // A transaction: switching (the object browser's picker) asks first.
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text("insert into dbcraft_active_t values (1)");
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "pending transaction", |app| {
+        app.test_transaction_state().is_ok()
+    });
+    h.state_mut().test_open(OpenRequest::Browse {
+        connection: first.into(),
+    });
+    h.run_steps(2);
+    assert_eq!(h.state().test_active_connection().0, some("other"));
+    h.get_by_label("Roll back and switch").click();
+    h.run_steps(4);
+    assert_eq!(
+        h.state().test_active_connection(),
+        (some(first), some(first))
+    );
+    assert_eq!(sql_on(&h, first), windows + 1);
+    wait_until(&mut h, "rolled back", |_| rows() == 0);
+    assert_eq!(
+        h.state().test_tab_title("demo_pkg").as_deref(),
+        Some("demo_pkg"),
+        "the package is on the active connection again"
+    );
+
+    // Disconnecting the active connection: the other one takes over.
+    h.state_mut().test_command(Command::Disconnect);
+    h.run_steps(2);
+    assert_eq!(
+        h.state().test_active_connection(),
+        (some("other"), some("other"))
+    );
+    assert_eq!(sql_on(&h, "other"), windows + 1);
+    conn.execute("drop table dbcraft_active_t purge", &[])
+        .unwrap();
+}
+
+/// SQL windows stay on their connection unless the settings allow
+/// switching, and never switch with a pending transaction.
+#[test]
+fn window_connection_switching() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let other = ConnectionProfile {
+        name: "other".into(),
+        color: None,
+        ..profile.clone()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password.clone());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_connect(other, password);
+    wait_until(&mut h, "second connection", |app| {
+        app.test_connected_to("other")
+    });
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin\n  execute immediate 'drop table dbcraft_switch_t';\nexception\n  when others then null;\nend;\n/\n\
+               create table dbcraft_switch_t (n number);\n\
+               insert into dbcraft_switch_t values (1);\n"
+            .into(),
+        run: false,
+    });
+    h.run_steps(2);
+    let on = |h: &Ui| h.state().test_focused_connection().unwrap();
+
+    // Off by default: no picker, and the window stays.
+    assert!(h.query_by_label("Connection").is_none());
+    h.state_mut().test_rebind_focused("other");
+    assert_eq!(on(&h), "dbcraft@FREEPDB1");
+
+    h.state_mut().test_settings_mut().switch_window_connection = true;
+    h.run_steps(2);
+    assert!(h.query_by_label("Connection").is_some());
+    save(&mut h, "window-connection");
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "pending transaction", |app| {
+        app.test_transaction_state().is_ok()
+    });
+    h.state_mut().test_rebind_focused("other");
+    assert_eq!(on(&h), "dbcraft@FREEPDB1", "not with a pending transaction");
+    h.state_mut()
+        .test_command(crate::commands::Command::Rollback);
+    wait_until(&mut h, "rolled back", |app| {
+        app.test_transaction_state() == Err("No transaction")
+    });
+    h.state_mut().test_rebind_focused("other");
+    assert_eq!(on(&h), "other");
+
+    // Switching off again: the window goes back to the connection the
+    // object browser shows, the app's, and moves when it is disconnected.
+    h.state_mut().test_settings_mut().switch_window_connection = false;
+    h.run_steps(2);
+    assert_eq!(on(&h), "dbcraft@FREEPDB1");
+    assert!(h.query_by_label("Connection").is_none());
+    h.state_mut()
+        .test_command(crate::commands::Command::Disconnect);
+    h.run_steps(2);
+    assert_eq!(on(&h), "other");
+    assert!(h.query_by_label("Connection").is_none());
+}
+
+/// After disconnecting one of two connections, Execute in a window that
+/// was on it runs on the other one instead of opening the Connect dialog
+/// (#84).
+#[test]
+fn execute_after_disconnecting_its_connection() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let other = ConnectionProfile {
+        name: "other".into(),
+        color: None,
+        ..profile.clone()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(other, password.clone());
+    wait_until(&mut h, "first connection", |app| {
+        app.test_connected_to("other")
+    });
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "second connection", |app| {
+        app.test_connected_to("dbcraft@FREEPDB1")
+    });
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "select 42 as answer from dual".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::Disconnect);
+    h.run_steps(2);
+    assert!(!h.state().test_connected_to("dbcraft@FREEPDB1"));
+    h.state_mut().test_execute_focused();
+    h.run_steps(2);
+    assert!(!h.state().test_connect_dialog_open(), "no Connect dialog");
+    assert_eq!(
+        h.state().test_focused_connection().as_deref(),
+        Some("other")
+    );
+    wait_until(&mut h, "the query", |app| !app.test_focused_busy());
+    let window = h.state_mut().test_sql_window();
+    let errors: Vec<&str> = window
+        .state
+        .messages
+        .iter()
+        .filter(|m| m.level == crate::sql_window::Level::Error)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(window.state.results.len(), 1, "the query ran");
+}
+
+/// The toolbar's Debug button is enabled only with the cursor in an
+/// anonymous block of a connected SQL window.
+#[test]
+fn toolbar_debug_follows_the_cursor() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let text = "select 1 from dual;\n\nbegin\n  dbms_output.put_line('hi');\nend;\n/\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: text.into(),
+        run: false,
+    });
+    let cursor_at = |h: &mut Ui, needle: &str| {
+        let i = text.find(needle).unwrap();
+        h.state_mut().test_sql_window().editor.select(i..i);
+        h.run_steps(2);
+        h.state().test_debug_state()
+    };
+    assert_eq!(
+        cursor_at(&mut h, "dual"),
+        Err("Debugging runs an anonymous block (BEGIN … END;): put the cursor in one")
+    );
+    assert_eq!(cursor_at(&mut h, "put_line"), Ok(()));
+    h.state_mut().test_program_with(
+        ObjectRef {
+            owner: "DBCRAFT".into(),
+            name: "P".into(),
+            object_type: dbcraft_db::ObjectType::Procedure,
+        },
+        "create or replace procedure p as begin null; end;",
+        "",
+    );
+    h.run_steps(2);
+    assert!(
+        h.state()
+            .test_debug_state()
+            .is_err_and(|r| r.starts_with("Debugging starts from a SQL window"))
+    );
+}
+
+/// The assistant panel with a fake model: a statement is explained, its
+/// bind values stay back until allowed in the settings, and code from the
+/// answer replaces the statement.
+#[test]
+fn ai_assistant_panel() {
+    use std::sync::{Arc, Mutex};
+    let mut h = harness(true);
+    let requests: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen = requests.clone();
+    h.state_mut()
+        .test_ai(Arc::new(move |request: &dbcraft_ai::ChatRequest| {
+            let mut seen = seen.lock().unwrap();
+            let sent: Vec<&str> = request.messages.iter().map(|m| m.content.as_str()).collect();
+            seen.push(format!("{}\n{}", request.system, sent.join("\n")));
+            Ok(if seen.len() == 1 {
+                "It reads the name of one employee by number.\n\n```sql\nselect ename\n  from emp\n where empno = 7839;\n```\n\
+                 - The **primary key** makes this a `UNIQUE SCAN`.\n- A literal shows the plan for one value."
+                    .into()
+            } else {
+                "With :id = 7839 it returns one row.".into()
+            })
+        }));
+    let text = "-- names\nselect ename from emp where empno = :id;\n";
+    let w = h.state_mut().test_sql_window();
+    w.editor.set_text(text);
+    let at = text.find("select").unwrap();
+    w.editor.select(at..at);
+    w.bind_values.insert("id".into(), Some("7839".into()));
+    h.run_steps(2);
+
+    h.state_mut()
+        .test_command(crate::commands::Command::AiExplain);
+    wait_until(&mut h, "the answer", |app| app.test_ai_answers() == 1);
+    assert!(
+        h.query_all_by_label_contains("where empno = 7839")
+            .next()
+            .is_some()
+    );
+    assert!(
+        h.query_by_label_contains("Not sent: Bind variable values")
+            .is_some()
+    );
+    {
+        let seen = requests.lock().unwrap();
+        assert!(seen[0].contains("select ename from emp where empno = :id"));
+        assert!(!seen[0].contains("7839"), "bind value sent: {}", seen[0]);
+    }
+    save(&mut h, "18-ai-assistant-dark");
+
+    // Allowed now: the follow-up's request carries the value. Ctrl+Enter in
+    // the input sends it rather than executing the statement.
+    h.state_mut().test_settings_mut().ai.send_bind_values = true;
+    h.state_mut().test_assistant().focus(crate::ai::Mode::Ask);
+    h.run_steps(2);
+    h.event(egui::Event::Text("Which row does it return?".into()));
+    h.run_steps(1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    wait_until(&mut h, "the second answer", |app| {
+        app.test_ai_answers() == 2
+    });
+    assert!(!h.state().test_connect_dialog_open(), "the statement ran");
+    let follow_up = requests.lock().unwrap()[1].clone();
+    assert!(
+        follow_up.ends_with("Which row does it return?"),
+        "{follow_up}"
+    );
+    assert!(follow_up.contains(":id = '7839'"), "{follow_up}");
+
+    // Code from the first answer replaces the statement; the editor keeps
+    // its terminator.
+    h.get_by_label("Replace").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state_mut().test_sql_window().editor.text(),
+        "-- names\nselect ename\n  from emp\n where empno = 7839;\n"
+    );
+}
+
+/// With a connection, requests carry the definitions of the tables used, a
+/// plan, and tables found for a description.
+#[test]
+fn ai_with_database() {
+    use std::sync::{Arc, Mutex};
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("DBCRAFT_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let _ = conn.execute("drop table dbcraft_ai_invoices purge", &[]);
+    conn.execute(
+        "create table dbcraft_ai_invoices (invoice_id number primary key, amount number(12,2), issued date)",
+        &[],
+    )
+    .unwrap();
+    let mut h = headless_harness();
+    let requests: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen = requests.clone();
+    h.state_mut()
+        .test_ai(Arc::new(move |request: &dbcraft_ai::ChatRequest| {
+            let last = request.messages.last().unwrap().content.clone();
+            seen.lock().unwrap().push(last);
+            Ok("```sql\nselect 1 from dual\n```".into())
+        }));
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "select * from dbcraft_ai_invoices where amount > 100;\n".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::AiAnalyzePlan);
+    wait_until(&mut h, "the plan analysis", |app| {
+        app.test_ai_answers() == 1
+    });
+    {
+        let sent = &requests.lock().unwrap()[0];
+        assert!(sent.contains("## Database\nOracle"), "{sent}");
+        assert!(
+            sent.contains("## TABLE DBCRAFT.DBCRAFT_AI_INVOICES\n"),
+            "{sent}"
+        );
+        assert!(sent.contains("Primary key (INVOICE_ID)"), "{sent}");
+        assert!(sent.contains("## Execution plan (EXPLAIN PLAN)"), "{sent}");
+        assert!(sent.contains("TABLE ACCESS FULL"), "{sent}");
+    }
+
+    h.state_mut().test_assistant().mode = crate::ai::Mode::Generate;
+    h.state_mut().test_assistant().input = "invoices above 1000 from last month".into();
+    h.run_steps(1);
+    h.get_by_label("Send").click();
+    wait_until(&mut h, "the generated query", |app| {
+        app.test_ai_answers() == 2
+    });
+    {
+        let sent = &requests.lock().unwrap()[1];
+        assert!(sent.contains("DBCRAFT_AI_INVOICES"), "{sent}");
+        assert!(
+            sent.contains("invoices above 1000 from last month"),
+            "{sent}"
+        );
+    }
+    conn.execute("drop table dbcraft_ai_invoices purge", &[])
+        .unwrap();
+}
+
+/// AI: Analyze Execution Plan explains in the SQL window's own session
+/// (#319), as Explain plan does (#269): the window's private temporary
+/// table counts, which on the connection's main session failed with
+/// ORA-00942, and its transaction stays as it was. While the window runs
+/// a statement, it says so.
+#[test]
+fn ai_plans_in_the_windows_session() {
+    use std::sync::{Arc, Mutex};
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = headless_harness();
+    let requests: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen = requests.clone();
+    h.state_mut()
+        .test_ai(Arc::new(move |request: &dbcraft_ai::ChatRequest| {
+            let last = request.messages.last().unwrap().content.clone();
+            seen.lock().unwrap().push(last);
+            Ok("A full scan.".into())
+        }));
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(
+        &mut h,
+        "begin execute immediate 'drop table r66_ai_t purge'; \
+         exception when others then null; end;\n/\n\
+         create table r66_ai_t (id number);\n\
+         create private temporary table ora$ptt_r66 (id number) on commit preserve definition;\n\
+         insert into r66_ai_t values (1);",
+    );
+    assert!(h.state().test_pending_tx());
+    let analyze = |h: &mut Ui| {
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text("select * from ora$ptt_r66 where id = 1");
+        h.run_steps(2);
+        h.state_mut()
+            .test_command(crate::commands::Command::AiAnalyzePlan);
+    };
+    analyze(&mut h);
+    wait_until(&mut h, "the plan analysis", |app| {
+        app.test_ai_answers() == 1
+    });
+    {
+        let sent = &requests.lock().unwrap()[0];
+        assert!(sent.contains("## Execution plan (EXPLAIN PLAN)"), "{sent}");
+        assert!(sent.contains("ORA$PTT_R66"), "{sent}");
+        assert!(!sent.contains("EXPLAIN PLAN failed"), "{sent}");
+    }
+    assert!(h.state().test_pending_tx());
+    assert_eq!(
+        run_in_window(&mut h, "select count(*) from r66_ai_t").as_deref(),
+        Some("1")
+    );
+
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text("begin dbms_session.sleep(3); end;");
+    h.state_mut().test_execute_focused();
+    h.run_steps(2);
+    assert!(h.state().test_focused_busy());
+    analyze(&mut h);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("running a statement").is_some());
+    assert_eq!(h.state().test_ai_answers(), 1);
+    wait_until(&mut h, "the block", |app| !app.test_focused_busy());
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    run_in_window(&mut h, "drop table r66_ai_t purge");
+}
+
+/// Settings → AI with a configured backend.
+#[test]
+fn settings_ai() {
+    if out_dir().is_none() {
+        return;
+    }
+    let mut h = harness(true);
+    h.state_mut()
+        .test_ai(std::sync::Arc::new(|_: &dbcraft_ai::ChatRequest| {
+            Ok("OK".into())
+        }));
+    let claude = dbcraft_config::AiBackend::new(dbcraft_config::AiKind::Anthropic, "shot".into());
+    h.state_mut()
+        .test_settings_mut()
+        .ai
+        .backends
+        .insert(0, claude);
+    h.state_mut().test_settings_ai();
+    h.run_steps(3);
+    save(&mut h, "settings-ai");
+}
+
+/// A MySQL connection through an SSH server (`DBCRAFT_TEST_SSH` and
+/// `DBCRAFT_TEST_MYSQL_VIA_SSH`, see dbcraft-db's MySQL tests): the connect
+/// dialog asks to trust the server's host key, then connects, and SQL
+/// windows get sessions through the same tunnel.
+#[test]
+fn mysql_through_ssh() {
+    use crate::connections::Passwords;
+    let (Ok(ssh), Ok(spec)) = (
+        std::env::var("DBCRAFT_TEST_SSH"),
+        std::env::var("DBCRAFT_TEST_MYSQL_VIA_SSH"),
+    ) else {
+        return;
+    };
+    let (ssh_credentials, ssh_host) = ssh.rsplit_once('@').unwrap();
+    let (ssh_user, ssh_password) = ssh_credentials.split_once(':').unwrap();
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop over ssh".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ssh: dbcraft_config::SshTunnel {
+            enabled: true,
+            host: ssh_host.into(),
+            username: ssh_user.into(),
+            key_file: String::new(),
+        },
+        ..Default::default()
+    };
+    let dir = std::env::temp_dir().join(format!("dbcraft-app-ssh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let known_hosts = dir.join("known_hosts");
+
+    let mut h = harness(true);
+    h.state_mut().test_connect_dialog(
+        profile,
+        Passwords {
+            database: password.into(),
+            ssh: ssh_password.into(),
+        },
+        known_hosts.clone(),
+    );
+    wait_until(&mut h, "the host key question", |app| {
+        app.test_connect_dialog_error()
+            .is_some_and(|e| e.contains("isn't known yet"))
+    });
+    save(&mut h, "mysql-ssh-host-key");
+    h.get_by_label("Trust and connect").click();
+    wait_until(&mut h, "connection", |app| {
+        app.test_connected_to("shop over ssh")
+    });
+    assert!(!h.state().test_connect_dialog_open());
+    let saved = std::fs::read_to_string(&known_hosts).unwrap();
+    assert!(saved.contains(" ssh-"), "{saved}");
+    let log = h.state().test_log();
+    assert!(
+        log.iter()
+            .any(|l| l == &format!("Connecting to shop over ssh through {ssh_host}…")),
+        "{log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("Trusted the SSH host key of ")),
+        "{log:?}"
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop over ssh".into(),
+        text: "select database() as db, 6 * 7 as answer;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let result = w.state.results.last().expect("a result");
+    assert_eq!(
+        result.rows,
+        [vec![Some("dbcraft".into()), Some("42".into())]]
+    );
+    save(&mut h, "mysql-ssh-sql-window");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Nothing shows through behind the dock (#64): the light theme had black
+/// in the tabs' rounded corners and between the dock's areas. The test
+/// renderer clears to transparent, so such spots are transparent pixels.
+#[test]
+fn nothing_shows_through_behind_the_dock() {
+    // Needs a GPU adapter, like the screenshots.
+    if out_dir().is_none() {
+        return;
+    }
+    for dark in [false, true] {
+        // The start layout: browser and project on the left, a SQL window
+        // on the right.
+        let mut h = locked(dark, true);
+        h.run_steps(4);
+        let image = h.render().expect("render");
+        let holes: Vec<(u32, u32)> = image
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p.0[3] < 255)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        assert!(
+            holes.is_empty(),
+            "dark {dark}: {} transparent pixels, e.g. {:?}",
+            holes.len(),
+            &holes[..holes.len().min(5)]
+        );
+        save(&mut h, if dark { "dock-dark" } else { "dock-light" });
+    }
+}
+
+/// Every Settings page fits DbCraft's default window: the close button stays
+/// on screen however tall the page is (#62), and closes the dialog. No page
+/// makes the window wider, also with a bigger interface font: a hint on one
+/// line pushed the page list off the screen (#113).
+#[test]
+fn settings_pages_fit_the_window() {
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    for font_size in [13.0, 18.0] {
+        let mut h = sized_harness(screen.size());
+        h.state_mut().test_settings_mut().appearance.font_size = font_size;
+        let ctx = h.ctx.clone();
+        h.state_mut().test_apply_settings(&ctx);
+        let mut page = 0;
+        let mut first_close = None;
+        while h.state_mut().test_settings_page(page) {
+            h.run_steps(4);
+            let at = format!("{font_size} pt, page {page}");
+            let close = h.get_by_label("Close window").rect();
+            assert!(
+                screen.contains_rect(close),
+                "{at}: close button at {close:?}"
+            );
+            let first_close = *first_close.get_or_insert(close);
+            assert_eq!(close, first_close, "{at}: the window changed size");
+            for entry in h.query_all_by_label("Appearance") {
+                let rect = entry.rect();
+                assert!(screen.contains_rect(rect), "{at}: Appearance at {rect:?}");
+            }
+            page += 1;
+        }
+        assert!(page > 5, "{page} pages");
+        h.state_mut().test_settings(true);
+        h.run_steps(4);
+        save(
+            &mut h,
+            &format!("settings-formatter-small-window-{font_size}pt"),
+        );
+        h.get_by_label("Close window").click();
+        h.run_steps(2);
+        assert!(!h.state().test_settings_open());
+    }
+}
+
+/// The New profile field lines up with the other rows' controls when a
+/// bigger interface font widens the label column (#116).
+#[test]
+fn settings_formatter_rows_line_up() {
+    let mut h = sized_harness(egui::vec2(1280.0, 800.0));
+    h.state_mut().test_settings_mut().appearance.font_size = 18.0;
+    let ctx = h.ctx.clone();
+    h.state_mut().test_apply_settings(&ctx);
+    h.state_mut().test_settings(true);
+    h.run_steps(4);
+    let field = h.get_by_label("New profile").rect();
+    let learn = h.get_by_label("Focused editor").rect();
+    assert_eq!(field.min.x, learn.min.x, "{field:?} {learn:?}");
+}
+
+/// The MySQL dashboard (`DBCRAFT_TEST_MYSQL`): server KPIs, trends and
+/// findings on the connection's own session, and what the user would need
+/// to see more.
+#[test]
+fn mysql_dashboard() {
+    use crate::commands::Command;
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        color: Some([0x14, 0xb8, 0xa6]),
+        ..Default::default()
+    };
+    // Tall enough for all of it.
+    let mut h = sized_harness(egui::vec2(1440.0, 2100.0));
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_command(Command::MonitorDashboard);
+
+    // Three snapshots: rates from the second on, a chart from the third.
+    let wait_for = |h: &mut Ui, what: &str, done: &dyn Fn(&mut Ui) -> bool| {
+        let start = Instant::now();
+        while !done(h) {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "timed out waiting for {what}"
+            );
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    wait_for(&mut h, "the dashboard", &|h| {
+        h.query_by_label("Buffer pool hit ratio").is_some()
+    });
+    // Refreshing now until the charts have two samples.
+    let start = Instant::now();
+    while h.query_all_by_label("Collecting samples…").next().is_some() {
+        assert!(start.elapsed() < Duration::from_secs(60), "no charts");
+        std::thread::sleep(Duration::from_millis(600));
+        h.get_by_label("⟳").click();
+        h.run_steps(3);
+    }
+    for label in [
+        "Connections",
+        "Queries / s",
+        "Buffer pool used",
+        "Temp tables on disk",
+        "Largest tables",
+        "Running statements, longest first",
+    ] {
+        assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+    }
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("Dashboard"));
+    save(&mut h, "mysql-dashboard");
+    sessions(&mut h, "mysql");
+}
+
+/// Monitor: Sessions on a MySQL, PostgreSQL or SQL Server connection
+/// (#131): every session, idle ones too, in a tab of its own; a session
+/// opens its details. Screenshots are named after `tag`.
+fn sessions(h: &mut Harness<'_, DbCraftApp>, tag: &str) {
+    use crate::commands::Command;
+    h.state_mut().test_command(Command::MonitorSessions);
+    // The header counts sessions before the list is in: wait for the
+    // table (#137). Until the tab is drawn, the dashboard's running and
+    // top statements, there when other sessions are busy, have a
+    // Statement column too.
+    let start = Instant::now();
+    loop {
+        h.step();
+        if h.state().test_focused_title().as_deref() == Some("Sessions")
+            && h.query_all_by_label("Statement").next().is_some()
+        {
+            break;
+        }
+        assert!(
+            h.query_by_label_contains("Sessions are not available")
+                .is_none(),
+            "the list loads"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "timed out waiting for the sessions"
+        );
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    h.run_steps(3);
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("Sessions"));
+    assert!(h.query_by_label_contains(" sessions · ").is_some());
+    // "Blocking tree (1)" while another test holds a lock on the server.
+    assert!(h.query_by_label_contains("Blocking tree").is_some());
+    save(h, &format!("{tag}-sessions"));
+}
+
+/// The PostgreSQL dashboard (`DBCRAFT_TEST_POSTGRES`, #92): server KPIs,
+/// trends, findings, sessions, storage and top statements.
+#[test]
+fn postgres_dashboard() {
+    use crate::commands::Command;
+    let Some(spec) = std::env::var("DBCRAFT_TEST_POSTGRES").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "orders".into(),
+        kind: dbcraft_config::DbKind::Postgres,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        color: Some([0x14, 0xb8, 0xa6]),
+        ..Default::default()
+    };
+    // Tall enough for all of it.
+    let mut h = sized_harness(egui::vec2(1440.0, 2100.0));
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_command(Command::MonitorDashboard);
+
+    // Three snapshots: rates from the second on, a chart from the third.
+    let wait_for = |h: &mut Ui, what: &str, done: &dyn Fn(&mut Ui) -> bool| {
+        let start = Instant::now();
+        while !done(h) {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "timed out waiting for {what}"
+            );
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    wait_for(&mut h, "the dashboard", &|h| {
+        h.query_by_label("Cache hit ratio").is_some()
+    });
+    // Refreshing now until the charts have two samples.
+    let start = Instant::now();
+    while h.query_all_by_label("Collecting samples…").next().is_some() {
+        assert!(start.elapsed() < Duration::from_secs(60), "no charts");
+        std::thread::sleep(Duration::from_millis(600));
+        h.get_by_label("⟳").click();
+        h.run_steps(3);
+    }
+    for label in [
+        "Connections",
+        "Commits / s",
+        "Transaction ID age",
+        "Largest databases",
+        "Running statements, longest first",
+        "Top statements by total time (since the statistics were reset)",
+    ] {
+        assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+    }
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("Dashboard"));
+    save(&mut h, "postgres-dashboard");
+    sessions(&mut h, "postgres");
+}
+
+/// A MySQL connection without a database (#81): the toolbar, status bar
+/// and object browser say so; picking one in the browser makes it the
+/// database of the open SQL windows and of new ones.
+#[test]
+fn mysql_database_from_the_browser() {
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let (server, database) = connect_string.rsplit_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "nodb@mysql".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: server.into(),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile.clone(), password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.run_steps(2);
+    assert!(
+        h.state()
+            .test_log()
+            .iter()
+            .any(|l| l.starts_with("Connected to nodb@mysql (MySQL ")
+                && l.ends_with(", no database)")),
+        "{:?}",
+        h.state().test_log()
+    );
+    // The toolbar and the status bar.
+    let shown = |h: &Ui, label: &str| h.query_all_by_label_contains(label).count();
+    assert_eq!(shown(&h, "nodb@mysql · No database"), 2);
+    assert!(h.query_by_label("No database selected").is_some());
+
+    let current = |h: &mut Ui| -> Option<String> {
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text("select database() as db");
+        h.state_mut().test_execute_focused();
+        wait_until(h, "select database()", |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let result = w.state.results.last().expect("a result");
+        result.rows[0][0].clone()
+    };
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "nodb@mysql".into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    assert_eq!(current(&mut h), None);
+
+    // Picked in the browser's picker, as a user does (#102): the panel's
+    // effects reach the app together with the frame's others.
+    h.get_by_value("No database").click();
+    let start = Instant::now();
+    while h.query_by_label(database).is_none() {
+        assert!(start.elapsed() < Duration::from_secs(60), "the databases");
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    h.get_by_label(database).click();
+    h.run_steps(2);
+    assert_eq!(
+        current(&mut h).as_deref(),
+        Some(database),
+        "the open window"
+    );
+    h.state_mut()
+        .test_command(crate::commands::Command::NewSqlWindow);
+    h.run_steps(2);
+    assert_eq!(current(&mut h).as_deref(), Some(database), "a new window");
+    assert_eq!(shown(&h, &format!("nodb@mysql · {database}")), 2);
+    assert!(h.query_by_label("No database selected").is_none());
+
+    // Connected again, it starts in the database picked last (#133).
+    let picked = format!("nodb@mysql: database {database}");
+    let picks = |app: &DbCraftApp| app.test_log().iter().filter(|l| **l == picked).count();
+    h.state_mut().test_connect(profile.clone(), password.into());
+    wait_until(&mut h, "the database picked last", |app| {
+        app.test_connected() && picks(app) == 2
+    });
+    assert_eq!(current(&mut h).as_deref(), Some(database), "again");
+    assert_eq!(shown(&h, &format!("nodb@mysql · {database}")), 2);
+    assert!(h.query_by_label("No database selected").is_none());
+
+    // A database from the profile wins.
+    let profile = ConnectionProfile {
+        default_schema: "information_schema".into(),
+        ..profile
+    };
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| {
+        app.test_connected() && !app.test_browser_loading()
+    });
+    assert_eq!(
+        current(&mut h).as_deref(),
+        Some("information_schema"),
+        "the profile's"
+    );
+    assert_eq!(picks(h.state()), 2);
+    assert_eq!(shown(&h, "nodb@mysql · information_schema"), 2);
+    let marks = &h.state_mut().test_browser().marks;
+    assert_eq!(
+        marks.databases.get("nodb@mysql").map(String::as_str),
+        Some(database),
+        "kept for a profile without one"
+    );
+}
+
+/// Passwords the keychain doesn't take say so (#214), in the log and by
+/// *Save password* in the connect dialog while it's ticked: the next
+/// connect had no password, and nothing said why.
+#[test]
+fn passwords_not_saved() {
+    let mut h = headless_harness();
+    let profile = ConnectionProfile {
+        name: "keychain".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: "app".into(),
+        connect_string: "db.example.com:3306/shop".into(),
+        save_password: true,
+        ..Default::default()
+    };
+    h.state_mut().test_show_connections(vec![profile]);
+    let why = "there's no keychain (no Secret Service)";
+    h.state_mut()
+        .test_passwords_saved("keychain", Err(why.into()));
+    h.run_steps(2);
+    assert!(
+        h.query_by_label_contains(&format!("Passwords aren't saved: {why}"))
+            .is_some()
+    );
+    let log = h.state().test_log();
+    assert!(
+        log.iter()
+            .any(|l| *l == format!("The password of keychain wasn't saved: {why}")),
+        "{log:?}"
+    );
+    save(&mut h, "connect-password-not-saved");
+    h.state_mut().test_passwords_saved("keychain", Ok(()));
+    h.run_steps(2);
+    assert!(
+        h.query_by_label_contains("Passwords aren't saved")
+            .is_none()
+    );
+}
+
+/// The windows' files are checked for changes on a thread of their own,
+/// not before the window is up (#479): one changed is read again, one
+/// with changes in its window is left as it is.
+#[test]
+fn files_changed_on_disk_are_read_on_a_thread() {
+    let dir = std::env::temp_dir().join(format!("dbcraft-disk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("r101.sql");
+    std::fs::write(&file, "select 1 from dual;\n").unwrap();
+    let mut h = harness(true);
+    h.state_mut().test_open_file(file.clone());
+    h.run_steps(2);
+    std::fs::write(&file, "select 2 from dual;\n").unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().test_check_files_on_disk(&ctx);
+    wait_until(&mut h, "the file read again", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text() == "select 2 from dual;\n")
+    });
+    // Changed in the window meanwhile: left as it is.
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text("select 3 from dual;\n");
+    std::fs::write(&file, "select 4 from dual;\n").unwrap();
+    h.state_mut().test_check_files_on_disk(&ctx);
+    h.run_steps(5);
+    assert_eq!(
+        h.state().test_sql_window_ref().unwrap().editor.text(),
+        "select 3 from dual;\n"
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The connect dialog never saves a connection over another one (#246):
+/// Save under another saved connection's name replaced it, and after a
+/// rename that changed only the case, Connect kept both. Saved in a
+/// config directory, as the file has them (#196).
+#[test]
+fn connections_are_saved_under_their_own_name() {
+    let dir = std::env::temp_dir().join(format!("dbcraft-names-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = dbcraft_config::Paths {
+        config_dir: dir.clone(),
+        data_dir: dir.clone(),
+    };
+    let file = dir.join("names.db");
+    let profile = |name: &str, color: u8| ConnectionProfile {
+        name: name.into(),
+        kind: dbcraft_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", file.display()),
+        color: Some([color, 0, 0]),
+        ..Default::default()
+    };
+    let saved = || vec![profile("super", 1), profile("other", 2)];
+    let connections_file = paths.connections_file();
+    dbcraft_config::save_toml(
+        &connections_file,
+        &dbcraft_config::Connections { profiles: saved() },
+    )
+    .unwrap();
+    // Names and colors, as the file has them.
+    let in_file = || -> Vec<(String, u8)> {
+        let saved: dbcraft_config::Connections =
+            dbcraft_config::load_toml(&connections_file).unwrap();
+        saved
+            .profiles
+            .iter()
+            .map(|p| (p.name.clone(), p.color.map_or(0, |c| c[0])))
+            .collect()
+    };
+    let _lock = UI_LOCK.shared();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .with_pixels_per_point(1.5)
+        .build_eframe(move |cc| DbCraftApp::new(cc, Some(paths)));
+    h.run_steps(2);
+    h.state_mut().test_show_connections(saved());
+    h.run_steps(2);
+    // Picks the saved connection `from` and types `to` as its name.
+    let rename = |h: &mut Harness<'_, DbCraftApp>, from: &str, to: &str| {
+        h.get_by_label(from).click();
+        h.run_steps(2);
+        let field = h
+            .get_by(|n| {
+                n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some(from)
+            })
+            .rect()
+            .center();
+        h.event(egui::Event::PointerButton {
+            pos: field,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.event(egui::Event::PointerButton {
+            pos: field,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.event(egui::Event::Text(to.into()));
+        h.run_steps(2);
+    };
+    let refused = |h: &Harness<'_, DbCraftApp>| {
+        h.query_by_label_contains("There's a saved connection named")
+            .is_some()
+    };
+
+    // Under another one's name, in any case: refused, both stay.
+    for name in ["Super", "super"] {
+        rename(&mut h, "other", name);
+        h.get_by_label("Save").click();
+        h.run_steps(2);
+        assert!(refused(&h), "Save as {name}");
+        save(&mut h, "connect-name-taken");
+        assert_eq!(in_file(), [("super".into(), 1), ("other".into(), 2)]);
+        h.get_by_label("Connect").click();
+        h.run_steps(2);
+        assert!(refused(&h), "Connect as {name}");
+        assert!(!h.state().test_connected());
+        assert_eq!(in_file(), [("super".into(), 1), ("other".into(), 2)]);
+    }
+
+    // Its own name in another case: renamed, in its place.
+    rename(&mut h, "super", "Super");
+    h.get_by_label("Save").click();
+    h.run_steps(2);
+    assert!(!refused(&h));
+    assert_eq!(in_file(), [("Super".into(), 1), ("other".into(), 2)]);
+    rename(&mut h, "Super", "super");
+    click_to_connect(&mut h, "Connect");
+    wait_until(&mut h, "connection", |app| app.test_connected_to("super"));
+    assert_eq!(in_file(), [("super".into(), 1), ("other".into(), 2)]);
+    let names: Vec<&str> = h
+        .state()
+        .test_saved_profiles()
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, ["super", "other"]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A database file made with *New…* (`?create`) is made by that connect
+/// only (#255). The connection was saved and shown again with
+/// `?create`, and the other windows opened their sessions with it: once
+/// the file was moved or deleted, a new window, connecting again or the
+/// saved connection made an empty database in its place without a word.
+#[test]
+fn a_new_database_file_is_made_once() {
+    let dir = std::env::temp_dir().join(format!("dbcraft-made-once-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = dbcraft_config::Paths {
+        config_dir: dir.clone(),
+        data_dir: dir.clone(),
+    };
+    let file = dir.join("once.db");
+    let path = file.display().to_string();
+    let connections_file = paths.connections_file();
+    let profile = ConnectionProfile {
+        name: "once.db".into(),
+        kind: dbcraft_config::DbKind::Sqlite,
+        connect_string: path.clone(),
+        ..Default::default()
+    };
+    dbcraft_config::save_toml(
+        &connections_file,
+        &dbcraft_config::Connections {
+            profiles: vec![profile.clone()],
+        },
+    )
+    .unwrap();
+    let in_file = || -> Vec<String> {
+        let saved: dbcraft_config::Connections =
+            dbcraft_config::load_toml(&connections_file).unwrap();
+        saved
+            .profiles
+            .into_iter()
+            .map(|p| p.connect_string)
+            .collect()
+    };
+    let start = |paths: dbcraft_config::Paths| {
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .with_pixels_per_point(1.5)
+            .build_eframe(move |cc| DbCraftApp::new(cc, Some(paths)));
+        h.run_steps(2);
+        h
+    };
+    // Connect, and what the dialog says about it.
+    let connect = |h: &mut Harness<'_, DbCraftApp>| {
+        click_to_connect(h, "Connect");
+        wait_until(h, "connect", |app| {
+            app.test_connected_to("once.db") || app.test_connect_dialog_error().is_some()
+        });
+        h.state().test_connect_dialog_error().map(str::to_owned)
+    };
+    let missing = |error: Option<String>| {
+        error.is_some_and(|e| e.starts_with(&format!("There is no database file {path}")))
+    };
+    let _lock = UI_LOCK.shared();
+    let mut h = start(paths.clone());
+    h.state_mut().test_show_connections(vec![profile]);
+    h.run_steps(2);
+    h.state_mut().test_pick_database_file(true, file.clone());
+    h.run_steps(2);
+    assert_eq!(connect(&mut h), None);
+    assert!(file.exists());
+    assert_eq!(in_file(), [path.as_str()], "saved without ?create");
+
+    // Gone while connected: a new window doesn't make it again. Windows
+    // doesn't let a file go while it's open.
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(&file).unwrap();
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "once.db".into(),
+            text: "select count(*) from sqlite_schema".into(),
+            run: true,
+        });
+        wait_until(&mut h, "query", |app| !app.test_focused_busy());
+        let messages: Vec<String> = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("There is no database file")),
+            "{messages:?}"
+        );
+        assert!(!file.exists(), "made again by a window");
+
+        // Nor connecting again from the dialog, which shows the connection.
+        // Still connected to it, so only the dialog's error says it's over.
+        h.state_mut()
+            .test_command(crate::commands::Command::Connect);
+        h.run_steps(2);
+        click_to_connect(&mut h, "Connect");
+        wait_until(&mut h, "the connect error", |app| {
+            app.test_connect_dialog_error().is_some()
+        });
+        let error = h.state().test_connect_dialog_error().map(str::to_owned);
+        assert!(missing(error.clone()), "{error:?}");
+        assert!(!file.exists(), "made again by Connect");
+    }
+    drop(h);
+    // On Windows, once the sessions have closed it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while file.exists() && std::fs::remove_file(&file).is_err() {
+        assert!(std::time::Instant::now() < deadline, "{path} stays open");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Nor the saved connection.
+    let mut h = start(paths);
+    h.get_by_label("once.db").click();
+    h.run_steps(2);
+    let error = connect(&mut h);
+    assert!(missing(error.clone()), "{error:?}");
+    assert!(!file.exists(), "made again by the saved connection");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A MySQL connection (`DBCRAFT_TEST_MYSQL=user/password@host:port/database`):
+/// queries, transactions, browser and object views work; what MySQL can't
+/// do is left out of the menus, the toolbar and the browser.
+#[test]
+fn mysql_connection() {
+    use crate::commands::Command;
+    use dbcraft_db::ObjectType;
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let schema = connect_string.rsplit_once('/').map(|(_, db)| db).unwrap();
+    let profile = ConnectionProfile {
+        name: "dbcraft@mysql".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        color: Some([0x14, 0xb8, 0xa6]),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    assert!(
+        h.state()
+            .test_log()
+            .iter()
+            .any(|l| l.starts_with("Connected to dbcraft@mysql (MySQL ")),
+        "{:?}",
+        h.state().test_log()
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@mysql".into(),
+        text: "drop table if exists app_orders;
+create table app_orders (
+  id int primary key,
+  customer varchar(30) not null comment 'Who ordered',
+  total decimal(8,2),
+  ordered datetime default current_timestamp
+);
+insert into app_orders (id, customer, total) values (1, 'Ada', 12.50), (2, 'Linus', 99.00), (3, 'Grace', 250.00);
+set @limit = 100;
+select id, customer, total from app_orders where total < @limit order by id;
+"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let result = w.state.results.last().expect("a result");
+    let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "customer", "total"]);
+    assert_eq!(result.rows.len(), 2, "SET ran on the server");
+    assert_eq!(
+        h.state().test_transaction_state(),
+        Ok(()),
+        "the insert waits for commit"
+    );
+    save(&mut h, "mysql-sql-window");
+    h.state_mut().test_command(Command::Commit);
+    wait_until(&mut h, "commit", |app| {
+        app.test_transaction_state() == Err("No transaction")
+    });
+
+    // Oracle-only menus are gone, the rest only offers what works.
+    for menu in ["Debug", "Reports"] {
+        assert!(h.query_by_label(menu).is_none(), "{menu}");
+    }
+    h.get_by_label("Monitor").click();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Dashboard").is_some());
+    assert!(h.query_by_label_contains("Blocking Sessions").is_some());
+    assert!(h.query_by_label_contains("AWR").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.get_by_label("Tools").click();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Find Database Object").is_some());
+    assert!(h.query_by_label_contains("Scheduler Jobs").is_none());
+    assert!(h.query_by_label_contains("Compare Schemas").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    // A shortcut to something hidden explains instead of running it.
+    h.state_mut().test_command(Command::MonitorAwr);
+    assert_eq!(
+        h.state().test_log().last().map(String::as_str),
+        Some("AWR / ASH Reports isn't available for MySQL connections")
+    );
+
+    // The browser has MySQL's folders.
+    h.state_mut()
+        .test_expand_browser(&[ObjectType::Table, ObjectType::Procedure]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    save(&mut h, "mysql-browser");
+    assert!(h.query_by_label("Procedures").is_some());
+    assert!(h.query_by_label("Packages").is_none());
+    assert!(h.query_by_label_contains("app_orders").is_some());
+
+    // The session's own user, `user@host`, and its form; without access to
+    // `mysql` it says what it can't read.
+    let user = format!("{username}@%");
+    h.state_mut().test_browser().set_filter(username);
+    h.run_steps(2);
+    user_forms(&mut h, "mysql", &user);
+    h.state_mut().test_browser().set_filter("");
+    h.run_steps(2);
+
+    // Tables open on their columns; MySQL's details are tabs.
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: "dbcraft@mysql".into(),
+        object: ObjectRef {
+            owner: schema.into(),
+            name: "app_orders".into(),
+            object_type: ObjectType::Table,
+        },
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "object view", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 4);
+    assert!(h.query_by_label("Constraints").is_some());
+    save(&mut h, "mysql-object-view");
+
+    // Completion: the columns after an alias, from MySQL's dictionary.
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@mysql".into(),
+        text: "select o\n  from app_orders o".into(),
+        run: false,
+    });
+    h.run_steps(3);
+    h.state_mut().test_sql_window().editor.select(8..8);
+    h.run_steps(3);
+    h.event(egui::Event::Text(".".into()));
+    wait_until(&mut h, "completion popup", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with("customer"))
+    });
+    save(&mut h, "mysql-completion");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@mysql".into(),
+        text: "drop table app_orders;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// What every connection to another database checks in the app: a script
+/// ran (its last result has `columns` and `rows` rows) and left a change
+/// pending; Oracle-only menus are gone; the browser has `folders`, and
+/// lists `user` among the users; tables open on their columns; completion
+/// offers a table's columns after an alias. Screenshots are named after
+/// `tag`.
+struct OtherDatabase<'a> {
+    tag: &'a str,
+    connection: &'a str,
+    product: &'a str,
+    schema: &'a str,
+    /// The connection's user, as the browser lists it.
+    user: &'a str,
+    folders: &'a [dbcraft_db::ObjectType],
+}
+
+impl OtherDatabase<'_> {
+    fn check(&self, h: &mut Harness<'_, DbCraftApp>, script: &str, columns: &[&str], rows: usize) {
+        use crate::commands::Command;
+        use dbcraft_db::ObjectType;
+        let connected = format!("Connected to {} ({} ", self.connection, self.product);
+        assert!(
+            h.state()
+                .test_log()
+                .iter()
+                .any(|l| l.starts_with(&connected)),
+            "{:?}",
+            h.state().test_log()
+        );
+
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: self.connection.into(),
+            text: script.into(),
+            run: true,
+        });
+        wait_until(h, "script", |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let errors: Vec<&str> = w
+            .state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| m.text.as_str())
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let result = w.state.results.last().expect("a result");
+        let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, columns);
+        assert_eq!(result.rows.len(), rows);
+        assert_eq!(
+            h.state().test_transaction_state(),
+            Ok(()),
+            "the insert waits for commit"
+        );
+        save(h, &format!("{}-sql-window", self.tag));
+        h.state_mut().test_command(Command::Commit);
+        wait_until(h, "commit", |app| {
+            app.test_transaction_state() == Err("No transaction")
+        });
+
+        // Oracle-only menus are gone; a shortcut to one explains. Monitor
+        // has the dashboard (#92) and sessions (#131).
+        for menu in ["Debug", "Reports"] {
+            assert!(h.query_by_label(menu).is_none(), "{menu}");
+        }
+        assert!(h.query_by_label("Monitor").is_some());
+        h.state_mut().test_command(Command::MonitorAwr);
+        assert_eq!(
+            h.state().test_log().last().cloned(),
+            Some(format!(
+                "AWR / ASH Reports isn't available for {} connections",
+                self.product
+            ))
+        );
+
+        h.state_mut()
+            .test_expand_browser(&[ObjectType::Table, ObjectType::Procedure]);
+        wait_until(h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        save(h, &format!("{}-browser", self.tag));
+        for folder in self.folders {
+            assert!(h.query_by_label(folder.plural()).is_some(), "{folder:?}");
+        }
+        assert!(h.query_by_label("Packages").is_none());
+        assert!(h.query_by_label_contains("app_orders").is_some());
+
+        // Users and roles below the folders (#130), with their forms
+        // (#142): New user… on Users, Edit user… on one.
+        assert!(h.query_by_label("Roles").is_some());
+        assert!(h.query_by_label("Profiles").is_none());
+        h.state_mut().test_browser().set_filter(self.user);
+        h.run_steps(2);
+        user_forms(h, self.tag, self.user);
+        assert!(h.query_by_label("Copy name").is_none());
+        h.state_mut().test_browser().set_filter("");
+        h.run_steps(2);
+
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: self.connection.into(),
+            object: ObjectRef {
+                owner: self.schema.into(),
+                name: "app_orders".into(),
+                object_type: ObjectType::Table,
+            },
+        });
+        h.run_steps(2);
+        wait_until(h, "object view", |app| !app.test_focused_busy());
+        assert_eq!(h.state().test_object_view().loaded_for_test().1, 4);
+        assert!(h.query_by_label("Constraints").is_some());
+        save(h, &format!("{}-object-view", self.tag));
+
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: self.connection.into(),
+            text: "select o\n  from app_orders o".into(),
+            run: false,
+        });
+        h.run_steps(3);
+        h.state_mut().test_sql_window().editor.select(8..8);
+        h.run_steps(3);
+        h.event(egui::Event::Text(".".into()));
+        wait_until(h, "completion popup", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.completion_visible_with("customer"))
+        });
+        save(h, &format!("{}-completion", self.tag));
+    }
+}
+
+/// The user forms of a database other than Oracle (#142), with the browser
+/// filtered to `user`: New user… on Users opens a new user's form, the
+/// user's menu has what works on every database and Edit user… opens its
+/// form, read from the database.
+fn user_forms(h: &mut Harness<'_, DbCraftApp>, tag: &str, user: &str) {
+    h.get_by_label("Users").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("New user…").click();
+    h.run_steps(2);
+    wait_until(h, "new user form", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("New user"));
+    assert!(h.query_by_label("Privileges").is_some(), "the form loaded");
+    save(h, &format!("{tag}-new-user"));
+
+    h.get_by_label("Users").click();
+    h.run_steps(2);
+    wait_until(h, "users", |app| !app.test_browser_loading());
+    h.run_steps(2);
+    h.get_by_label(user).click_secondary();
+    h.run_steps(2);
+    save(h, &format!("{tag}-users"));
+    assert!(h.query_by_label("Copy name").is_some());
+    assert!(h.query_by_label("Drop…").is_some());
+    h.get_by_label("Edit user…").click();
+    h.run_steps(2);
+    wait_until(h, "user form", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(
+        h.state().test_focused_title(),
+        Some(format!("{user} (user)"))
+    );
+    assert!(
+        h.query_by_label(&format!("User {user}")).is_some(),
+        "the user was read"
+    );
+    save(h, &format!("{tag}-edit-user"));
+}
+
+/// Connects the harness to the database of `env`
+/// (`user/password@connect string`) as `name`.
+fn connect_to(env: &str, name: &str, kind: dbcraft_config::DbKind) -> Option<Ui> {
+    let spec = std::env::var(env).ok()?;
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: name.into(),
+        kind,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        color: Some([0x3b, 0x82, 0xf6]),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    Some(h)
+}
+
+/// A PostgreSQL connection (`DBCRAFT_TEST_POSTGRES=user/password@host:port/database`):
+/// a script with a dollar-quoted function and casts, transactions, browser,
+/// object views and completion.
+#[test]
+fn postgres_connection() {
+    use dbcraft_db::ObjectType;
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_POSTGRES",
+        "dbcraft@postgres",
+        dbcraft_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    let database = OtherDatabase {
+        tag: "postgres",
+        connection: "dbcraft@postgres",
+        product: "PostgreSQL",
+        schema: "public",
+        user: "dbcraft",
+        folders: &[
+            ObjectType::Table,
+            ObjectType::MaterializedView,
+            ObjectType::Function,
+            ObjectType::Sequence,
+        ],
+    };
+    database.check(
+        &mut h,
+        "drop table if exists app_orders cascade;
+create table app_orders (
+  id int primary key,
+  customer varchar(30) not null,
+  total numeric(8,2),
+  ordered timestamp default now()
+);
+comment on column app_orders.customer is 'Who ordered';
+create or replace function app_below(p_limit numeric) returns numeric language plpgsql as $$
+begin
+  -- A body with statements of its own.
+  return (select sum(total) from app_orders where total < p_limit);
+end;
+$$;
+insert into app_orders (id, customer, total) values (1, 'Ada', 12.50), (2, 'Linus', 99.00), (3, 'Grace', 250.00);
+set work_mem = '8MB';
+select id, customer, total::text, app_below(100) as below
+  from app_orders where total < 100::numeric order by id;
+",
+        &["id", "customer", "total", "below"],
+        2,
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@postgres".into(),
+        text: "drop function app_below;\ndrop table app_orders;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// A SQL Server connection (`DBCRAFT_TEST_MSSQL=user/password@host:port/database?trust`):
+/// a script of `GO` batches with a procedure and a variable, transactions,
+/// browser, object views and completion.
+#[test]
+fn sqlserver_connection() {
+    use dbcraft_db::ObjectType;
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_MSSQL",
+        "dbcraft@sqlserver",
+        dbcraft_config::DbKind::SqlServer,
+    ) else {
+        return;
+    };
+    let database = OtherDatabase {
+        tag: "sqlserver",
+        connection: "dbcraft@sqlserver",
+        product: "SQL Server",
+        schema: "dbo",
+        user: "dbcraft",
+        folders: &[
+            ObjectType::Table,
+            ObjectType::Procedure,
+            ObjectType::Sequence,
+            ObjectType::Synonym,
+        ],
+    };
+    database.check(
+        &mut h,
+        "drop table if exists app_orders;
+create table app_orders (
+  id int primary key,
+  customer varchar(30) not null,
+  total decimal(8,2),
+  ordered datetime2 default sysdatetime()
+);
+GO
+create or alter procedure app_below @limit decimal(8,2) as
+begin
+  set nocount on;
+  select id, customer, total from app_orders where total < @limit order by id;
+end
+GO
+insert into app_orders (id, customer, total) values (1, 'Ada', 12.50), (2, 'Linus', 99.00), (3, 'Grace', 250.00);
+declare @limit decimal(8,2) = 100;
+select id, customer, total, @limit as limit from app_orders where total < @limit order by id;
+",
+        &["id", "customer", "total", "limit"],
+        2,
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@sqlserver".into(),
+        text: "drop procedure app_below;\ndrop table app_orders;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// A SQLite database file of its own, on any machine: a script with a
+/// trigger, the change waiting for Commit, Oracle's and the servers' menus
+/// gone, the browser's folders (no users or roles), an object view, and
+/// completion after an alias.
+#[test]
+fn sqlite_connection() {
+    use crate::commands::Command;
+    use dbcraft_db::ObjectType;
+    let path = std::env::temp_dir().join(format!("dbcraft-ui-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let profile = ConnectionProfile {
+        name: "shop.db".into(),
+        kind: dbcraft_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", path.display()),
+        color: Some([0x14, 0xb8, 0xa6]),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    assert!(
+        h.state()
+            .test_log()
+            .iter()
+            .any(|l| l.starts_with("Connected to shop.db (SQLite 3.")),
+        "{:?}",
+        h.state().test_log()
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop.db".into(),
+        text: "create table app_orders (
+  id integer primary key,
+  customer varchar(30) not null,
+  total decimal(8,2),
+  ordered text default current_timestamp
+);
+create table app_audit (order_id integer references app_orders (id), total decimal(8,2));
+create trigger app_orders_audit after insert on app_orders
+begin
+  insert into app_audit values (new.id, new.total);
+end;
+create index app_orders_customer on app_orders (customer);
+insert into app_orders (id, customer, total) values (1, 'Ada', 12.50), (2, 'Linus', 99.00), (3, 'Grace', 250.00);
+select o.id, o.customer, o.total, a.total as audited
+  from app_orders o join app_audit a on a.order_id = o.id
+ where o.total < 100 order by o.id;
+"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let errors: Vec<&str> = w
+        .state
+        .messages
+        .iter()
+        .filter(|m| m.level == crate::sql_window::Level::Error)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let result = w.state.results.last().expect("a result");
+    let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "customer", "total", "audited"]);
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(
+        h.state().test_transaction_state(),
+        Ok(()),
+        "the insert waits for commit"
+    );
+    save(&mut h, "sqlite-sql-window");
+    h.state_mut().test_command(Command::Commit);
+    wait_until(&mut h, "commit", |app| {
+        app.test_transaction_state() == Err("No transaction")
+    });
+
+    // No debugger, reports or monitor for a file.
+    for menu in ["Debug", "Reports", "Monitor"] {
+        assert!(h.query_by_label(menu).is_none(), "{menu}");
+    }
+
+    h.state_mut()
+        .test_expand_browser(&[ObjectType::Table, ObjectType::Index, ObjectType::Trigger]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    save(&mut h, "sqlite-browser");
+    for folder in dbcraft_db::Dialect::SQLITE.browser_types() {
+        assert!(h.query_by_label(folder.plural()).is_some(), "{folder:?}");
+    }
+    for absent in ["Packages", "Users", "Roles"] {
+        assert!(h.query_by_label(absent).is_none(), "{absent}");
+    }
+    assert!(h.query_by_label_contains("app_orders_audit").is_some());
+    assert!(h.query_by_label_contains("app_orders_customer").is_some());
+
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: "shop.db".into(),
+        object: ObjectRef {
+            owner: "main".into(),
+            name: "app_orders".into(),
+            object_type: ObjectType::Table,
+        },
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "object view", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 4);
+    assert!(h.query_by_label("Constraints").is_some());
+    assert!(h.query_by_label("Grants").is_none());
+    save(&mut h, "sqlite-object-view");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop.db".into(),
+        text: "select o\n  from app_orders o".into(),
+        run: false,
+    });
+    h.run_steps(3);
+    h.state_mut().test_sql_window().editor.select(8..8);
+    h.run_steps(3);
+    h.event(egui::Event::Text(".".into()));
+    wait_until(&mut h, "completion popup", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with("customer"))
+    });
+    save(&mut h, "sqlite-completion");
+    drop(h);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The SQL Server dashboard (`DBCRAFT_TEST_MSSQL_DBA`, a login with VIEW
+/// SERVER STATE): server KPIs, trends, waits and storage on the
+/// connection's own session.
+#[test]
+fn sqlserver_dashboard() {
+    use crate::commands::Command;
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MSSQL_DBA").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "warehouse".into(),
+        kind: dbcraft_config::DbKind::SqlServer,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        color: Some([0xe1, 0x1d, 0x48]),
+        ..Default::default()
+    };
+    // Tall enough for all of it.
+    let mut h = sized_harness(egui::vec2(1440.0, 2200.0));
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_command(Command::MonitorDashboard);
+
+    let start = Instant::now();
+    while h.query_by_label("Page life expectancy").is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "timed out waiting for the dashboard"
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    // Refreshing now until the charts have two samples.
+    let start = Instant::now();
+    while h.query_all_by_label("Collecting samples…").next().is_some() {
+        assert!(start.elapsed() < Duration::from_secs(60), "no charts");
+        std::thread::sleep(Duration::from_millis(600));
+        h.get_by_label("⟳").click();
+        h.run_steps(3);
+    }
+    for label in [
+        "Connections",
+        "Batch requests / s",
+        "Buffer cache hit ratio",
+        "Top waits (since the refresh before)",
+        "Largest databases",
+        "Running requests, longest first",
+    ] {
+        assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+    }
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("Dashboard"));
+    save(&mut h, "sqlserver-dashboard");
+    sessions(&mut h, "sqlserver");
+}
+
+/// An error raised in a package called from a trigger: one click opens the
+/// code where it was raised, and each stack line opens its own (#112).
+#[test]
+fn error_stack() {
+    use crate::sql_window::FrameTarget;
+    use dbcraft_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "create table dbcraft_es_orders (id number, qty number);
+create or replace package dbcraft_es_stock as
+  procedure reserve(p_qty number);
+end;
+/
+create or replace package body dbcraft_es_stock as
+  procedure check_qty(p_qty number) is
+    l_ok number;
+  begin
+    select 1 into l_ok from dual where p_qty <= 3;
+  end;
+
+  procedure reserve(p_qty number) is
+  begin
+    check_qty(p_qty);
+  end;
+end;
+/
+create or replace trigger dbcraft_es_orders_trg
+before insert on dbcraft_es_orders
+for each row
+begin
+  dbcraft_es_stock.reserve(:new.qty);
+end;
+/"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "setup", |app| !app.test_focused_busy());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "begin\n  insert into dbcraft_es_orders values (1, 5);\nend;".into(),
+        run: true,
+    });
+    let sql = h.state().test_focused();
+    wait_until(&mut h, "error stack", |app| {
+        app.test_sql_window_ref().is_some_and(|w| {
+            w.state.messages.iter().any(|m| {
+                !m.stack.is_empty()
+                    && !m
+                        .stack
+                        .iter()
+                        .any(|f| matches!(f.target, FrameTarget::Pending(_)))
+            })
+        })
+    });
+    let w = h.state_mut().test_sql_window();
+    let message = w
+        .state
+        .messages
+        .iter()
+        .find(|m| !m.stack.is_empty())
+        .unwrap();
+    let opens = message.stack.iter().filter(|f| f.target.opens()).count();
+    assert_eq!(
+        opens, 4,
+        "package twice, trigger, statement: {}",
+        message.text
+    );
+    h.get_by_label("Open where raised").hover();
+    save(&mut h, "error_stack");
+
+    h.get_by_label("Open where raised").click();
+    wait_until(&mut h, "package body at the line", |app| {
+        app.test_focused_title()
+            .is_some_and(|t| t == "dbcraft_es_stock")
+    });
+    wait_for_source(&mut h);
+    let program = h.state_mut().test_program();
+    let part = &program.parts[program.active];
+    assert_eq!(part.object_type, ObjectType::PackageBody);
+    assert_eq!(part.editor.line_col().0, 5, "select 1 into l_ok ...");
+    save(&mut h, "error_stack_open");
+
+    // The trigger's line counts from its block: line 2 there is line 5.
+    h.state_mut().test_focus(sql);
+    h.run_steps(3);
+    h.get_by_label_contains("DBCRAFT_ES_ORDERS_TRG\", line")
+        .click();
+    wait_until(&mut h, "trigger", |app| {
+        app.test_focused_title()
+            .is_some_and(|t| t == "dbcraft_es_orders_trg")
+    });
+    wait_for_source(&mut h);
+    let program = h.state_mut().test_program();
+    let part = &program.parts[program.active];
+    assert_eq!(part.object_type, ObjectType::Trigger);
+    assert_eq!(part.editor.line_col().0, 5, "{}", part.editor.text());
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "dbcraft@FREEPDB1".into(),
+        text: "drop table dbcraft_es_orders purge;\ndrop package dbcraft_es_stock;".into(),
+        run: true,
+    });
+    wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
+}
+
+/// Steps the app until the focused program window shows its source.
+fn wait_for_source(harness: &mut Harness<'_, DbCraftApp>) {
+    let start = Instant::now();
+    loop {
+        let editor = harness.state_mut().test_program_editor();
+        if editor.is_some_and(|e| !e.text().is_empty()) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "timed out waiting for the source"
+        );
+        harness.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    harness.run_steps(3);
+}
+
+/// Runs `task` in the focused maintenance window (after `options`) and
+/// waits until it is done and the state is read again: (outcome, whether
+/// it went well, each statement's messages).
+fn run_maintenance(
+    h: &mut Harness<'_, DbCraftApp>,
+    dialect: dbcraft_db::Dialect,
+    task: crate::maintenance::Task,
+    options: impl FnOnce(&mut crate::maintenance::Options),
+) -> (String, bool, Vec<Vec<String>>) {
+    let window = h.state_mut().test_maintenance_window();
+    window.task = Some(task);
+    options(&mut window.options);
+    let effects = window.run_for_test(dialect);
+    h.state_mut().test_apply(effects);
+    h.run_steps(2);
+    wait_until(h, task.label(dialect), |app| !app.test_focused_busy());
+    let (outcome, messages) = h.state_mut().test_maintenance_window().outcome_for_test();
+    let (text, ok) = outcome.expect("an outcome");
+    (text, ok, messages)
+}
+
+/// A line of the focused maintenance window's state: (value, warning).
+fn maintenance_fact(h: &mut Harness<'_, DbCraftApp>, label: &str) -> Option<(String, bool)> {
+    let facts = h.state_mut().test_maintenance_window().facts_for_test()?;
+    let fact = facts.state.iter().find(|f| f.label == label)?;
+    Some((fact.value.clone(), fact.warn))
+}
+
+/// Opens the maintenance window of `object` and waits for its state.
+fn open_maintenance(h: &mut Harness<'_, DbCraftApp>, connection: &str, object: ObjectRef) {
+    h.state_mut().test_open(OpenRequest::Maintenance {
+        connection: connection.into(),
+        object,
+        task: None,
+    });
+    h.run_steps(2);
+    wait_until(h, "maintenance state", |app| !app.test_focused_busy());
+}
+
+/// Runs a script in a new SQL window and closes it.
+fn run_script(h: &mut Harness<'_, DbCraftApp>, connection: &str, sql: &str) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: sql.into(),
+        run: true,
+    });
+    wait_until(h, sql, |app| !app.test_focused_busy());
+    h.state_mut().test_close_focused();
+}
+
+/// Maintenance of an Oracle table and index (#144): an offline move leaves
+/// the indexes unusable, which the window shows and rebuilds; statistics
+/// are gathered, locked (gathering then needs force) and unlocked; the
+/// table shrinks and moves online; the index rebuilds.
+#[test]
+fn maintenance_oracle() {
+    use crate::maintenance::Task;
+    use dbcraft_db::{Dialect, ObjectType};
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let owner = profile.username.to_uppercase();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let connection = "dbcraft@FREEPDB1";
+    run_script(
+        &mut h,
+        connection,
+        "begin
+  for t in (select table_name from user_tables where table_name = 'DBCRAFT_MT_ORDERS') loop
+    execute immediate 'drop table ' || t.table_name || ' purge';
+  end loop;
+end;
+/
+create table dbcraft_mt_orders (id number primary key, note varchar2(100));
+create index dbcraft_mt_orders_ix on dbcraft_mt_orders (note);
+insert into dbcraft_mt_orders select level, 'order ' || level from dual connect by level <= 2000;
+commit;
+alter table dbcraft_mt_orders move;",
+    );
+    let table = ObjectRef {
+        owner: owner.clone(),
+        name: "DBCRAFT_MT_ORDERS".into(),
+        object_type: ObjectType::Table,
+    };
+    open_maintenance(&mut h, connection, table);
+    assert_eq!(
+        h.state().test_focused_title().as_deref(),
+        Some("dbcraft_mt_orders maintenance")
+    );
+    let window = h.state().test_focused();
+    assert_eq!(
+        maintenance_fact(&mut h, "Indexes"),
+        Some(("2, 2 indexes unusable".into(), true))
+    );
+    assert_eq!(
+        maintenance_fact(&mut h, "Statistics gathered"),
+        Some(("never".into(), true))
+    );
+
+    // The unusable indexes rebuild, online (Free has it).
+    h.state_mut().test_maintenance_window().task = Some(Task::RebuildUnusable);
+    let statements = h
+        .state_mut()
+        .test_maintenance_window()
+        .statements_for_test(Dialect::ORACLE)
+        .unwrap();
+    assert_eq!(statements.len(), 2, "{statements:?}");
+    assert!(statements.contains(&format!(
+        "alter index {owner}.DBCRAFT_MT_ORDERS_IX rebuild online"
+    )));
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::RebuildUnusable, |_| {});
+    assert!(ok, "{text}");
+    assert_eq!(
+        maintenance_fact(&mut h, "Indexes"),
+        Some(("2".into(), false))
+    );
+
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::GatherStats, |_| {});
+    assert!(ok, "{text}");
+    assert_eq!(
+        maintenance_fact(&mut h, "Rows (statistics)"),
+        Some(("2,000".into(), false))
+    );
+    let (gathered, warn) = maintenance_fact(&mut h, "Statistics gathered").unwrap();
+    assert!(gathered.ends_with(" ago") && !warn, "{gathered}");
+
+    // Locked statistics are only gathered with force.
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::LockStats, |_| {});
+    assert!(ok, "{text}");
+    assert_eq!(
+        maintenance_fact(&mut h, "Statistics locked"),
+        Some(("yes".into(), true))
+    );
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::GatherStats, |o| {
+        o.force = false;
+    });
+    assert!(!ok && text.contains("ORA-20005"), "{text}");
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::GatherStats, |o| {
+        o.force = true;
+    });
+    assert!(ok, "{text}");
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::UnlockStats, |_| {});
+    assert!(ok, "{text}");
+    assert_eq!(maintenance_fact(&mut h, "Statistics locked"), None);
+
+    // Half the rows go; the table shrinks (with row movement for as long
+    // as it takes) and moves online, keeping its indexes usable.
+    run_script(
+        &mut h,
+        connection,
+        "delete from dbcraft_mt_orders where mod(id, 2) = 0;\ncommit;",
+    );
+    h.state_mut().test_focus(window);
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::Shrink, |_| {});
+    assert!(ok, "{text}");
+    assert_eq!(
+        maintenance_fact(&mut h, "Row movement"),
+        Some(("disabled".into(), false))
+    );
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::Move, |o| {
+        o.online = true;
+    });
+    assert!(ok, "{text}");
+    assert_eq!(
+        maintenance_fact(&mut h, "Indexes"),
+        Some(("2".into(), false))
+    );
+    h.state_mut().test_maintenance_window().task = Some(Task::GatherStats);
+    h.run_steps(2);
+    save(&mut h, "maintenance");
+
+    // The index on its own.
+    let index = ObjectRef {
+        owner: owner.clone(),
+        name: "DBCRAFT_MT_ORDERS_IX".into(),
+        object_type: ObjectType::Index,
+    };
+    open_maintenance(&mut h, connection, index);
+    assert_eq!(
+        maintenance_fact(&mut h, "Status"),
+        Some(("valid".into(), false))
+    );
+    h.state_mut().test_maintenance_window().task = Some(Task::RebuildIndex);
+    assert_eq!(
+        h.state_mut()
+            .test_maintenance_window()
+            .statements_for_test(Dialect::ORACLE)
+            .unwrap(),
+        [format!(
+            "alter index {owner}.DBCRAFT_MT_ORDERS_IX rebuild online"
+        )]
+    );
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::RebuildIndex, |_| {});
+    assert!(ok, "{text}");
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::ORACLE, Task::Shrink, |_| {});
+    assert!(ok, "{text}");
+
+    run_script(&mut h, connection, "drop table dbcraft_mt_orders purge;");
+}
+
+/// Maintenance of a PostgreSQL table (#144): VACUUM (with VERBOSE's
+/// messages), ANALYZE and REINDEX CONCURRENTLY, which refuses a
+/// transaction block: the window's session autocommits.
+#[test]
+fn maintenance_postgres() {
+    use crate::maintenance::Task;
+    use dbcraft_db::{Dialect, ObjectType};
+    let connection = "dbcraft@postgres";
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_POSTGRES",
+        connection,
+        dbcraft_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    run_script(
+        &mut h,
+        connection,
+        "drop table if exists dbcraft_mt_orders;
+create table dbcraft_mt_orders (id int primary key, note text);
+create index dbcraft_mt_orders_note on dbcraft_mt_orders (note);
+insert into dbcraft_mt_orders select g, 'order ' || g from generate_series(1, 5000) g;
+delete from dbcraft_mt_orders where id % 2 = 0;
+commit;",
+    );
+    let table = ObjectRef {
+        owner: "public".into(),
+        name: "dbcraft_mt_orders".into(),
+        object_type: ObjectType::Table,
+    };
+    open_maintenance(&mut h, connection, table);
+    assert_eq!(
+        maintenance_fact(&mut h, "Indexes"),
+        Some(("2".into(), false))
+    );
+    let (text, ok, messages) = run_maintenance(&mut h, Dialect::POSTGRES, Task::Vacuum, |o| {
+        o.analyze = true;
+        o.verbose = true;
+    });
+    assert!(ok, "{text}");
+    assert!(
+        messages[0].iter().any(|m| m.contains("dbcraft_mt_orders")),
+        "{messages:?}"
+    );
+    let (vacuumed, _) = maintenance_fact(&mut h, "Last vacuum").unwrap();
+    assert!(vacuumed.contains(" ago"), "{vacuumed}");
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::POSTGRES, Task::Reindex, |o| {
+        o.concurrently = true;
+    });
+    assert!(ok, "{text}");
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::POSTGRES, Task::Analyze, |o| {
+        o.verbose = false;
+    });
+    assert!(ok, "{text}");
+    let (text, ok, _) = run_maintenance(&mut h, Dialect::POSTGRES, Task::Vacuum, |o| {
+        o.full = true;
+        o.verbose = false;
+    });
+    assert!(ok, "{text}");
+    run_script(&mut h, connection, "drop table dbcraft_mt_orders;");
+}
+
+/// Maintenance of a MySQL table (#144): ANALYZE, OPTIMIZE and CHECK TABLE
+/// answer with rows, shown as messages.
+#[test]
+fn maintenance_mysql() {
+    use crate::maintenance::Task;
+    use dbcraft_db::{Dialect, ObjectType};
+    let connection = "dbcraft@mysql";
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MYSQL").ok() else {
+        return;
+    };
+    let database = spec.rsplit('/').next().unwrap_or_default().to_owned();
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_MYSQL",
+        connection,
+        dbcraft_config::DbKind::MySql,
+    ) else {
+        return;
+    };
+    run_script(
+        &mut h,
+        connection,
+        "drop table if exists dbcraft_mt_orders;
+create table dbcraft_mt_orders (id int primary key, note varchar(100), key (note));
+insert into dbcraft_mt_orders values (1, 'one'), (2, 'two'), (3, 'three');
+commit;",
+    );
+    let table = ObjectRef {
+        owner: database,
+        name: "dbcraft_mt_orders".into(),
+        object_type: ObjectType::Table,
+    };
+    open_maintenance(&mut h, connection, table);
+    assert_eq!(
+        maintenance_fact(&mut h, "Engine"),
+        Some(("InnoDB".into(), false))
+    );
+    for task in [Task::Analyze, Task::Optimize, Task::Check] {
+        let (text, ok, messages) = run_maintenance(&mut h, Dialect::MYSQL, task, |_| {});
+        assert!(ok, "{task:?}: {text}");
+        assert!(
+            messages[0].iter().any(|m| m == "status: OK"),
+            "{task:?}: {messages:?}"
+        );
+    }
+    run_script(&mut h, connection, "drop table dbcraft_mt_orders;");
+}
+
+/// A harness connected to a new SQLite file in the temp directory, named
+/// `connection`; the file is removed on drop of the returned guard.
+fn sqlite_file(connection: &str) -> (Ui, SqliteFile) {
+    let file = SqliteFile(std::env::temp_dir().join(format!(
+        "dbcraft-ui-{}-{}.db",
+        std::process::id(),
+        connection.replace('.', "-")
+    )));
+    let _ = std::fs::remove_file(&file.0);
+    let profile = ConnectionProfile {
+        name: connection.into(),
+        kind: dbcraft_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", file.0.display()),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    (h, file)
+}
+
+struct SqliteFile(PathBuf);
+
+impl Drop for SqliteFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A file dropped on the window.
+#[derive(Debug)]
+struct Dropped(PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+/// A data file dropped on a connection whose database DbCraft doesn't import
+/// into says so (#235), as the Tools menu doesn't offer the import there. It
+/// opened an import window, which showed Oracle's CREATE TABLE and failed
+/// only at Import: "This tool isn't available for SQLite connections".
+#[test]
+fn dropped_data_files_import_only_where_they_can() {
+    let connection = "drop.db";
+    let (mut h, _file) = sqlite_file(connection);
+    let dir = std::env::temp_dir().join(format!("dbcraft-drop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("names.csv");
+    std::fs::write(&path, "id;name\n1;äöü\n2;日本\n").unwrap();
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(path)));
+    h.run_steps(3);
+    let windows = h.state().test_window_connections();
+    assert!(
+        !windows.iter().any(|(title, _)| title.starts_with("Import")),
+        "{windows:?}"
+    );
+    assert_eq!(
+        h.state().test_log().last().map(String::as_str),
+        Some("names.csv: Import Data (CSV, Excel)… isn't available for SQLite connections")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Completion forgets what the object browser changed or read again
+/// (#198): after the browser dropped a table, completion still offered its
+/// columns; after a column was added from outside, Refresh didn't make
+/// completion offer it.
+#[test]
+fn completion_follows_the_browser() {
+    use dbcraft_db::ObjectType;
+    let connection = "completion.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table cb_t (id integer, name text)",
+    );
+    // The columns completion offers after `x.` of `from cb_t x`.
+    let columns = |h: &mut Ui| -> Vec<String> {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: "select x\n  from cb_t x".into(),
+            run: false,
+        });
+        h.run_steps(3);
+        h.state_mut().test_sql_window().editor.select(8..8);
+        h.run_steps(3);
+        h.event(egui::Event::Text(".".into()));
+        let mut labels = Vec::new();
+        for _ in 0..50 {
+            h.run_steps(1);
+            labels = h
+                .state_mut()
+                .test_sql_window()
+                .editor
+                .completion_labels()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if !labels.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+        labels
+    };
+    assert!(columns(&mut h).contains(&"name".to_owned()));
+
+    rusqlite::Connection::open(&file.0)
+        .unwrap()
+        .execute("alter table cb_t add column extra integer", [])
+        .unwrap();
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(2);
+    h.state_mut().test_refresh_browser();
+    h.run_steps(2);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    assert!(
+        columns(&mut h).contains(&"extra".to_owned()),
+        "after Refresh"
+    );
+
+    h.get_by_label("cb_t").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Drop…").click();
+    h.run_steps(2);
+    h.get_by_label("Drop").click();
+    wait_until(&mut h, "drop", |app| {
+        app.test_log()
+            .iter()
+            .any(|l| l.contains("cb_t") && l.ends_with("dropped"))
+    });
+    h.run_steps(2);
+    assert_eq!(columns(&mut h), Vec::<String>::new(), "after Drop");
+}
+
+/// A table's object view doesn't stay as if it were there after the table
+/// is dropped (#200): a Drop in the object browser closes it, and Refresh
+/// after a DROP elsewhere says the table is gone instead of showing no
+/// columns.
+#[test]
+fn object_view_of_a_dropped_table() {
+    use dbcraft_db::ObjectType;
+    let connection = "views.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table dv_a (id integer, name text);\ncreate table dv_b (id integer)",
+    );
+    let open = |h: &mut Ui, name: &str, columns: usize| {
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: connection.into(),
+            object: crate::documents::ObjectRef {
+                owner: "main".into(),
+                name: name.into(),
+                object_type: ObjectType::Table,
+            },
+        });
+        wait_until(h, "columns", |app| !app.test_focused_busy());
+        assert_eq!(h.state().test_object_view().loaded_for_test().1, columns);
+    };
+    open(&mut h, "dv_a", 2);
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(2);
+    h.get_by_label("dv_a").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Drop…").click();
+    h.run_steps(2);
+    h.get_by_label("Drop").click();
+    wait_until(&mut h, "drop", |app| {
+        app.test_log()
+            .iter()
+            .any(|l| l.contains("dv_a") && l.ends_with("dropped"))
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("main.dv_a").is_none(), "its view closed");
+
+    open(&mut h, "dv_b", 1);
+    run_script(&mut h, connection, "drop table dv_b");
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: crate::documents::ObjectRef {
+            owner: "main".into(),
+            name: "dv_b".into(),
+            object_type: ObjectType::Table,
+        },
+    });
+    h.run_steps(3);
+    h.get_by_label("Refresh").click();
+    wait_until(&mut h, "refresh", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert!(
+        h.query_by_label_contains("There is no table main.dv_b")
+            .is_some(),
+        "Refresh says it's gone"
+    );
+}
+
+/// A read-only connection drops nothing from the object browser either
+/// (#464): only SQL windows refused changes, and *Drop…* ran.
+#[test]
+fn read_only_connections_drop_nothing() {
+    use crate::browser::ObjectAction;
+    use dbcraft_db::ObjectType;
+    let file = SqliteFile(std::env::temp_dir().join(format!(
+        "dbcraft-ui-{}-r101-read-only.db",
+        std::process::id()
+    )));
+    let _ = std::fs::remove_file(&file.0);
+    rusqlite::Connection::open(&file.0)
+        .unwrap()
+        .execute_batch("create table r101_keep (a)")
+        .unwrap();
+    let connection = "r101-read-only";
+    let profile = ConnectionProfile {
+        name: connection.into(),
+        kind: dbcraft_config::DbKind::Sqlite,
+        connect_string: file.0.display().to_string(),
+        read_only: true,
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let before = h.state().test_log().len();
+    let object = ObjectRef {
+        owner: "main".into(),
+        name: "r101_keep".into(),
+        object_type: ObjectType::Table,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Drop(object));
+    h.run_steps(3);
+    h.get_by_label("Drop").click();
+    wait_until(&mut h, "the refusal", |app| {
+        app.test_log()[before..]
+            .iter()
+            .any(|l| l.contains("read-only"))
+    });
+    drop(h);
+    let tables: i64 = rusqlite::Connection::open(&file.0)
+        .unwrap()
+        .query_row(
+            "select count(*) from sqlite_schema where name = 'r101_keep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1);
+}
+
+/// *Drop…* names the table as its database writes it, in the question and
+/// in the log (#268). They read `"main"."r55_drop"`, Oracle's quoting, on
+/// every database.
+#[test]
+fn drop_names_the_object_as_its_database_writes_it() {
+    use crate::browser::ObjectAction;
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+
+    // Creates and drops each table through the question, which must name
+    // it so, as must the log.
+    let drops = |h: &mut Ui, connection: &str, tables: &[(&str, &str, &str)]| {
+        for (create, owner, name) in tables {
+            let (owner, name) = (owner.to_string(), name.to_string());
+            run_script(h, connection, create);
+            let object = ObjectRef {
+                owner,
+                name: name.clone(),
+                object_type: ObjectType::Table,
+            };
+            let named = match (object.owner.as_str(), name.as_str()) {
+                ("main", "r55_drop") => "main.r55_drop",
+                ("main", _) => "main.\"R55 Drop\"",
+                ("public", _) => "public.\"R55 Drop\"",
+                ("dbo", _) => "dbo.[r55 drop]",
+                ("DBCRAFT", "R55_DROP") => "DBCRAFT.R55_DROP",
+                ("DBCRAFT", _) => "DBCRAFT.\"R55 Drop\"",
+                _ => "dbcraft.`r55 drop`",
+            };
+            let before = h.state().test_log().len();
+            h.state_mut()
+                .test_object_action(connection, ObjectAction::Drop(object));
+            h.run_steps(3);
+            let question = format!("Drop table {named}? This cannot be undone.");
+            assert!(h.query_by_label(&question).is_some(), "{question}");
+            h.get_by_label("Drop").click();
+            wait_until(h, "the drop", |app| {
+                app.test_log()[before..]
+                    .iter()
+                    .any(|l| l.ends_with(" dropped"))
+            });
+            let log = h.state().test_log()[before..].to_vec();
+            let line = format!("table {named} dropped");
+            assert!(log.contains(&line), "{line}: {log:?}");
+        }
+    };
+
+    let connection = "r55-drop.db";
+    let (mut h, _file) = sqlite_file(connection);
+    drops(
+        &mut h,
+        connection,
+        &[
+            ("create table r55_drop (a)", "main", "r55_drop"),
+            ("create table \"R55 Drop\" (a)", "main", "R55 Drop"),
+        ],
+    );
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    for (env, kind, table) in [
+        (
+            "DBCRAFT_TEST_MYSQL",
+            DbKind::MySql,
+            ("create table `r55 drop` (a int)", "dbcraft", "r55 drop"),
+        ),
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            ("create table \"R55 Drop\" (a int)", "public", "R55 Drop"),
+        ),
+        (
+            "DBCRAFT_TEST_MSSQL",
+            DbKind::SqlServer,
+            ("create table [r55 drop] (a int)", "dbo", "r55 drop"),
+        ),
+    ] {
+        if let Some(mut h) = connect_to(env, "r55-drop", kind) {
+            drops(&mut h, "r55-drop", &[table]);
+        }
+    }
+    // Oracle's as before.
+    if let Some(mut h) = connect_to("DBCRAFT_TEST_DB", "r55-drop", DbKind::Oracle) {
+        drops(
+            &mut h,
+            "r55-drop",
+            &[
+                ("create table r55_drop (a int)", "DBCRAFT", "R55_DROP"),
+                ("create table \"R55 Drop\" (a int)", "DBCRAFT", "R55 Drop"),
+            ],
+        );
+    }
+}
+
+/// The object browser, an object's tab, Favorites and Recent show a name
+/// with the case that tells it apart (#272). Every name was lowercased, so
+/// PostgreSQL's "R55Case" and r55case, MySQL's R55Case and r55case, and
+/// Oracle's R55_CASE, "R55_Case" and "R55_case" each read the same; Oracle's
+/// uppercase names still read in lowercase.
+#[test]
+fn names_keep_the_case_that_tells_them_apart() {
+    use dbcraft_config::DbKind;
+    use dbcraft_db::ObjectType;
+
+    // Creates the tables (name, as shown) and finds each in the browser
+    // once; the second one in its tab, Favorites and Recent too.
+    let check = |h: &mut Ui, owner: &str, script: &str, drops: &str, tables: &[(&str, &str)]| {
+        let connection = "r55-case";
+        run_script(h, connection, script);
+        h.state_mut().test_expand_browser(&[ObjectType::Table]);
+        h.state_mut().test_browser().set_filter("R55");
+        h.state_mut().test_refresh_browser();
+        wait_until(h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        for (_, shown) in tables {
+            assert_eq!(h.query_all_by_label(shown).count(), 1, "{shown}");
+        }
+        let (name, shown) = tables[1];
+        let object = ObjectRef {
+            owner: owner.into(),
+            name: name.into(),
+            object_type: ObjectType::Table,
+        };
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: connection.into(),
+            object: object.clone(),
+        });
+        wait_until(h, "its view", |app| !app.test_focused_busy());
+        assert_eq!(h.state().test_focused_title().as_deref(), Some(shown));
+        h.state_mut().test_close_focused();
+        // The folder left out (only invalid objects), Favorites and Recent.
+        h.state_mut().test_browser().test_marks(object);
+        h.run_steps(3);
+        assert_eq!(h.query_all_by_label(shown).count(), 2, "{shown}");
+        run_script(h, connection, drops);
+    };
+
+    let (mut h, _file) = sqlite_file("r55-case");
+    check(
+        &mut h,
+        "main",
+        "create table R55Case (a);\ncreate table r55_other (a)",
+        "drop table R55Case;\ndrop table r55_other",
+        &[("r55_other", "r55_other"), ("R55Case", "R55Case")],
+    );
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    let both = |create: &str, quoted: &str| {
+        (
+            format!("{create} {quoted} (a int);\n{create} r55case (a int)"),
+            format!("drop table {quoted};\ndrop table r55case"),
+        )
+    };
+    for (env, kind, owner, quoted) in [
+        (
+            "DBCRAFT_TEST_POSTGRES",
+            DbKind::Postgres,
+            "public",
+            "\"R55Case\"",
+        ),
+        ("DBCRAFT_TEST_MYSQL", DbKind::MySql, "dbcraft", "R55Case"),
+    ] {
+        if let Some(mut h) = connect_to(env, "r55-case", kind) {
+            let (script, drops) = both("create table", quoted);
+            check(
+                &mut h,
+                owner,
+                &script,
+                &drops,
+                &[("r55case", "r55case"), ("R55Case", "R55Case")],
+            );
+        }
+    }
+    if let Some(mut h) = connect_to("DBCRAFT_TEST_DB", "r55-case", DbKind::Oracle) {
+        check(
+            &mut h,
+            "DBCRAFT",
+            "create table r55_case (a int);\ncreate table \"R55_Case\" (a int);\n\
+             create table \"R55_case\" (a int)",
+            "drop table r55_case;\ndrop table \"R55_Case\";\ndrop table \"R55_case\"",
+            &[
+                ("R55_CASE", "r55_case"),
+                ("R55_Case", "\"R55_Case\""),
+                ("R55_case", "\"R55_case\""),
+            ],
+        );
+    }
+}
+
+/// On Oracle the filters of the object browser, Export tables and Invalid
+/// objects find a quoted name with lowercase letters by any case (#305):
+/// `r62_ca` found no "R62_Case", `r62_bad` no "R62_Bad".
+#[test]
+fn oracle_filters_find_names_in_any_case() {
+    use dbcraft_db::ObjectType;
+
+    let connection = "r62-filters";
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_DB",
+        connection,
+        dbcraft_config::DbKind::Oracle,
+    ) else {
+        return;
+    };
+    let drops = [
+        "table \"R62_Case\" purge",
+        "table r62_upper purge",
+        "view \"R62_Bad\"",
+    ]
+    .map(|o| {
+        format!(
+            "begin execute immediate 'drop {o}'; \
+             exception when others then null; end;\n/"
+        )
+    })
+    .join("\n");
+    run_script(&mut h, connection, &drops);
+    run_script(
+        &mut h,
+        connection,
+        "create table \"R62_Case\" (a number);\ncreate table r62_upper (a number);\n\
+         create force view \"R62_Bad\" as select * from r62_missing;",
+    );
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    h.state_mut().test_browser().set_filter("r62_ca");
+    h.state_mut().test_refresh_browser();
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"R62_Case\"").count(), 1);
+    assert_eq!(h.query_all_by_label("r62_upper").count(), 0);
+
+    // The browser shows none of them now.
+    h.state_mut().test_browser().set_filter("r62_none");
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    h.state_mut().test_export_tables().set_filter("r62_ca");
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"R62_Case\"").count(), 1);
+    assert_eq!(h.query_all_by_label("r62_upper").count(), 0);
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::InvalidObjects {
+        connection: connection.into(),
+        schema: None,
+        recompile: false,
+    });
+    wait_until(&mut h, "invalid objects", |app| {
+        app.test_invalid_window()
+            .is_some_and(|w| !w.is_busy() && w.objects().iter().any(|o| o.id.name == "R62_Bad"))
+    });
+    h.state_mut().test_invalid_window_mut().unwrap().filter = "r62_bad".into();
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"R62_Bad\"").count(), 1);
+    h.state_mut().test_close_focused();
+    run_script(&mut h, connection, &drops);
+}
+
+/// A SQLite table named `""` shows as `""` (#281): in the browser, where it
+/// was a button without a label, 16 pixels wide, its tab and view,
+/// Favorites and Recent. One named `" "` shows as `" "`.
+#[test]
+fn an_empty_name_shows_as_quotes() {
+    use dbcraft_db::ObjectType;
+    let connection = "r55-empty.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \"\" (a, b);\ncreate table \" \" (a)",
+    );
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    assert!(h.query_by_label("\" \"").is_some());
+    let entry = h.get_by_label("\"\"");
+    assert!(entry.rect().width() > 20.0, "{:?}", entry.rect());
+    entry.click();
+    h.run_steps(2);
+    let selected = h.state().test_browser_selected();
+    assert_eq!(selected.map(|o| o.name), Some(String::new()));
+    let object = ObjectRef {
+        owner: "main".into(),
+        name: String::new(),
+        object_type: ObjectType::Table,
+    };
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: object.clone(),
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("\"\""));
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 2);
+    assert!(
+        h.query_by_label("main.\"\"").is_some(),
+        "the view's heading"
+    );
+    h.state_mut().test_close_focused();
+    h.state_mut().test_browser().test_marks(object);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"\"").count(), 2, "Favorites, Recent");
+}
+
+/// SQLite tables named `" t"` and `"t "` show quoted, so they don't look
+/// like `t`: in the browser, their tabs and views, Favorites and Recent.
+#[test]
+fn names_with_spaces_around_them_show_quoted() {
+    use dbcraft_db::ObjectType;
+    let connection = "r64-spaces.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \" t\" (a);\ncreate table \"t \" (a, b);\ncreate table t (a)",
+    );
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    for shown in ["\" t\"", "\"t \"", "t"] {
+        assert_eq!(h.query_all_by_label(shown).count(), 1, "{shown}");
+    }
+    let object = ObjectRef {
+        owner: "main".into(),
+        name: "t ".into(),
+        object_type: ObjectType::Table,
+    };
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: object.clone(),
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("\"t \""));
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 2);
+    assert!(
+        h.query_by_label("main.\"t \"").is_some(),
+        "the view's heading"
+    );
+    h.state_mut().test_close_focused();
+    h.state_mut().test_browser().test_marks(object);
+    h.run_steps(3);
+    assert_eq!(
+        h.query_all_by_label("\"t \"").count(),
+        2,
+        "Favorites, Recent"
+    );
+}
+
+/// Oracle's names keep the case that tells them apart outside the browser
+/// too, as #272 shows them there: `R64_CASE` reads `r64_case`, `"R64_Case"`
+/// reads `"R64_Case"`, in the maintenance scan and an index's maintenance,
+/// Export tables, the invalid objects, a table's partitions and the grants
+/// on it. Each read `r64_case` and the like, so the two looked the same.
+#[test]
+fn oracle_names_keep_their_case_beyond_the_browser() {
+    use crate::object_editor::EditTarget;
+    use dbcraft_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = "dbcraft@FREEPDB1";
+    // A role with lowercase letters to grant to, made by a DBA.
+    let dba = std::env::var("DBCRAFT_TEST_DB_DBA").ok().map(|spec| {
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        dbcraft_db::oracle::Connection::connect(user, pw, db).unwrap()
+    });
+    if let Some(dba) = &dba {
+        let _ = dba.execute("drop role \"R64_Role\"", &[]);
+        dba.execute("create role \"R64_Role\"", &[]).unwrap();
+    }
+    let drops = "drop view if exists \"R64_Bad\";
+drop table if exists r64_case purge;
+drop table if exists \"R64_Case\" purge;
+drop table if exists r64_part purge;";
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    run_script(&mut h, connection, drops);
+    run_script(
+        &mut h,
+        connection,
+        &format!(
+            "create table r64_case (id number);
+create table \"R64_Case\" (\"Id\" number);
+create index \"R64_Case_Ix\" on \"R64_Case\" (\"Id\");
+create table r64_part (\"Day\" number, id number) tablespace users
+  partition by range (\"Day\") (partition \"P_Low\" values less than (10),
+                                partition p_high values less than (maxvalue));
+create force view \"R64_Bad\" as select * from r64_missing;{}",
+            if dba.is_some() {
+                "\ngrant select on \"R64_Case\" to \"R64_Role\";"
+            } else {
+                ""
+            }
+        ),
+    );
+    let object = |name: &str, object_type| ObjectRef {
+        owner: "DBCRAFT".into(),
+        name: name.into(),
+        object_type,
+    };
+
+    // The scan: both tables have no statistics.
+    open_scan(&mut h, None);
+    let found = scan_findings(&mut h, "dbcraft.");
+    let found: Vec<_> = found
+        .iter()
+        .filter(|(name, ..)| name.to_lowercase().contains("r64_case"))
+        .map(|(name, problem, _)| (name.as_str(), problem.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("dbcraft.r64_case", "No statistics"),
+            ("dbcraft.\"R64_Case\"", "No statistics")
+        ]
+    );
+    h.state_mut().test_close_focused();
+    open_maintenance(&mut h, connection, object("R64_Case_Ix", ObjectType::Index));
+    assert_eq!(
+        maintenance_fact(&mut h, "Table").map(|(table, _)| table),
+        Some("dbcraft.\"R64_Case\"".into())
+    );
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_export_tables()
+        .set_tables(&[("R64_CASE", ""), ("R64_Case", "")]);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("r64_case").count(), 1, "Export tables");
+    assert_eq!(h.query_all_by_label("\"R64_Case\"").count(), 1);
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::InvalidObjects {
+        connection: connection.into(),
+        schema: Some("DBCRAFT".into()),
+        recompile: false,
+    });
+    wait_until(&mut h, "invalid objects", |app| {
+        app.test_invalid_window()
+            .is_some_and(|w| !w.is_busy() && !w.objects().is_empty())
+    });
+    h.state_mut().test_invalid_window_mut().unwrap().filter = "R64".into();
+    h.run_steps(3);
+    assert!(h.query_by_label("\"R64_Bad\"").is_some(), "invalid objects");
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::EditTable {
+        connection: connection.into(),
+        object: object("R64_PART", ObjectType::Table),
+        tab: crate::table_editor::TableTab::Partitions,
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "partitions", |app| !app.test_focused_busy());
+    h.run_steps(3);
+    assert!(h.query_by_label("\"P_Low\"").is_some(), "partitions");
+    assert!(h.query_by_label("p_high").is_some());
+    assert!(h.query_by_label("(\"Day\")").is_some(), "the key");
+    h.state_mut().test_close_focused();
+
+    if dba.is_some() {
+        h.state_mut().test_open(OpenRequest::EditObject {
+            connection: connection.into(),
+            target: EditTarget::Grants(object("R64_Case", ObjectType::Table)),
+        });
+        h.run_steps(2);
+        wait_until(&mut h, "grants", |app| !app.test_focused_busy());
+        h.run_steps(2);
+        assert!(h.query_by_label("\"R64_Role\"").is_some(), "grantee");
+        h.state_mut().test_close_focused();
+    }
+    run_script(&mut h, connection, drops);
+    if let Some(dba) = &dba {
+        dba.execute("drop role \"R64_Role\"", &[]).unwrap();
+    }
+}
+
+/// A name typed after its opening quote is completed and closed (#234):
+/// `` `ord `` became ``` ``order` ```, and after `[` or `"` the popup
+/// didn't open.
+#[test]
+fn completion_after_an_opening_quote() {
+    let connection = "quoted.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \"order\" (id integer, \"unit price\" real)",
+    );
+    // The text, where a letter is typed, and the text once completed.
+    for (text, caret, letter, completed) in [
+        ("select * from `or", 17, "d", "select * from `order`"),
+        ("select * from [o", 16, "r", "select * from [order]"),
+        (
+            "select [u from [order]",
+            9,
+            "n",
+            "select [unit price] from [order]",
+        ),
+        (
+            "select \"u from \"order\"",
+            9,
+            "n",
+            "select \"unit price\" from \"order\"",
+        ),
+    ] {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: text.into(),
+            run: false,
+        });
+        h.run_steps(3);
+        h.state_mut().test_sql_window().editor.select(caret..caret);
+        h.run_steps(2);
+        h.event(egui::Event::Text(letter.into()));
+        let mut open = false;
+        for _ in 0..50 {
+            h.run_steps(1);
+            let editor = &h.state_mut().test_sql_window().editor;
+            if !editor.completion_labels().is_empty() {
+                open = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(open, "{text}: no completion");
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state_mut().test_sql_window().editor.text(), completed);
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    }
+}
+
+/// Maintenance of a SQLite table: its rows, pages and missing statistics,
+/// then ANALYZE (after which it has them), REINDEX and the integrity check.
+#[test]
+fn maintenance_sqlite() {
+    use crate::maintenance::Task;
+    use dbcraft_db::{Dialect, ObjectType};
+    let connection = "maintenance.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table orders (id integer primary key, note text);
+create index orders_note on orders (note);
+insert into orders values (1, 'one'), (2, 'two'), (3, 'three');
+commit;",
+    );
+    let table = ObjectRef {
+        owner: "main".into(),
+        name: "orders".into(),
+        object_type: ObjectType::Table,
+    };
+    open_maintenance(&mut h, connection, table);
+    assert_eq!(maintenance_fact(&mut h, "Rows"), Some(("3".into(), false)));
+    assert!(maintenance_fact(&mut h, "Data").is_some());
+    assert!(maintenance_fact(&mut h, "Indexes").is_some());
+    assert_eq!(
+        maintenance_fact(&mut h, "Statistics"),
+        Some(("never gathered".into(), true))
+    );
+    for task in [Task::Analyze, Task::Reindex, Task::Check] {
+        let (text, ok, messages) = run_maintenance(&mut h, Dialect::SQLITE, task, |_| {});
+        assert!(ok, "{task:?}: {text}");
+        if task == Task::Check {
+            assert!(
+                messages[0].iter().any(|m| m.contains("ok")),
+                "{task:?}: {messages:?}"
+            );
+        }
+    }
+    assert_eq!(
+        maintenance_fact(&mut h, "Statistics"),
+        Some(("gathered (ANALYZE)".into(), false))
+    );
+    assert_eq!(
+        maintenance_fact(&mut h, "Rows (statistics)"),
+        Some(("3".into(), false))
+    );
+}
+
+/// The maintenance scan of a SQLite database: free pages after a large
+/// delete (with the line lowered for a small file) and an indexed table
+/// without statistics; the batch vacuums and analyzes, and the scan after
+/// finds neither.
+#[test]
+fn maintenance_scan_sqlite() {
+    let connection = "scan.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table big (id integer primary key, pad text);
+create index big_pad on big (pad);
+insert into big
+  with recursive n(i) as (select 1 union all select i + 1 from n where i < 2000)
+  select i, printf('%.500c', 'x') from n;
+delete from big where id > 10;
+commit;",
+    );
+    let everything = crate::maintenance::Limits {
+        free_bytes: 0.0,
+        free_share: 0.0,
+        ..Default::default()
+    };
+    open_scan(&mut h, Some(everything));
+    save(&mut h, "maintenance-scan-sqlite");
+    let mut found = scan_findings(&mut h, "");
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("database main".into(), "Reclaimable space".into(), true),
+            ("main.big".into(), "No statistics".into(), true),
+        ]
+    );
+    assert!(scan_note(&mut h, "File").is_some());
+    let (text, ok, statuses) = run_scan(&mut h, "", |_| true);
+    assert!(ok, "{text}: {statuses:?}");
+    assert_eq!(statuses.len(), 2, "{statuses:?}");
+    assert!(scan_findings(&mut h, "").is_empty());
+}
+
+/// Maintenance of a SQL Server table (#144): statistics with a full scan,
+/// rebuilding and reorganizing its indexes.
+#[test]
+fn maintenance_sqlserver() {
+    use crate::maintenance::Task;
+    use dbcraft_db::{Dialect, ObjectType};
+    let connection = "dbcraft@sqlserver";
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_MSSQL",
+        connection,
+        dbcraft_config::DbKind::SqlServer,
+    ) else {
+        return;
+    };
+    run_script(
+        &mut h,
+        connection,
+        "drop table if exists dbcraft_mt_orders;
+create table dbcraft_mt_orders (id int primary key, note varchar(100));
+create index dbcraft_mt_orders_note on dbcraft_mt_orders (note);
+insert into dbcraft_mt_orders
+select top 5000 row_number() over (order by (select null)), 'order'
+  from sys.all_objects a cross join sys.all_objects b;
+commit;",
+    );
+    let table = ObjectRef {
+        owner: "dbo".into(),
+        name: "dbcraft_mt_orders".into(),
+        object_type: ObjectType::Table,
+    };
+    open_maintenance(&mut h, connection, table);
+    assert_eq!(
+        maintenance_fact(&mut h, "Rows"),
+        Some(("5,000".into(), false))
+    );
+    assert_eq!(
+        maintenance_fact(&mut h, "Indexes"),
+        Some(("2".into(), false))
+    );
+    for task in [
+        Task::UpdateStatistics,
+        Task::RebuildIndexes,
+        Task::ReorganizeIndexes,
+    ] {
+        let (text, ok, _) = run_maintenance(&mut h, Dialect::SQLSERVER, task, |o| {
+            o.fullscan = true;
+        });
+        assert!(ok, "{task:?}: {text}");
+    }
+    // Each statement committed: nothing waits in the window's session.
+    assert!(!h.state().test_pending_tx());
+    run_script(&mut h, connection, "drop table dbcraft_mt_orders;");
+}
+
+/// Opens the maintenance scan of the harness's connection (Tools menu) and
+/// waits for it; with `limits`, scans again with those.
+fn open_scan(h: &mut Harness<'_, DbCraftApp>, limits: Option<crate::maintenance::Limits>) {
+    h.state_mut()
+        .test_command(crate::commands::Command::MaintenanceScan);
+    h.run_steps(2);
+    wait_until(h, "maintenance scan", |app| !app.test_focused_busy());
+    if let Some(limits) = limits {
+        let window = h.state_mut().test_scan_window();
+        window.set_limits_for_test(limits);
+        let effects = window.load();
+        h.state_mut().test_apply(effects);
+        h.run_steps(2);
+        wait_until(h, "maintenance scan", |app| !app.test_focused_busy());
+    }
+    h.run_steps(2);
+}
+
+/// The focused scan's findings whose name starts with `prefix`, as
+/// (name, problem, picked).
+fn scan_findings(h: &mut Harness<'_, DbCraftApp>, prefix: &str) -> Vec<(String, String, bool)> {
+    let scan = h
+        .state_mut()
+        .test_scan_window()
+        .scan_for_test()
+        .expect("a scan");
+    scan.findings
+        .iter()
+        .filter(|f| f.name.starts_with(prefix))
+        .map(|f| (f.name.clone(), f.problem.clone(), f.picked))
+        .collect()
+}
+
+/// Whether the focused scan has a note with `label`.
+fn scan_note(h: &mut Harness<'_, DbCraftApp>, label: &str) -> Option<String> {
+    let scan = h.state_mut().test_scan_window().scan_for_test()?;
+    let note = scan.notes.iter().find(|n| n.label == label)?;
+    Some(note.value.clone())
+}
+
+/// Runs the findings whose name starts with `prefix` (and `pick` accepts)
+/// as a batch; waits for it and the scan after. How it ended, and each
+/// statement's object and status.
+fn run_scan(
+    h: &mut Harness<'_, DbCraftApp>,
+    prefix: &str,
+    pick: impl Fn(&crate::maintenance::Finding) -> bool,
+) -> (String, bool, Vec<(usize, &'static str)>) {
+    let window = h.state_mut().test_scan_window();
+    window.pick_for_test(|f| f.name.starts_with(prefix) && pick(f));
+    let effects = window.run_for_test();
+    h.state_mut().test_apply(effects);
+    h.run_steps(2);
+    wait_until(h, "maintenance batch", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    let (outcome, statuses) = h.state_mut().test_scan_window().outcome_for_test();
+    let (text, ok) = outcome.expect("an outcome");
+    (text, ok, statuses)
+}
+
+/// The maintenance scan of an Oracle schema (#145): a table without
+/// statistics, its index left unusable by a move, and a table whose
+/// statistics are locked (found, but not picked: gathering takes force).
+/// The batch rebuilds the index first, then gathers; the scan after finds
+/// neither. Without the DBA views, the automatic task can't be read.
+#[test]
+fn maintenance_scan_oracle() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let connection = "dbcraft@FREEPDB1";
+    run_script(
+        &mut h,
+        connection,
+        "begin
+  for t in (select table_name from user_tables
+             where table_name in ('DBCRAFT_MS_T', 'DBCRAFT_MS_L')) loop
+    execute immediate 'drop table ' || t.table_name || ' purge';
+  end loop;
+end;
+/
+create table dbcraft_ms_t (id number, note varchar2(40));
+insert into dbcraft_ms_t select level, 'row ' || level from dual connect by level <= 500;
+commit;
+create index dbcraft_ms_t_note on dbcraft_ms_t (note);
+alter table dbcraft_ms_t move;
+begin dbms_stats.delete_table_stats(user, 'DBCRAFT_MS_T'); end;
+/
+create table dbcraft_ms_l (id number);
+begin dbms_stats.lock_table_stats(user, 'DBCRAFT_MS_L'); end;
+/",
+    );
+    open_scan(&mut h, None);
+    save(&mut h, "maintenance-scan-oracle");
+    let found = scan_findings(&mut h, "dbcraft.dbcraft_ms_");
+    let has = |name: &str, problem: &str, picked: bool| {
+        found.contains(&(name.into(), problem.into(), picked))
+    };
+    assert!(
+        has("dbcraft.dbcraft_ms_t_note", "Unusable index", true),
+        "{found:?}"
+    );
+    assert!(
+        has("dbcraft.dbcraft_ms_t", "No statistics", true),
+        "{found:?}"
+    );
+    assert!(
+        has("dbcraft.dbcraft_ms_l", "No statistics (locked)", false),
+        "{found:?}"
+    );
+    assert!(scan_note(&mut h, "Automatic statistics").is_some());
+
+    let (text, ok, statuses) = run_scan(&mut h, "dbcraft.dbcraft_ms_t", |_| true);
+    assert!(ok, "{text}: {statuses:?}");
+    assert!(text.starts_with("Maintenance: 2 done in "), "{text}");
+    assert_eq!(statuses, [(0, "done"), (1, "done")]);
+    let found = scan_findings(&mut h, "dbcraft.dbcraft_ms_");
+    assert_eq!(
+        found,
+        [(
+            "dbcraft.dbcraft_ms_l".into(),
+            "No statistics (locked)".into(),
+            false
+        )]
+    );
+    run_script(
+        &mut h,
+        connection,
+        "drop table dbcraft_ms_t purge;
+drop table dbcraft_ms_l purge;",
+    );
+}
+
+/// The maintenance scan of a PostgreSQL database (#145): a table with
+/// many dead rows, and an index a failed CREATE INDEX CONCURRENTLY left
+/// invalid. The batch vacuums the one and rebuilds the other concurrently
+/// (on the window's own session, which autocommits); the scan after finds
+/// neither.
+#[test]
+fn maintenance_scan_postgres() {
+    use dbcraft_config::DbKind;
+    let connection = "dbcraft@postgres";
+    let Some(mut h) = connect_to("DBCRAFT_TEST_POSTGRES", connection, DbKind::Postgres) else {
+        return;
+    };
+    let results = crate::test_db::execute_on(
+        "DBCRAFT_TEST_POSTGRES",
+        DbKind::Postgres,
+        &[
+            "drop table if exists dbcraft_ms_dead",
+            "drop table if exists dbcraft_ms_inv",
+            "create table dbcraft_ms_dead (id int primary key, note text) \
+             with (autovacuum_enabled = false)",
+            "insert into dbcraft_ms_dead select g, 'row ' || g from generate_series(1, 3000) g",
+            "analyze dbcraft_ms_dead",
+            "delete from dbcraft_ms_dead where id > 1000",
+            "create table dbcraft_ms_inv (id int) with (autovacuum_enabled = false)",
+            "insert into dbcraft_ms_inv values (1), (1)",
+            "create unique index concurrently dbcraft_ms_inv_ux on dbcraft_ms_inv (id)",
+            "delete from dbcraft_ms_inv",
+            // The counters of this session reach pg_stat_all_tables now.
+            "select pg_stat_force_next_flush()",
+        ],
+    )
+    .expect("DBCRAFT_TEST_POSTGRES");
+    assert!(results[8].is_err(), "the duplicates fail it: {results:?}");
+    assert!(
+        results.iter().enumerate().all(|(i, r)| i == 8 || r.is_ok()),
+        "{results:?}"
+    );
+    open_scan(&mut h, None);
+    save(&mut h, "maintenance-scan-postgres");
+    let found = scan_findings(&mut h, "public.dbcraft_ms_");
+    assert!(
+        found.contains(&("public.dbcraft_ms_dead".into(), "Dead rows".into(), true)),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&(
+            "public.dbcraft_ms_inv_ux".into(),
+            "Invalid index".into(),
+            true
+        )),
+        "{found:?}"
+    );
+
+    let (text, ok, statuses) = run_scan(&mut h, "public.dbcraft_ms_", |_| true);
+    assert!(ok, "{text}: {statuses:?}");
+    let found = scan_findings(&mut h, "public.dbcraft_ms_");
+    assert!(found.is_empty(), "{found:?}");
+    crate::test_db::execute_on(
+        "DBCRAFT_TEST_POSTGRES",
+        DbKind::Postgres,
+        &["drop table dbcraft_ms_dead", "drop table dbcraft_ms_inv"],
+    );
+}
+
+/// The maintenance scan of a MySQL database (#145), with the reclaimable
+/// space's line lowered to every table: OPTIMIZE TABLE runs as a batch.
+/// Without access to `mysql`, the statistics' age can't be read; with it
+/// (`DBCRAFT_TEST_MYSQL_DBA`), statistics older than the table's last change
+/// by a day are found.
+#[test]
+fn maintenance_scan_mysql() {
+    use dbcraft_config::DbKind;
+    let connection = "dbcraft@mysql";
+    let Some(mut h) = connect_to("DBCRAFT_TEST_MYSQL", connection, DbKind::MySql) else {
+        return;
+    };
+    run_script(
+        &mut h,
+        connection,
+        "drop table if exists dbcraft_ms_t;
+create table dbcraft_ms_t (id int primary key, note varchar(40));
+insert into dbcraft_ms_t values (1, 'one'), (2, 'two'), (3, 'three');
+commit;",
+    );
+    let everything = crate::maintenance::Limits {
+        free_bytes: 0.0,
+        free_share: -1.0,
+        ..Default::default()
+    };
+    open_scan(&mut h, Some(everything));
+    save(&mut h, "maintenance-scan-mysql");
+    let found = scan_findings(&mut h, "dbcraft.dbcraft_ms_t");
+    assert_eq!(
+        found,
+        [(
+            "dbcraft.dbcraft_ms_t".into(),
+            "Reclaimable space".into(),
+            true
+        )]
+    );
+    let (text, ok, statuses) = run_scan(&mut h, "dbcraft.dbcraft_ms_t", |_| true);
+    assert!(ok, "{text}: {statuses:?}");
+    assert_eq!(statuses, [(0, "done")]);
+    if std::env::var("DBCRAFT_TEST_MYSQL_DBA").is_err() {
+        assert!(scan_note(&mut h, "Statistics").is_some());
+    }
+
+    // Statistics a few days older than the table's last change.
+    let found = crate::test_db::run_on("DBCRAFT_TEST_MYSQL_DBA", DbKind::MySql, |c| {
+        let database = c.query("select database()", &[]).unwrap()[0][0]
+            .clone()
+            .unwrap_or_default();
+        c.execute("analyze table dbcraft_ms_t").unwrap();
+        c.execute(
+            "update mysql.innodb_table_stats set last_update = now() - interval 3 day \
+              where database_name = database() and table_name = 'dbcraft_ms_t'",
+        )
+        .unwrap();
+        c.execute("insert into dbcraft_ms_t values (4, 'four')")
+            .unwrap();
+        let scan =
+            crate::maintenance::scan(c, &database, &crate::maintenance::Limits::default()).unwrap();
+        scan.findings
+            .into_iter()
+            .filter(|f| f.name.ends_with(".dbcraft_ms_t"))
+            .map(|f| (f.problem, f.statements))
+            .collect::<Vec<_>>()
+    });
+    if let Some(found) = found {
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "Statistics behind");
+        assert!(found[0].1[0].starts_with("analyze table "), "{found:?}");
+    }
+    run_script(&mut h, connection, "drop table dbcraft_ms_t;");
+}
+
+/// The maintenance scan of a SQL Server database (#145): an index on
+/// random GUIDs is fragmented (with the pages' line lowered for a small
+/// table); the batch rebuilds it, and the scan after doesn't find it. The
+/// last good DBCC CHECKDB is a note.
+#[test]
+fn maintenance_scan_sqlserver() {
+    use dbcraft_config::DbKind;
+    let connection = "dbcraft@sqlserver";
+    let Some(mut h) = connect_to("DBCRAFT_TEST_MSSQL", connection, DbKind::SqlServer) else {
+        return;
+    };
+    // Row by row: one INSERT … SELECT would be sorted by the key first.
+    let results = crate::test_db::execute_on(
+        "DBCRAFT_TEST_MSSQL",
+        DbKind::SqlServer,
+        &[
+            "drop table if exists dbcraft_ms_frag",
+            "create table dbcraft_ms_frag (
+               id uniqueidentifier not null default newid()
+                  constraint dbcraft_ms_frag_pk primary key,
+               pad char(800) not null default 'x')",
+            "declare @i int = 0
+             begin transaction
+             while @i < 3000
+             begin
+               insert into dbcraft_ms_frag default values
+               set @i = @i + 1
+             end
+             commit",
+        ],
+    )
+    .expect("DBCRAFT_TEST_MSSQL");
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    let small = crate::maintenance::Limits {
+        pages: 10,
+        ..Default::default()
+    };
+    open_scan(&mut h, Some(small));
+    save(&mut h, "maintenance-scan-sqlserver");
+    let found = scan_findings(&mut h, "dbo.dbcraft_ms_frag");
+    assert_eq!(
+        found,
+        [(
+            "dbo.dbcraft_ms_frag (dbcraft_ms_frag_pk)".into(),
+            "Fragmented index".into(),
+            true
+        )],
+    );
+    assert!(scan_note(&mut h, "Last good CHECKDB").is_some());
+    let (text, ok, statuses) = run_scan(&mut h, "dbo.dbcraft_ms_frag", |f| {
+        f.problem == "Fragmented index"
+    });
+    assert!(ok, "{text}: {statuses:?}");
+    let found = scan_findings(&mut h, "dbo.dbcraft_ms_frag");
+    assert!(
+        found
+            .iter()
+            .all(|(_, problem, _)| problem != "Fragmented index"),
+        "{found:?}"
+    );
+    run_script(&mut h, connection, "drop table dbcraft_ms_frag;");
+}
+
+/// The debugger's panels are tabs of their own (#163): opened together,
+/// breakpoints behind watches, the SQL plan with its button (#169), and a
+/// closed panel comes back when the debugger is shown again.
+#[test]
+fn debugger_panels_are_tabs() {
+    use crate::app::Tab;
+    let mut h = headless_harness();
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::ShowDebugger);
+    h.run_steps(2);
+    let app = h.state();
+    let (debugger, front) = app.test_tab(Tab::Debugger).expect("debugger");
+    assert!(front);
+    let (variables, _) = app.test_tab(Tab::DebugVariables).expect("variables");
+    let (watches, watches_front) = app.test_tab(Tab::DebugWatches).expect("watches");
+    let (breakpoints, _) = app.test_tab(Tab::DebugBreakpoints).expect("breakpoints");
+    assert_ne!(debugger, variables);
+    assert_ne!(variables, watches);
+    assert_eq!(watches, breakpoints, "breakpoints behind watches");
+    assert!(watches_front);
+    assert!(app.test_tab(Tab::DebugSql).is_none(), "closed by default");
+
+    // The plan button opens the plan in front, beside the code.
+    h.get_by_label("SQL plan").click();
+    h.run_steps(2);
+    save(&mut h, "debugger-panels");
+    let (sql, front) = h.state().test_tab(Tab::DebugSql).expect("SQL plan");
+    assert!(front);
+    assert!(![debugger, variables, watches].contains(&sql));
+    h.get_by_label("SQL plan").click();
+    h.run_steps(2);
+    assert!(h.state().test_tab(Tab::DebugSql).is_none(), "hidden: gone");
+
+    // Closed panels come back; open ones stay where they are.
+    h.state_mut().test_close_tab(Tab::DebugVariables);
+    h.run_steps(2);
+    assert!(h.state().test_tab(Tab::DebugVariables).is_none());
+    h.state_mut()
+        .test_command(crate::commands::Command::ShowDebugger);
+    h.run_steps(2);
+    let app = h.state();
+    assert!(app.test_tab(Tab::DebugVariables).is_some());
+    assert_eq!(
+        app.test_tab(Tab::DebugBreakpoints).unwrap().0,
+        app.test_tab(Tab::DebugWatches).unwrap().0
+    );
+}
+
+/// The focused window's first result.
+fn first_result<'h>(h: &'h mut Harness<'_, DbCraftApp>) -> &'h mut crate::sql_window::QueryResult {
+    &mut h.state_mut().test_sql_window().state.results[0]
+}
+
+/// The number of messages of the focused window.
+fn message_count(h: &mut Harness<'_, DbCraftApp>) -> usize {
+    h.state_mut().test_sql_window().state.messages.len()
+}
+
+/// Waits for the window to say how saving or loading a file went, after
+/// the `before` messages it had; that message.
+fn file_done(h: &mut Harness<'_, DbCraftApp>, before: usize) -> String {
+    wait_until(h, "the file", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| !w.state.value_files.is_busy() && w.state.messages.len() > before)
+    });
+    let w = h.state_mut().test_sql_window();
+    w.state
+        .messages
+        .last()
+        .map(|m| m.text.clone())
+        .unwrap_or_default()
+}
+
+/// *Save to file…* writes a binary or text value whole (#293): from the
+/// cell's context menu and from the viewer, the dialog suggesting the
+/// column's name with what the bytes say they are. The grid holds a blob
+/// past 4000 bytes cut short: that is refused until the result is edited,
+/// which fetches it again by its row's key.
+#[test]
+fn values_save_to_files() {
+    let (mut h, _db) = sqlite_file("lob-save.db");
+    let dir = std::env::temp_dir().join(format!("dbcraft-lob-save-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png: Vec<u8> = [0x89, b'P', b'N', b'G', 13, 10, 0x1A, 10]
+        .into_iter()
+        .chain((0..9000u32).map(|i| (i * 7 % 256) as u8))
+        .collect();
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02X}")).collect() };
+    run_script(
+        &mut h,
+        "lob-save.db",
+        &format!(
+            "create table lob_doc (id integer primary key, img blob, body text);\n\
+             insert into lob_doc values (1, X'{}', 'Grüße, 日本');\n\
+             insert into lob_doc values (2, X'{}', null);\n\
+             commit;\n",
+            hex(&png[..64]),
+            hex(&png)
+        ),
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "lob-save.db".into(),
+        text: "select id, img, body from lob_doc order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let save = |h: &mut Harness<'_, DbCraftApp>, cell: &str, name: &str| -> String {
+        let before = message_count(h);
+        let files = &mut h.state_mut().test_sql_window().state.value_files;
+        files.chosen.push_back(Some(dir.join(name)));
+        // The menu takes a few frames to settle where it fits.
+        h.get_by_label(cell).click_secondary();
+        h.run_steps(4);
+        h.get_by_label("Save to file…").click();
+        file_done(h, before)
+    };
+
+    // A small blob, held whole.
+    let shown = "0x89504E470D0A1A0A… · 64 bytes";
+    let said = save(&mut h, shown, "small.png");
+    assert!(said.starts_with("Saved 64 bytes to"), "{said}");
+    assert_eq!(std::fs::read(dir.join("small.png")).unwrap(), png[..64]);
+    // A big one is cut short in the grid.
+    let big = "0x89504E470D0A1A0A… · 8.8 KB";
+    let said = save(&mut h, big, "big.png");
+    assert!(said.contains("Edit the result"), "{said}");
+    assert!(!dir.join("big.png").exists());
+    let files = &mut h.state_mut().test_sql_window().state.value_files;
+    assert_eq!(files.chosen.drain(..).count(), 1, "no dialog");
+    // Edited, the result fetches the value again whole by its key.
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    assert!(first_result(&mut h).grid.is_editable());
+    let said = save(&mut h, big, "big.png");
+    assert!(said.starts_with("Saved 9008 bytes"), "{said}");
+    assert_eq!(std::fs::read(dir.join("big.png")).unwrap(), png);
+
+    // Text from the viewer, as UTF-8.
+    let path = dir.join("body.txt");
+    let before = message_count(&mut h);
+    let files = &mut h.state_mut().test_sql_window().state.value_files;
+    files.chosen.push_back(Some(path.clone()));
+    h.get_by_label("Grüße, 日本").click_secondary();
+    h.run_steps(4);
+    h.get_by_label("View value…").click();
+    h.run_steps(2);
+    h.get_by_label("Save to file…").click();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Saved 15 bytes"), "{said}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Grüße, 日本");
+    let suggested = &h.state_mut().test_sql_window().state.value_files.suggested;
+    assert_eq!(suggested, &["img.png", "img.png", "body.txt"]);
+    h.state_mut().test_close_focused();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A database's table for [`files_round_trip`]: `lob_files` with an `id`
+/// key, a binary column `b` and a long text column `t`, and the row `1`.
+struct FilesTable {
+    connection: &'static str,
+    /// Creates the table and its row, and commits.
+    create: &'static str,
+    drop: &'static str,
+}
+
+/// Loads files into the cells of a fetched row and of a new one, a few
+/// megabytes with every byte value into the binary column and text that
+/// isn't ASCII into the long text column; applies the changes; saves
+/// each value to a file again, fetched whole by its row's key, and
+/// compares the files byte for byte (#293).
+fn files_round_trip(h: &mut Harness<'_, DbCraftApp>, db: &FilesTable) {
+    let dir = std::env::temp_dir().join(format!(
+        "dbcraft-lob-files-{}-{}",
+        std::process::id(),
+        db.connection.replace(['@', '.'], "-")
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes: Vec<u8> = (0..3usize << 20)
+        .map(|i| ((i * 7 + i / 256) % 256) as u8)
+        .collect();
+    let text: String = (0..20_000)
+        .map(|i| format!("Zeile {i}: Grüße aus Zürich, 日本語のテキスト, Ελληνικά, 😀\n"))
+        .collect();
+    let files = [
+        (dir.join("b.bin"), bytes.clone()),
+        (dir.join("t.txt"), text.as_bytes().to_vec()),
+        (dir.join("b2.bin"), bytes.iter().rev().copied().collect()),
+        (
+            dir.join("t2.txt"),
+            text.chars().rev().collect::<String>().into_bytes(),
+        ),
+    ];
+    for (path, content) in &files {
+        std::fs::write(path, content).unwrap();
+    }
+    run_script(h, db.connection, db.drop);
+    run_script(h, db.connection, db.create);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: db.connection.into(),
+        text: "select id, b, t from lob_files order by id".into(),
+        run: true,
+    });
+    wait_until(h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(h, "editing", |app| !app.test_focused_busy());
+    let errors = |h: &mut Harness<'_, DbCraftApp>| -> Vec<String> {
+        let w = h.state_mut().test_sql_window();
+        w.state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| m.text.clone())
+            .collect()
+    };
+    assert!(first_result(h).grid.is_editable(), "{:?}", errors(h));
+    // The file as *Load from file…* takes it into a cell.
+    let load = |h: &mut Harness<'_, DbCraftApp>, cell: (usize, usize), path: &PathBuf| {
+        let before = message_count(h);
+        let files = &mut h.state_mut().test_sql_window().state.value_files;
+        files.chosen.push_back(Some(path.clone()));
+        let r = first_result(h);
+        r.grid.request_load(&r.columns, cell);
+        let said = file_done(h, before);
+        assert!(said.starts_with("Loaded "), "{}: {said}", db.connection);
+    };
+    load(h, (0, 1), &files[0].0);
+    load(h, (0, 2), &files[1].0);
+    {
+        let r = first_result(h);
+        let rows = r.rows.clone();
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 1, 0, Some("2".into()));
+    }
+    load(h, (1, 1), &files[2].0);
+    load(h, (1, 2), &files[3].0);
+    assert_eq!(
+        first_result(h).grid.changes().map(|c| c.loaded.len()),
+        Some(4)
+    );
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(h, "apply", |app| !app.test_focused_busy());
+    assert!(errors(h).is_empty(), "{}: {:?}", db.connection, errors(h));
+    assert_eq!(first_result(h).rows.len(), 2);
+    // Saved again, each is the file it was loaded from.
+    let cells = [((0, 1), "b"), ((0, 2), "t"), ((1, 1), "b2"), ((1, 2), "t2")];
+    for (((row, col), name), (_, content)) in cells.into_iter().zip(&files) {
+        let path = dir.join(format!("{name}.saved"));
+        let before = message_count(h);
+        let value_files = &mut h.state_mut().test_sql_window().state.value_files;
+        value_files.chosen.push_back(Some(path.clone()));
+        let r = first_result(h);
+        r.grid.request_save(&r.columns, &r.rows, (row, col));
+        let said = file_done(h, before);
+        assert!(said.starts_with("Saved "), "{}: {said}", db.connection);
+        let saved = std::fs::read(&path).unwrap();
+        assert!(
+            saved == *content,
+            "{}: {name} saved {} bytes, not the {} loaded",
+            db.connection,
+            saved.len(),
+            content.len()
+        );
+    }
+    h.state_mut().test_rollback();
+    wait_until(h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    run_script(h, db.connection, db.drop);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// [`files_round_trip`] on Oracle (`DBCRAFT_TEST_DB`): a BLOB and a CLOB.
+#[test]
+fn oracle_files_round_trip() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "dbcraft@FREEPDB1",
+            create: "create table lob_files (id number primary key, b blob, t clob);\n\
+                     insert into lob_files values (1, hextoraw('CAFE'), 'old');\n\
+                     commit;",
+            drop: "begin execute immediate 'drop table lob_files purge'; \
+                   exception when others then null; end;\n/",
+        },
+    );
+}
+
+/// On Oracle, *Load from file…* takes no JSON and no VECTOR cell (#293):
+/// their text goes into a literal of parts (#342), and a LONG bound into
+/// one fails (ORA-01461 in a VECTOR). A row with files loaded into its
+/// BLOB and CLOB, bound, and a JSON and a VECTOR typed in, longer than a
+/// literal holds, applies; so does a new one.
+#[test]
+fn oracle_files_next_to_json_and_vectors() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let connection = "dbcraft@FREEPDB1";
+    let drop = "begin execute immediate 'drop table r76_lob_json purge'; \
+                exception when others then null; end;\n/";
+    run_script(&mut h, connection, drop);
+    run_script(
+        &mut h,
+        connection,
+        "create table r76_lob_json (id number primary key, b blob, c clob, j json, \
+           v vector(*, float32));\n\
+         insert into r76_lob_json values (1, hextoraw('CAFE'), 'old', '{\"a\":1}', '[1,2]');\n\
+         commit;",
+    );
+    let dir = std::env::temp_dir().join(format!("dbcraft-r76-lob-json-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes: Vec<u8> = (0..1usize << 20).map(|i| (i % 251) as u8).collect();
+    let text = "Grüße & 日本語\n".repeat(40_000);
+    let (bin, txt) = (dir.join("b.bin"), dir.join("c.txt"));
+    std::fs::write(&bin, &bytes).unwrap();
+    std::fs::write(&txt, &text).unwrap();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: "select id, b, c, j, v from r76_lob_json order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    assert!(first_result(&mut h).grid.is_editable());
+
+    // The menu takes a few frames to settle where it fits.
+    for (cell, offered) in [("old", true), (r#"{"a":1}"#, false), ("[1,2]", false)] {
+        h.get_by_label(cell).click_secondary();
+        h.run_steps(4);
+        assert!(h.query_by_label("Edit cell").is_some(), "{cell}");
+        assert_eq!(
+            h.query_by_label("Load from file…").is_some(),
+            offered,
+            "{cell}"
+        );
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+    }
+
+    let load = |h: &mut Harness<'_, DbCraftApp>, cell: (usize, usize), path: &PathBuf| {
+        let before = message_count(h);
+        let files = &mut h.state_mut().test_sql_window().state.value_files;
+        files.chosen.push_back(Some(path.clone()));
+        let r = first_result(h);
+        r.grid.request_load(&r.columns, cell);
+        let said = file_done(h, before);
+        assert!(said.starts_with("Loaded "), "{said}");
+    };
+    let json = format!(
+        "[{}]",
+        (0..1000)
+            .map(|i| format!(r#"{{"k":{i},"url":"https://example.com/?a={i}&b=2"}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let vector = format!("[{}]", vec!["0.25"; 3000].join(","));
+    {
+        let r = first_result(&mut h);
+        let rows = r.rows.clone();
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 1, 0, Some("2".into()));
+    }
+    for row in [0, 1] {
+        load(&mut h, (row, 1), &bin);
+        load(&mut h, (row, 2), &txt);
+        let r = first_result(&mut h);
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, row, 3, Some(json.clone()));
+        r.grid.edit_cell(&rows, row, 4, Some(vector.clone()));
+    }
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let errors: Vec<String> = {
+        let w = h.state_mut().test_sql_window();
+        w.state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| m.text.clone())
+            .collect()
+    };
+    assert!(errors.is_empty(), "{errors:?}");
+    let rows = first_result(&mut h).rows.clone();
+    assert_eq!(rows.len(), 2);
+    for (r, row) in rows.iter().enumerate() {
+        assert!(row[3].as_deref() == Some(&*json), "row {r}: the JSON");
+        assert!(row[4].as_deref() == Some(&*vector), "row {r}: the VECTOR");
+        for (col, file) in [(1, &bin), (2, &txt)] {
+            let path = dir.join(format!("saved-{r}-{col}"));
+            let before = message_count(&mut h);
+            let files = &mut h.state_mut().test_sql_window().state.value_files;
+            files.chosen.push_back(Some(path.clone()));
+            let result = first_result(&mut h);
+            result
+                .grid
+                .request_save(&result.columns, &result.rows, (r, col));
+            let said = file_done(&mut h, before);
+            assert!(said.starts_with("Saved "), "{said}");
+            assert!(
+                std::fs::read(&path).unwrap() == std::fs::read(file).unwrap(),
+                "row {r}, column {col}"
+            );
+        }
+    }
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    run_script(&mut h, connection, drop);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// [`files_round_trip`] on MySQL or MariaDB (`DBCRAFT_TEST_MYSQL`): a
+/// LONGBLOB and a LONGTEXT.
+#[test]
+fn mysql_files_round_trip() {
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_MYSQL",
+        "lob@mysql",
+        dbcraft_config::DbKind::MySql,
+    ) else {
+        return;
+    };
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "lob@mysql",
+            create: "create table lob_files (id int primary key, b longblob, t longtext);\n\
+                     insert into lob_files values (1, X'CAFE', 'old');\n\
+                     commit;",
+            drop: "drop table if exists lob_files;",
+        },
+    );
+}
+
+/// [`files_round_trip`] on PostgreSQL (`DBCRAFT_TEST_POSTGRES`): a bytea
+/// and a text.
+#[test]
+fn postgres_files_round_trip() {
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_POSTGRES",
+        "lob@postgres",
+        dbcraft_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "lob@postgres",
+            create: "create table lob_files (id int primary key, b bytea, t text);\n\
+                     insert into lob_files values (1, '\\xcafe', 'old');\n\
+                     commit;",
+            drop: "drop table if exists lob_files;",
+        },
+    );
+}
+
+/// [`files_round_trip`] on SQL Server (`DBCRAFT_TEST_MSSQL`): a
+/// varbinary(max) and an nvarchar(max).
+#[test]
+fn sqlserver_files_round_trip() {
+    let Some(mut h) = connect_to(
+        "DBCRAFT_TEST_MSSQL",
+        "lob@sqlserver",
+        dbcraft_config::DbKind::SqlServer,
+    ) else {
+        return;
+    };
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "lob@sqlserver",
+            create: "create table lob_files (id int primary key, b varbinary(max), \
+                       t nvarchar(max));\n\
+                     insert into lob_files values (1, 0xCAFE, N'old');\n\
+                     commit;",
+            drop: "drop table if exists lob_files;",
+        },
+    );
+}
+
+/// [`files_round_trip`] on SQLite, a file of its own: a BLOB and a TEXT.
+#[test]
+fn sqlite_files_round_trip() {
+    let (mut h, _db) = sqlite_file("lob-files.db");
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "lob-files.db",
+            create: "create table lob_files (id integer primary key, b blob, t text);\n\
+                     insert into lob_files values (1, X'CAFE', 'old');\n\
+                     commit;",
+            drop: "drop table if exists lob_files;",
+        },
+    );
+}
+
+/// A file loaded into a new row lands in that row or in none (#344). The
+/// dialog and the file's bytes are on helper threads, and the new rows can
+/// change meanwhile: here the rows are discarded and two others inserted
+/// before the file comes. Before, it went into the second of them, a row
+/// it wasn't chosen for, and the message said it was loaded.
+#[test]
+fn a_file_loads_into_its_own_row_or_none() {
+    let (mut h, _db) = sqlite_file("lob-row.db");
+    let dir = std::env::temp_dir().join(format!("dbcraft-lob-row-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("q.bin");
+    std::fs::write(&file, [0xAB; 100]).unwrap();
+    run_script(
+        &mut h,
+        "lob-row.db",
+        "create table lob_row (id integer primary key, img blob);\n\
+         insert into lob_row values (1, X'CAFE');\n\
+         commit;\n",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "lob-row.db".into(),
+        text: "select id, img from lob_row".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    let add = |h: &mut Harness<'_, DbCraftApp>, ids: &[&str]| {
+        let r = first_result(h);
+        let rows = r.rows.clone();
+        for id in ids {
+            r.grid.add_row(&rows, r.columns.len());
+            let view_row = rows.len() + r.grid.changes().unwrap().inserts.len() - 1;
+            r.grid.edit_cell(&rows, view_row, 0, Some((*id).into()));
+        }
+    };
+    add(&mut h, &["2", "3"]);
+    // Loaded into row 3's img; the rows are discarded and 7 and 8 are
+    // inserted while the file is chosen and read.
+    let before = message_count(&mut h);
+    h.state_mut()
+        .test_sql_window()
+        .state
+        .value_files
+        .chosen
+        .push_back(Some(file.clone()));
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (2, 1));
+    }
+    first_result(&mut h).grid.clear_changes();
+    add(&mut h, &["7", "8"]);
+    let said = file_done(&mut h, before);
+    let changes = first_result(&mut h).grid.changes().cloned().unwrap();
+    assert!(changes.loaded.is_empty(), "{:?}: {said}", changes.loaded);
+    let ids: Vec<Option<&str>> = changes.inserts.iter().map(|r| r[0].as_deref()).collect();
+    assert_eq!(ids, [Some("7"), Some("8")], "{said}");
+    assert!(
+        said.starts_with("Load from file: the new row it was chosen for is gone"),
+        "{said}"
+    );
+    h.state_mut().test_close_focused();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A load that ends without a file leaves nothing behind in the grid
+/// (#361): one asked for while the dialog of another is open, which is
+/// refused, and one whose file can't be read. Each kept its cell among the
+/// grid's loads in progress for as long as the result was there.
+#[test]
+fn loads_without_a_file_are_forgotten() {
+    let (mut h, _db) = sqlite_file("r85-loads.db");
+    run_script(
+        &mut h,
+        "r85-loads.db",
+        "create table r85_lob (id integer primary key, img blob);\n\
+         insert into r85_lob values (1, X'CAFE'), (2, X'BEEF');\n\
+         commit;\n",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "r85-loads.db".into(),
+        text: "select id, img from r85_lob".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    let loads = |h: &mut Harness<'_, DbCraftApp>| first_result(h).grid.loads_in_progress();
+    // The dialog for row 1, kept open; row 2's meanwhile.
+    h.state_mut().test_sql_window().state.value_files.held = true;
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (0, 1));
+    }
+    wait_until(&mut h, "the dialog", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.value_files.is_busy())
+    });
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (1, 1));
+    }
+    h.run_steps(3);
+    let refused = loads(&mut h);
+    // Row 1's file can't be read.
+    let missing = std::env::temp_dir().join(format!("dbcraft-r85-{}-none", std::process::id()));
+    let before = message_count(&mut h);
+    let answer = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .value_files
+        .answer
+        .take();
+    answer.expect("the dialog").send(Some(missing)).unwrap();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Load from file failed"), "{said}");
+    assert_eq!(
+        (refused, loads(&mut h)),
+        (1, 0),
+        "after refused, after failed"
+    );
+    h.state_mut().test_close_focused();
+}
+
+/// *Load from file…* (#293), from the context menu and the value editor of
+/// a result being edited, not of one that isn't: the file becomes the
+/// cell's pending change, shown by its size, and Undo takes it back; a
+/// text column takes UTF-8 only; a dialog cancelled changes nothing; Apply
+/// writes the files, as Save to file reads back.
+#[test]
+fn files_load_into_cells() {
+    let (mut h, _db) = sqlite_file("lob-load.db");
+    let dir = std::env::temp_dir().join(format!("dbcraft-lob-load-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png: Vec<u8> = [0x89, b'P', b'N', b'G', 13, 10, 0x1A, 10]
+        .into_iter()
+        .chain((0..6000u32).map(|i| (i % 256) as u8))
+        .collect();
+    let (image, latin1, utf8) = (
+        dir.join("image.png"),
+        dir.join("latin1.txt"),
+        dir.join("utf8.txt"),
+    );
+    std::fs::write(&image, &png).unwrap();
+    std::fs::write(&latin1, b"Gr\xFC\xDFe").unwrap();
+    std::fs::write(&utf8, "Grüße, 日本\n".repeat(500)).unwrap();
+    run_script(
+        &mut h,
+        "lob-load.db",
+        "create table lob_doc (id integer primary key, img blob, body text);\n\
+         insert into lob_doc values (1, X'CAFE', 'old');\n\
+         commit;\n",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "lob-load.db".into(),
+        text: "select id, img, body from lob_doc".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    // The menu takes a few frames to settle where it fits.
+    let menu = |h: &mut Harness<'_, DbCraftApp>, cell: &str| {
+        h.get_by_label(cell).click_secondary();
+        h.run_steps(4);
+    };
+    let choose = |h: &mut Harness<'_, DbCraftApp>, path: Option<&PathBuf>| {
+        let before = message_count(h);
+        let files = &mut h.state_mut().test_sql_window().state.value_files;
+        files.chosen.push_back(path.cloned());
+        before
+    };
+    let cafe = "0xCAFE · 2 bytes";
+    menu(&mut h, cafe);
+    assert!(h.query_by_label("Save to file…").is_some());
+    assert!(h.query_by_label("Load from file…").is_none(), "not edited");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    // Cancelled, the dialog leaves the cell as it was.
+    let before = choose(&mut h, None);
+    menu(&mut h, cafe);
+    h.get_by_label("Load from file…").click();
+    wait_until(&mut h, "the dialog", |app| {
+        app.test_sql_window_ref().is_some_and(|w| {
+            w.state.value_files.chosen.is_empty() && !w.state.value_files.is_busy()
+        })
+    });
+    assert_eq!(message_count(&mut h), before);
+    assert_eq!(
+        first_result(&mut h).grid.changes().map(|c| c.count()),
+        Some(0)
+    );
+    // Chosen, the file is the cell's change, shown by its size.
+    let before = choose(&mut h, Some(&image));
+    menu(&mut h, cafe);
+    h.get_by_label("Load from file…").click();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Loaded 6008 bytes from"), "{said}");
+    let loaded = "0x89504E470D0A1A0A… · 5.9 KB";
+    assert!(h.query_by_label(loaded).is_some());
+    // Undo takes it back, and it's loaded again.
+    menu(&mut h, loaded);
+    h.get_by_label("Undo").click();
+    h.run_steps(2);
+    assert!(h.query_by_label(cafe).is_some());
+    let before = choose(&mut h, Some(&image));
+    menu(&mut h, cafe);
+    h.get_by_label("Load from file…").click();
+    file_done(&mut h, before);
+
+    // The value editor loads a file too, as UTF-8 only.
+    menu(&mut h, "old");
+    h.get_by_label("Edit in dialog…").click();
+    h.run_steps(2);
+    let before = choose(&mut h, Some(&latin1));
+    h.get_by_label("Load from file…").click();
+    let said = file_done(&mut h, before);
+    assert!(said.contains("isn't UTF-8 text"), "{said}");
+    h.state_mut().test_sql_window().state.bottom = crate::sql_window::BottomTab::Result(0);
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("Edit body — row 1").is_some(),
+        "the editor stays"
+    );
+    let before = choose(&mut h, Some(&utf8));
+    h.get_by_label("Load from file…").click();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Loaded 8000 bytes"), "{said}");
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("Edit body — row 1").is_none(),
+        "the file replaced its text"
+    );
+    assert!(h.query_by_label("Grüße, 日本… · 7.8 KB").is_some());
+
+    // Applied, the values are the files'.
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    for (col, file) in [(1, &image), (2, &utf8)] {
+        let path = dir.join(format!("saved-{col}"));
+        let before = choose(&mut h, Some(&path));
+        let r = first_result(&mut h);
+        r.grid.request_save(&r.columns, &r.rows, (0, col));
+        let said = file_done(&mut h, before);
+        assert!(said.starts_with("Saved"), "{said}");
+        assert!(
+            std::fs::read(&path).unwrap() == std::fs::read(file).unwrap(),
+            "{col}"
+        );
+    }
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

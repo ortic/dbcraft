@@ -1,4 +1,4 @@
-# Releasing Pythia
+# Releasing DbCraft
 
 ## Cutting a release
 
@@ -6,7 +6,7 @@
    `cargo check` so `Cargo.lock` follows.
 2. Move the `[Unreleased]` entries in `CHANGELOG.md` under a new version
    heading with today's date and update the compare links at the bottom.
-3. Update `<releases>` in `assets/linux/com.ortic.pythia.metainfo.xml`.
+3. Update `<releases>` in `assets/linux/com.ortic.dbcraft.metainfo.xml`.
 4. Commit, then tag and push:
 
    ```sh
@@ -26,7 +26,7 @@ workflow*); without a tag it only uploads the packages as workflow artifacts.
 
 ## Website
 
-The website (<https://ortic.github.io/pythia/>) is built from `site/` by
+The website (<https://ortic.github.io/dbcraft/>) is built from `site/` by
 `site/build.py` and published on GitHub Pages by
 `.github/workflows/pages.yml`, when the site changes on master and when a
 release is published, edited or deleted. The build writes the newest
@@ -49,18 +49,18 @@ Locally: `python3 site/build.py` builds into `target/site`, and
 |---|---|---|
 | Linux | `.deb`, `.AppImage`, `.tar.gz` | |
 | Windows | `.msi` (WiX), `-setup.exe` (NSIS), `.zip` | per-machine install |
-| macOS | `.dmg` (containing `Pythia.app`), `.tar.gz` | minimum macOS 11 |
+| macOS | `.dmg` (containing `DbCraft.app`), `.tar.gz` | minimum macOS 11 |
 
-Build locally with `cargo packager --release -p pythia-app [-f deb]`; output
+Build locally with `cargo packager --release -p dbcraft-app [-f deb]`; output
 goes to `target/packages`.
 
 Every package comes in two flavors:
 
-- `pythia_…`, `pythia-v…-<platform>.zip/.tar.gz`: the pure-Rust driver (our
+- `dbcraft_…`, `dbcraft-v…-<platform>.zip/.tar.gz`: the pure-Rust driver (our
   fork of [rust-oracledb](https://github.com/ortic/rust-oracledb), pinned in
   `Cargo.toml`); needs no Oracle client libraries.
-- `pythia-instantclient_…`, `pythia-v…-<platform>-instantclient.zip/.tar.gz`:
-  built with `--features pythia-db/thick` (ODPI-C), for servers the pure-Rust
+- `dbcraft-instantclient_…`, `dbcraft-v…-<platform>-instantclient.zip/.tar.gz`:
+  built with `--features dbcraft-db/thick` (ODPI-C), for servers the pure-Rust
   driver can't reach (Native Network Encryption required, 11.2). It loads
   the Oracle Instant Client at run time, so the runners need none.
 
@@ -68,7 +68,7 @@ Both have the same identifier: installing one replaces the other. The
 workflow picks the flavor through `CARGO_ALIAS_PACKAGE_BUILD`, which
 overrides the `package-build` alias (`.cargo/config.toml`) that
 `beforePackagingCommand` runs; locally,
-`CARGO_ALIAS_PACKAGE_BUILD="build --release -p pythia-app --features pythia-db/thick" cargo packager --release -p pythia-app`
+`CARGO_ALIAS_PACKAGE_BUILD="build --release -p dbcraft-app --features dbcraft-db/thick" cargo packager --release -p dbcraft-app`
 packages the Instant Client flavor.
 
 ## Signing and notarization
@@ -90,7 +90,7 @@ passes them to cargo-packager:
 **Windows** (Authenticode): import the certificate into the runner's store
 in a step before packaging and set `certificateThumbprint`, `digestAlgorithm`
 (`sha256`) and `timestampUrl` under `[package.metadata.packager.windows]` in
-`crates/pythia-app/Cargo.toml`, or use `signCommand` with a cloud signing
+`crates/dbcraft-app/Cargo.toml`, or use `signCommand` with a cloud signing
 service (e.g. Azure Trusted Signing).
 
 **Linux**: packages are unsigned; `SHA256SUMS.txt` lets users verify

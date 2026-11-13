@@ -3,27 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pythia — Fast, Native Oracle PL/SQL IDE for Windows, macOS &amp; Linux</title>
-<meta name="description" content="Pythia is a free, open-source Oracle SQL and PL/SQL IDE written in Rust: completion from your schema, a debugger that sets itself up, result editing without locks, monitoring and AI with your own model. No Oracle client needed.">
+<title>DbCraft — Fast, Native Oracle PL/SQL IDE for Windows, macOS &amp; Linux</title>
+<meta name="description" content="DbCraft is a free, open-source Oracle SQL and PL/SQL IDE written in Rust: completion from your schema, a debugger that sets itself up, result editing without locks, monitoring and AI with your own model. No Oracle client needed.">
 <link rel="canonical" href="{{ base_url }}">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#2463b8">
 <meta property="og:type" content="website">
-<meta property="og:title" content="Pythia — a fast, native Oracle PL/SQL IDE">
+<meta property="og:title" content="DbCraft — a fast, native Oracle PL/SQL IDE">
 <meta property="og:description" content="Free and open source, for Windows, macOS and Linux. No Oracle client needed.">
 <meta property="og:url" content="{{ base_url }}">
 <meta property="og:image" content="{{ base_url }}screenshots/sql-window.png">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" href="icons/pythia.svg" type="image/svg+xml">
-<link rel="icon" href="icons/pythia-32.png" sizes="32x32" type="image/png">
-<link rel="apple-touch-icon" href="icons/pythia-256.png">
+<link rel="icon" href="icons/dbcraft.svg" type="image/svg+xml">
+<link rel="icon" href="icons/dbcraft-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="icons/dbcraft-256.png">
 <link rel="stylesheet" href="style.css">
 <script src="site.js" defer></script>
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
-  "name": "Pythia",
+  "name": "DbCraft",
   "description": "A fast, native Oracle SQL and PL/SQL IDE written in Rust.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Windows, macOS, Linux",
@@ -31,7 +31,7 @@
   "datePublished": "{{ date_iso }}",
   "downloadUrl": "{{ release_url }}",
   "image": "{{ base_url }}screenshots/sql-window.png",
-  "license": "https://github.com/ortic/pythia/blob/master/LICENSE-MIT",
+  "license": "https://github.com/ortic/dbcraft/blob/master/LICENSE-MIT",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
 }
 </script>
@@ -41,14 +41,14 @@
 
 <header class="top">
   <div class="wrap top-inner">
-    <a class="brand" href="#" aria-label="Pythia home">
-      <img src="icons/pythia.svg" alt="" width="28" height="28">
-      <span>Pythia</span>
+    <a class="brand" href="#" aria-label="DbCraft home">
+      <img src="icons/dbcraft.svg" alt="" width="28" height="28">
+      <span>DbCraft</span>
     </a>
     <nav aria-label="Main">
       <a href="#features">Features</a>
       <a href="#faq">FAQ</a>
-      <a href="https://github.com/ortic/pythia">GitHub</a>
+      <a href="https://github.com/ortic/dbcraft">GitHub</a>
       <a class="btn btn-primary btn-small" href="#download">Download</a>
     </nav>
   </div>
@@ -60,18 +60,18 @@
   <div class="wrap hero-text">
     <p class="eyebrow">Free &amp; open source · Oracle SQL and PL/SQL IDE</p>
     <h1>Oracle development, <span class="accent">at native speed.</span></h1>
-    <p class="lead">Pythia covers the daily work of an Oracle developer — writing and running SQL, editing and compiling PL/SQL, debugging, editing data, comparing schemas and watching what the database is doing — in one responsive, keyboard-first app for Windows, macOS and Linux.</p>
+    <p class="lead">DbCraft covers the daily work of an Oracle developer — writing and running SQL, editing and compiling PL/SQL, debugging, editing data, comparing schemas and watching what the database is doing — in one responsive, keyboard-first app for Windows, macOS and Linux.</p>
     <div class="actions">
       <a class="btn btn-primary btn-large" id="hero-download" href="#download"
          data-windows="{{ main_windows_x64_std }}" data-windows-size="{{ size_windows_x64 }}"
          data-mac-arm64="{{ main_mac_arm64_std }}" data-mac-arm64-size="{{ size_mac_arm64 }}"
          data-mac-x64="{{ main_mac_x64_std }}" data-mac-x64-size="{{ size_mac_x64 }}"
-         data-linux="{{ main_linux_x64_std }}" data-linux-size="{{ size_linux_x64 }}">Download Pythia</a>
+         data-linux="{{ main_linux_x64_std }}" data-linux-size="{{ size_linux_x64 }}">Download DbCraft</a>
       <a class="btn btn-secondary btn-large" href="#download">All platforms</a>
     </div>
     <p class="hero-note" id="hero-note" data-version="{{ version }}">Version {{ version }} · {{ date }} · Windows, macOS and Linux · no sign-up</p>
     <ul class="chips" aria-label="At a glance">
-      <li><a href="https://github.com/ortic/pythia">Open source on GitHub</a></li>
+      <li><a href="https://github.com/ortic/dbcraft">Open source on GitHub</a></li>
       <li>No Oracle client needed</li>
       <li>No Java, no Electron</li>
       <li>No telemetry</li>
@@ -80,7 +80,7 @@
   <div class="wrap">
     <figure class="hero-shot">
       <img src="screenshots/sql-window.png" width="2160" height="1350"
-           alt="Pythia's SQL window: the object browser with tables and packages on the left, a query with syntax highlighting, and its result grid below">
+           alt="DbCraft's SQL window: the object browser with tables and packages on the left, a query with syntax highlighting, and its result grid below">
     </figure>
   </div>
 </section>
@@ -186,7 +186,7 @@
     <ul class="checks">
       <li><strong>A session per window.</strong> Every window has its own session and transaction, and the status bar always shows what's pending.</li>
       <li><strong>Production in red.</strong> Production connections are marked red and ask before a commit. Connections can be read-only.</li>
-      <li><strong>Passwords in your keychain.</strong> Database passwords and API keys live in the system's keychain, never in Pythia's files.</li>
+      <li><strong>Passwords in your keychain.</strong> Database passwords and API keys live in the system's keychain, never in DbCraft's files.</li>
       <li><strong>No locks behind your back.</strong> Editing a result doesn't hold rows locked while you type; maintenance tasks ask first on production.</li>
       <li><strong>AI sees what you allow.</strong> Table definitions and plans go with a request; result rows and bind values only if you turn it on.</li>
       <li><strong>Nothing phones home.</strong> No telemetry, no account, no update checks — and no analytics on this site.</li>
@@ -203,14 +203,14 @@
     <ul class="highlights">
 {{ highlights }}
     </ul>
-    <p><a href="{{ release_url }}">Release notes for {{ version }}</a> · <a href="https://github.com/ortic/pythia/blob/master/CHANGELOG.md">All changes, version by version</a></p>
+    <p><a href="{{ release_url }}">Release notes for {{ version }}</a> · <a href="https://github.com/ortic/dbcraft/blob/master/CHANGELOG.md">All changes, version by version</a></p>
   </div>
 </section>
 <!-- /highlights -->
 
 <section id="download" class="section section-soft">
   <div class="wrap">
-    <h2>Download Pythia</h2>
+    <h2>Download DbCraft</h2>
     <p class="section-lead">Free for everyone. Version {{ version }}, released {{ date }}.</p>
 
     <input type="radio" name="flavor" id="flavor-std" class="flavor-radio" checked>
@@ -255,16 +255,16 @@
       </article>
     </div>
 
-    <p class="download-foot">Every file's SHA-256 is in <a href="{{ checksums_url }}">SHA256SUMS.txt</a>. Older versions are on the <a href="https://github.com/ortic/pythia/releases">releases page</a>. Prefer to build it yourself? <code>cargo build --release</code></p>
+    <p class="download-foot">Every file's SHA-256 is in <a href="{{ checksums_url }}">SHA256SUMS.txt</a>. Older versions are on the <a href="https://github.com/ortic/dbcraft/releases">releases page</a>. Prefer to build it yourself? <code>cargo build --release</code></p>
 
     <details class="first-launch">
-      <summary>First launch: “Windows protected your PC” or “Pythia can't be opened”?</summary>
+      <summary>First launch: “Windows protected your PC” or “DbCraft can't be opened”?</summary>
       <div>
-        <p>The packages aren't code-signed yet, so Windows and macOS ask once before they run Pythia.</p>
+        <p>The packages aren't code-signed yet, so Windows and macOS ask once before they run DbCraft.</p>
         <ul>
           <li><strong>Windows:</strong> click <em>More info</em>, then <em>Run anyway</em>.</li>
-          <li><strong>macOS:</strong> open Pythia once and close the message, then go to <em>System Settings → Privacy &amp; Security</em> and click <em>Open Anyway</em> next to Pythia. If macOS says the app is damaged, run <code>xattr -dr com.apple.quarantine /Applications/Pythia.app</code> in Terminal.</li>
-          <li><strong>Linux:</strong> make the AppImage executable first: <code>chmod +x pythia_*.AppImage</code>.</li>
+          <li><strong>macOS:</strong> open DbCraft once and close the message, then go to <em>System Settings → Privacy &amp; Security</em> and click <em>Open Anyway</em> next to DbCraft. If macOS says the app is damaged, run <code>xattr -dr com.apple.quarantine /Applications/DbCraft.app</code> in Terminal.</li>
+          <li><strong>Linux:</strong> make the AppImage executable first: <code>chmod +x dbcraft_*.AppImage</code>.</li>
         </ul>
       </div>
     </details>
@@ -275,11 +275,11 @@
   <div class="wrap callout">
     <div>
       <h2>Help make it better</h2>
-      <p>Pythia is young and moves fast. Found a bug, or missing something from the tool you used before? Tell us — every report is read.</p>
+      <p>DbCraft is young and moves fast. Found a bug, or missing something from the tool you used before? Tell us — every report is read.</p>
     </div>
     <div class="callout-actions">
-      <a class="btn btn-primary" href="https://github.com/ortic/pythia/issues/new">Report a problem</a>
-      <a class="btn btn-secondary" href="https://github.com/ortic/pythia/issues">See what's planned</a>
+      <a class="btn btn-primary" href="https://github.com/ortic/dbcraft/issues/new">Report a problem</a>
+      <a class="btn btn-secondary" href="https://github.com/ortic/dbcraft/issues">See what's planned</a>
     </div>
   </div>
 </section>
@@ -288,12 +288,12 @@
   <div class="wrap narrow">
     <h2>Questions</h2>
     <details>
-      <summary>Is Pythia free?</summary>
+      <summary>Is DbCraft free?</summary>
       <p>Yes, for personal and commercial use. It's open source under the MIT or Apache-2.0 license, with no account, license key or paid edition.</p>
     </details>
     <details>
       <summary>Do I need an Oracle client?</summary>
-      <p>No. Pythia talks to Oracle with a built-in driver written in Rust. Easy Connect strings (<code>host:port/service</code>) work as they are; for net service names, point <code>TNS_ADMIN</code> at the folder with your <code>tnsnames.ora</code>, and the one of an Oracle Client that's already installed is found the way Oracle finds it.</p>
+      <p>No. DbCraft talks to Oracle with a built-in driver written in Rust. Easy Connect strings (<code>host:port/service</code>) work as they are; for net service names, point <code>TNS_ADMIN</code> at the folder with your <code>tnsnames.ora</code>, and the one of an Oracle Client that's already installed is found the way Oracle finds it.</p>
     </details>
     <details id="faq-flavor">
       <summary>Which download should I take?</summary>
@@ -301,19 +301,19 @@
     </details>
     <details>
       <summary>Which Oracle versions does it work with?</summary>
-      <p>Pythia is developed against Oracle 23ai and tested against 18c and 21c; Oracle 11.2 works with the Instant Client download. A few features need a newer release: the profiler needs 18c, reading trace files through the database 12.2.</p>
+      <p>DbCraft is developed against Oracle 23ai and tested against 18c and 21c; Oracle 11.2 works with the Instant Client download. A few features need a newer release: the profiler needs 18c, reading trace files through the database 12.2.</p>
     </details>
     <details>
       <summary>What about MySQL, MariaDB, PostgreSQL and SQL Server?</summary>
       <p>They're experimental: SQL windows with results, explain plan and completion, the object browser, users and roles, sessions, monitoring dashboards and maintenance, also through an SSH tunnel. Their drivers are built in too. The tools that rest on PL/SQL and Oracle's dictionary — debugger, profiler, schema compare and others — stay on Oracle.</p>
     </details>
     <details>
-      <summary>Does Pythia send my data anywhere?</summary>
+      <summary>Does DbCraft send my data anywhere?</summary>
       <p>Only to your databases, and to the AI model you set up when you use the assistant. Requests carry table definitions, statistics, plans and source; result rows and bind values only if you allow it in <em>Settings → AI</em>, and each answer shows what was sent. There's no telemetry and no account.</p>
     </details>
     <details>
       <summary>Does it run under WSL?</summary>
-      <p>Yes, under WSLg. Pythia opens its window through X11 there; on a scaled display, size it with <em>Settings → UI scale</em> or Ctrl&nbsp;+ and Ctrl&nbsp;−.</p>
+      <p>Yes, under WSLg. DbCraft opens its window through X11 there; on a scaled display, size it with <em>Settings → UI scale</em> or Ctrl&nbsp;+ and Ctrl&nbsp;−.</p>
     </details>
   </div>
 </section>
@@ -323,8 +323,8 @@
     <h2>Try it on your own schema.</h2>
     <p>Free, open source, and ready in a minute — on Windows, macOS and Linux.</p>
     <div class="actions">
-      <a class="btn btn-light" href="#download">Download Pythia</a>
-      <a class="btn btn-ghost" href="https://github.com/ortic/pythia">Star it on GitHub</a>
+      <a class="btn btn-light" href="#download">Download DbCraft</a>
+      <a class="btn btn-ghost" href="https://github.com/ortic/dbcraft">Star it on GitHub</a>
     </div>
   </div>
 </section>
@@ -335,18 +335,18 @@
   <div class="wrap">
     <div class="foot-top">
       <a class="brand" href="#">
-        <img src="icons/pythia.svg" alt="" width="24" height="24">
-        <span>Pythia</span>
+        <img src="icons/dbcraft.svg" alt="" width="24" height="24">
+        <span>DbCraft</span>
       </a>
       <nav aria-label="Footer">
-        <a href="https://github.com/ortic/pythia">Source code</a>
-        <a href="https://github.com/ortic/pythia/releases">Releases</a>
-        <a href="https://github.com/ortic/pythia/blob/master/CHANGELOG.md">Changelog</a>
-        <a href="https://github.com/ortic/pythia/issues">Issues</a>
+        <a href="https://github.com/ortic/dbcraft">Source code</a>
+        <a href="https://github.com/ortic/dbcraft/releases">Releases</a>
+        <a href="https://github.com/ortic/dbcraft/blob/master/CHANGELOG.md">Changelog</a>
+        <a href="https://github.com/ortic/dbcraft/issues">Issues</a>
       </nav>
     </div>
-    <p>Free and open source (MIT or Apache-2.0). Made by <a href="https://github.com/ortic">Ortic</a> and the Pythia contributors.</p>
-    <p class="legal">Oracle, Java and MySQL are registered trademarks of Oracle and/or its affiliates. Other names may be trademarks of their respective owners. Pythia is an independent open-source project, not affiliated with or endorsed by Oracle or any other database vendor.</p>
+    <p>Free and open source (MIT or Apache-2.0). Made by <a href="https://github.com/ortic">Ortic</a> and the DbCraft contributors.</p>
+    <p class="legal">Oracle, Java and MySQL are registered trademarks of Oracle and/or its affiliates. Other names may be trademarks of their respective owners. DbCraft is an independent open-source project, not affiliated with or endorsed by Oracle or any other database vendor.</p>
   </div>
 </footer>
 </body>

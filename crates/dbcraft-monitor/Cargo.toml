@@ -1,0 +1,18 @@
+[package]
+name = "dbcraft-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui_extras.workspace = true
+egui_plot = "0.37"
+dbcraft-db.workspace = true
+dbcraft-ui.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+eframe.workspace = true
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+dbcraft-config.workspace = true

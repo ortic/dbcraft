@@ -1277,6 +1277,196 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
+name = "dbcraft-ai"
+version = "0.11.0"
+dependencies = [
+ "dbcraft-config",
+ "serde_json",
+ "thiserror 2.0.21",
+ "ureq",
+]
+
+[[package]]
+name = "dbcraft-app"
+version = "0.11.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "csv",
+ "dbcraft-ai",
+ "dbcraft-compare",
+ "dbcraft-config",
+ "dbcraft-data",
+ "dbcraft-db",
+ "dbcraft-debugger",
+ "dbcraft-lsp-core",
+ "dbcraft-monitor",
+ "dbcraft-plsql",
+ "dbcraft-ui",
+ "eframe",
+ "egui",
+ "egui_dock",
+ "egui_extras",
+ "egui_kittest",
+ "egui_plot",
+ "embed-resource",
+ "keyring",
+ "regex",
+ "rfd",
+ "ron",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "skrifa",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
+]
+
+[[package]]
+name = "dbcraft-compare"
+version = "0.11.0"
+dependencies = [
+ "dbcraft-data",
+ "dbcraft-db",
+ "dbcraft-plsql",
+ "dbcraft-ui",
+ "egui",
+ "egui_extras",
+ "egui_kittest",
+ "similar",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "dbcraft-config"
+version = "0.11.0"
+dependencies = [
+ "anyhow",
+ "dbcraft-plsql",
+ "directories",
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "dbcraft-data"
+version = "0.11.0"
+dependencies = [
+ "calamine",
+ "chrono",
+ "csv",
+ "dbcraft-db",
+ "rust_xlsxwriter",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "dbcraft-db"
+version = "0.11.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "dbcraft-config",
+ "dbcraft-plsql",
+ "futures-util",
+ "mysql",
+ "mysql_common",
+ "oracle",
+ "oracledb",
+ "rusqlite",
+ "russh",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tiberius",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-util",
+ "tracing",
+ "webpki-roots",
+]
+
+[[package]]
+name = "dbcraft-debugger"
+version = "0.11.0"
+dependencies = [
+ "dbcraft-db",
+ "dbcraft-plsql",
+ "dbcraft-ui",
+ "egui",
+ "egui_extras",
+ "egui_kittest",
+ "serde",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dbcraft-lsp-core"
+version = "0.11.0"
+dependencies = [
+ "dbcraft-plsql",
+ "insta",
+]
+
+[[package]]
+name = "dbcraft-monitor"
+version = "0.11.0"
+dependencies = [
+ "dbcraft-config",
+ "dbcraft-db",
+ "dbcraft-ui",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "egui_kittest",
+ "egui_plot",
+ "tracing",
+]
+
+[[package]]
+name = "dbcraft-plsql"
+version = "0.11.0"
+dependencies = [
+ "insta",
+ "logos",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dbcraft-ui"
+version = "0.11.0"
+dependencies = [
+ "dbcraft-data",
+ "dbcraft-db",
+ "dbcraft-lsp-core",
+ "dbcraft-plsql",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "image",
+ "jiff",
+ "regex",
+ "resvg",
+ "ropey",
+ "serde",
+ "serde_json",
+ "tiny-skia",
+]
+
+[[package]]
 name = "debug_unsafe"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4587,196 +4777,6 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
-
-[[package]]
-name = "pythia-ai"
-version = "0.11.0"
-dependencies = [
- "pythia-config",
- "serde_json",
- "thiserror 2.0.21",
- "ureq",
-]
-
-[[package]]
-name = "pythia-app"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "chrono",
- "csv",
- "eframe",
- "egui",
- "egui_dock",
- "egui_extras",
- "egui_kittest",
- "egui_plot",
- "embed-resource",
- "keyring",
- "pythia-ai",
- "pythia-compare",
- "pythia-config",
- "pythia-data",
- "pythia-db",
- "pythia-debugger",
- "pythia-lsp-core",
- "pythia-monitor",
- "pythia-plsql",
- "pythia-ui",
- "regex",
- "rfd",
- "ron",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "skrifa",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "winit",
-]
-
-[[package]]
-name = "pythia-compare"
-version = "0.11.0"
-dependencies = [
- "egui",
- "egui_extras",
- "egui_kittest",
- "pythia-data",
- "pythia-db",
- "pythia-plsql",
- "pythia-ui",
- "similar",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "pythia-config"
-version = "0.11.0"
-dependencies = [
- "anyhow",
- "directories",
- "pythia-plsql",
- "serde",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "pythia-data"
-version = "0.11.0"
-dependencies = [
- "calamine",
- "chrono",
- "csv",
- "pythia-db",
- "rust_xlsxwriter",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "pythia-db"
-version = "0.11.0"
-dependencies = [
- "chrono",
- "chrono-tz",
- "futures-util",
- "mysql",
- "mysql_common",
- "oracle",
- "oracledb",
- "pythia-config",
- "pythia-plsql",
- "rusqlite",
- "russh",
- "rustls",
- "rustls-native-certs",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tiberius",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tokio-util",
- "tracing",
- "webpki-roots",
-]
-
-[[package]]
-name = "pythia-debugger"
-version = "0.11.0"
-dependencies = [
- "egui",
- "egui_extras",
- "egui_kittest",
- "pythia-db",
- "pythia-plsql",
- "pythia-ui",
- "serde",
- "thiserror 2.0.21",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "pythia-lsp-core"
-version = "0.11.0"
-dependencies = [
- "insta",
- "pythia-plsql",
-]
-
-[[package]]
-name = "pythia-monitor"
-version = "0.11.0"
-dependencies = [
- "eframe",
- "egui",
- "egui_extras",
- "egui_kittest",
- "egui_plot",
- "pythia-config",
- "pythia-db",
- "pythia-ui",
- "tracing",
-]
-
-[[package]]
-name = "pythia-plsql"
-version = "0.11.0"
-dependencies = [
- "insta",
- "logos",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pythia-ui"
-version = "0.11.0"
-dependencies = [
- "eframe",
- "egui",
- "egui_extras",
- "image",
- "jiff",
- "pythia-data",
- "pythia-db",
- "pythia-lsp-core",
- "pythia-plsql",
- "regex",
- "resvg",
- "ropey",
- "serde",
- "serde_json",
- "tiny-skia",
-]
 
 [[package]]
 name = "quick-error"

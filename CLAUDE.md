@@ -1,10 +1,10 @@
-# Pythia
+# DbCraft
 
 ## Releases
 
 A release is a commit and a tag on master. `.github/workflows/release.yml`
 builds the packages for the tag and leaves a **draft** release whose body is
-only GitHub's generated "Full Changelog" link: Pythia has no pull requests
+only GitHub's generated "Full Changelog" link: DbCraft has no pull requests
 for it to list. The release isn't done until its body says what changed.
 Never publish the generated body alone.
 
@@ -15,9 +15,9 @@ Never publish the generated body alone.
      and the compare links at the bottom (`[Unreleased]` from `vX.Y.Z`, a
      new `[X.Y.Z]` line);
    - `<release version="X.Y.Z" date="YYYY-MM-DD"/>` first among the
-     releases in `assets/linux/com.ortic.pythia.metainfo.xml`.
+     releases in `assets/linux/com.ortic.dbcraft.metainfo.xml`.
 2. Fast-forward master to it, push master, then
-   `git tag -a vX.Y.Z -m "Pythia X.Y.Z"` and push the tag.
+   `git tag -a vX.Y.Z -m "DbCraft X.Y.Z"` and push the tag.
 3. While the workflow runs (about 25 minutes, `gh run watch <id>`), write
    the release notes from the version's CHANGELOG section:
    - `## Highlights`: the most important changes, a bold lead each, with
@@ -26,7 +26,7 @@ Never publish the generated body alone.
      with a bold lead. When Fixed runs to dozens of entries, group them by
      area under bold headings, one line per fix with its issue numbers,
      and link `CHANGELOG.md` at the tag for the details;
-   - last, `**Full Changelog**: https://github.com/ortic/pythia/compare/vPREV...vX.Y.Z`.
+   - last, `**Full Changelog**: https://github.com/ortic/dbcraft/compare/vPREV...vX.Y.Z`.
 
    Every issue number of the CHANGELOG section appears in the notes:
    compare `grep -o '#[0-9]*'` of both. v0.10.0 (short) and v0.11.0

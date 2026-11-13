@@ -1,0 +1,34 @@
+// Windows resources of dbcraft.exe (#77). eframe sets the window icon at
+// runtime, but Explorer, the shortcuts the installers create and the taskbar
+// take the icon from the exe. The version strings show in the exe's
+// properties, Task Manager and "Open with". build.rs passes the DBCRAFT_VERSION
+// macros. No #include, so every resource compiler takes it as is.
+#pragma code_page(65001)
+
+1 ICON "../../assets/icon/dbcraft.ico"
+
+1 VERSIONINFO
+FILEVERSION DBCRAFT_VERSION_MAJOR, DBCRAFT_VERSION_MINOR, DBCRAFT_VERSION_PATCH, 0
+PRODUCTVERSION DBCRAFT_VERSION_MAJOR, DBCRAFT_VERSION_MINOR, DBCRAFT_VERSION_PATCH, 0
+FILEOS 0x40004 // VOS_NT_WINDOWS32
+FILETYPE 0x1 // VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0" // U.S. English, Unicode
+        BEGIN
+            VALUE "CompanyName", "Remo Laubacher"
+            VALUE "FileDescription", "DbCraft"
+            VALUE "FileVersion", DBCRAFT_VERSION
+            VALUE "InternalName", "dbcraft"
+            VALUE "LegalCopyright", "Copyright © 2026 Remo Laubacher"
+            VALUE "OriginalFilename", "dbcraft.exe"
+            VALUE "ProductName", "DbCraft"
+            VALUE "ProductVersion", DBCRAFT_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
