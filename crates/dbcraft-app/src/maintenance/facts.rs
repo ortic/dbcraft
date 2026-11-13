@@ -844,6 +844,13 @@ mod tests {
                    for values from (50) to (100)",
                 "create table fd_parted_high partition of fd_parted for values from (100) to (200)",
                 "insert into fd_parted select generate_series(0, 149)",
+                // The insert's counts are flushed at most once a second:
+                // after ANALYZE set the rows, they were added again (#494).
+                "do $$ begin \
+                   if current_setting('server_version_num')::int >= 150000 then \
+                     perform pg_stat_force_next_flush(); \
+                   end if; \
+                 end $$",
                 "analyze fd_parted",
             ] {
                 c.execute(sql).unwrap();
