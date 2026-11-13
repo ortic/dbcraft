@@ -135,12 +135,6 @@ and the project uses [Semantic Versioning](https://semver.org/).
   command, roles, `using` and `with check`, restrictive or not. Run
   elsewhere, the copy had neither, so every role that could read it read
   every row, and rows no policy let through could be written to it.
-- PostgreSQL: a table's DDL keeps its row level security (#373): `alter
-  table … enable row level security` and `force row level security`
-  where they are on, and a `create policy` for each policy, with its
-  command, roles, `using` and `with check`, restrictive or not. Run
-  elsewhere, the copy had neither, so every role that could read it read
-  every row, and rows no policy let through could be written to it.
 - PostgreSQL: a table's DDL gives each column its collation where it
   isn't its type's (#375), `code text collate "C"`, with its schema
   where it isn't `pg_catalog`. Run elsewhere, the copy's columns took
@@ -152,64 +146,10 @@ and the project uses [Semantic Versioning](https://semver.org/).
   `sys.all_objects`: the result failed with "Protocol error: nvarchar:
   invalid UTF-16 sequence", and the connection was opened again, which
   rolled back the transaction.
-- SQL Server: an `nvarchar`, `nchar` or `ntext` value that isn't valid
-  UTF-16 reads with U+FFFD in its place (#371). SQL Server doesn't check
-  them, as in the names of incremental statistics' objects in
-  `sys.all_objects`: the result failed with "Protocol error: nvarchar:
-  invalid UTF-16 sequence", and the connection was opened again, which
-  rolled back the transaction.
 - SQL Server: a table's DDL and *Columns* name a user-defined type, an
   alias or a CLR type, with its schema (#372), `[app].[ssn]`. By its name
   alone, the DDL failed with Msg 2715 where the session's default schema
   isn't the type's.
-- The program window finds a package's quoted subprograms by their
-  names (#359). *Edit "MyProc"* opened the package at the top, saying
-  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
-  program window called `"""MYPROC"""` without its parameters, so the
-  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
-  were one subprogram: overloads of each other for *Test…*, and *Go to
-  body* went from one to the other; `"PLAIN"` in the spec wasn't
-  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
-  too, also took the parameters of a `"myproc"`.
-- The program window finds a package's quoted subprograms by their
-  names (#359). *Edit "MyProc"* opened the package at the top, saying
-  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
-  program window called `"""MYPROC"""` without its parameters, so the
-  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
-  were one subprogram: overloads of each other for *Test…*, and *Go to
-  body* went from one to the other; `"PLAIN"` in the spec wasn't
-  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
-  too, also took the parameters of a `"myproc"`.
-- Forms keep the case of a name they pick or read (#365). The column
-  `"Mixed"` picked for a trigger's *Update of* read `"mixed"`, and the
-  trigger failed with ORA-00904; a job's list of procedures offered
-  `"MyPkg"."Run"` as `mypkg.run`, which the job ran as `MYPKG.RUN`; an
-  index's tablespace `"my_ts"`, picked or read by *Edit*, became `MY_TS`;
-  and *Edit* of a database link made again with its user `"hr_ro"` used
-  `HR_RO`.
-- The program window finds a package's quoted subprograms by their
-  names (#359). *Edit "MyProc"* opened the package at the top, saying
-  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
-  program window called `"""MYPROC"""` without its parameters, so the
-  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
-  were one subprogram: overloads of each other for *Test…*, and *Go to
-  body* went from one to the other; `"PLAIN"` in the spec wasn't
-  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
-  too, also took the parameters of a `"myproc"`.
-- Forms keep the case of a name they pick or read (#365). The column
-  `"Mixed"` picked for a trigger's *Update of* read `"mixed"`, and the
-  trigger failed with ORA-00904; a job's list of procedures offered
-  `"MyPkg"."Run"` as `mypkg.run`, which the job ran as `MYPKG.RUN`; an
-  index's tablespace `"my_ts"`, picked or read by *Edit*, became `MY_TS`;
-  and *Edit* of a database link made again with its user `"hr_ro"` used
-  `HR_RO`.
-- Oracle: DESCRIBE, *Compare data* and *Import* take a quoted name as
-  written (#369). `desc "MyTable"` described nothing, as it compared
-  `"MYTABLE"` with its quotes; a data compare of the table `"my_table"`
-  or with the key `"Id"` failed with ORA-01741; and Import into
-  `"My.Table"`, a dot in its quotes, failed with ORA-00922. Names
-  without quotes are still read in uppercase, and `owner.table` is split
-  at the dots outside quotes only.
 - The program window finds a package's quoted subprograms by their
   names (#359). *Edit "MyProc"* opened the package at the top, saying
   `"MyProc" not found`, and *Test…* and *Debug…* of it from the
@@ -238,15 +178,6 @@ and the project uses [Semantic Versioning](https://semver.org/).
   `café` doesn't name, and didn't map it to an existing table's `CAFÉ`;
   a *Schema* or *Default schema* typed `straße` named `STRASSE`, where
   Oracle reads `STRAßE`.
-- Oracle: a query with PL/SQL declarations, `with function f … end;
-  select f from dual`, runs as one statement (#358), also in an INSERT,
-  a view and an UPDATE's or DELETE's subquery (`/*+ with_plsql */`).
-  The script ended it at the first `;` inside the function, which failed
-  with ORA-02000, and ran the rest on its own. It ends at the `;` after
-  the query, or at `/` on a line of its own as in SQL*Plus; declarations
-  still open at the end of the script, as while they are typed, end at
-  that first `;` as before, so the statements after them stay apart.
-  Format Code keeps such a query as written.
 - Oracle: a query with PL/SQL declarations, `with function f … end;
   select f from dual`, runs as one statement (#358), also in an INSERT,
   a view and an UPDATE's or DELETE's subquery (`/*+ with_plsql */`).
