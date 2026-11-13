@@ -1,0 +1,19 @@
+[package]
+name = "dbcraft-debugger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui_extras.workspace = true
+dbcraft-db.workspace = true
+dbcraft-plsql.workspace = true
+dbcraft-ui.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+tracing-subscriber.workspace = true

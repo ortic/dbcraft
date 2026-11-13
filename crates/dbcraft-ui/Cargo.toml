@@ -1,0 +1,25 @@
+[package]
+name = "dbcraft-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui_extras = { workspace = true, features = ["svg", "image", "datepicker", "serde"] }
+# The formats the value viewer shows images of (egui_extras decodes them).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+jiff = { version = "0.2.35", default-features = false, features = ["std"] }
+dbcraft-data.workspace = true
+dbcraft-db.workspace = true
+dbcraft-lsp-core.workspace = true
+dbcraft-plsql.workspace = true
+regex.workspace = true
+ropey.workspace = true
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+eframe.workspace = true
+resvg = { version = "0.45", default-features = false }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "png-format"] }

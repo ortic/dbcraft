@@ -2,8 +2,8 @@
 FROM docker.io/library/alpine:3.22
 RUN apk add --no-cache openssh-server \
  && ssh-keygen -A \
- && adduser -D -s /bin/sh pythia \
- && echo pythia:pythia | chpasswd \
+ && adduser -D -s /bin/sh dbcraft \
+ && echo dbcraft:dbcraft | chpasswd \
  && sed -i \
       -e 's/^#\?AllowTcpForwarding .*/AllowTcpForwarding yes/' \
       -e 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' \

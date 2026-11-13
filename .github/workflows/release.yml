@@ -3,7 +3,7 @@ name: Release
 # Builds packages for every platform and publishes them as a GitHub release
 # when a version tag is pushed. Each platform comes in two flavors: the
 # pure-Rust driver (no Oracle client needed) and `-instantclient`, built with
-# `pythia-db/thick` for servers the pure-Rust driver can't reach (Native
+# `dbcraft-db/thick` for servers the pure-Rust driver can't reach (Native
 # Network Encryption required, 11.2). ODPI-C loads the Instant Client at run
 # time, so building needs no client.
 #
@@ -47,9 +47,9 @@ jobs:
             formats: app,dmg
         flavor:
           - suffix: ""
-            build: build --release -p pythia-app
+            build: build --release -p dbcraft-app
           - suffix: -instantclient
-            build: build --release -p pythia-app --features pythia-db/thick
+            build: build --release -p dbcraft-app --features dbcraft-db/thick
     runs-on: ${{ matrix.platform.os }}
     env:
       # The build behind beforePackagingCommand (`cargo package-build`).
@@ -78,7 +78,7 @@ jobs:
       - name: Build packages
         shell: bash
         run: |
-          cargo packager --release -p pythia-app \
+          cargo packager --release -p dbcraft-app \
             --target ${{ matrix.platform.target }} \
             --formats ${{ matrix.platform.formats }} \
             --out-dir "${{ github.workspace }}/dist"
@@ -91,7 +91,7 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
-      # pythia_0.4.0_amd64.deb -> pythia-instantclient_0.4.0_amd64.deb, so
+      # dbcraft_0.4.0_amd64.deb -> dbcraft-instantclient_0.4.0_amd64.deb, so
       # both flavors fit in one release.
       - name: Name the flavor's packages
         if: matrix.flavor.suffix != ''
@@ -107,14 +107,14 @@ jobs:
       - name: Plain binary archive
         shell: bash
         run: |
-          bin=pythia
-          [ "${{ runner.os }}" = "Windows" ] && bin=pythia.exe
+          bin=dbcraft
+          [ "${{ runner.os }}" = "Windows" ] && bin=dbcraft.exe
           mkdir -p dist/archive
           # beforePackagingCommand builds for the runner's own target.
           cp "target/release/$bin" README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE dist/archive/
           cd dist/archive
           # A branch run by hand (feat/x) has a slash in its name.
-          name="pythia-${GITHUB_REF_NAME//\//-}-${{ matrix.platform.name }}${{ matrix.flavor.suffix }}"
+          name="dbcraft-${GITHUB_REF_NAME//\//-}-${{ matrix.platform.name }}${{ matrix.flavor.suffix }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a "../$name.zip" .
           else
@@ -123,7 +123,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pythia-${{ matrix.platform.name }}${{ matrix.flavor.suffix }}
+          name: dbcraft-${{ matrix.platform.name }}${{ matrix.flavor.suffix }}
           path: |
             dist/*.deb
             dist/*.AppImage

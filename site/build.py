@@ -25,7 +25,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-REPO = "ortic/pythia"
+REPO = "ortic/dbcraft"
 ROOT = Path(__file__).resolve().parent.parent
 SITE = ROOT / "site"
 
@@ -34,16 +34,16 @@ SITE = ROOT / "site"
 # them apart. The page's links follow this order; `main` marks the file the
 # big button offers on that system.
 KINDS = [
-    ("windows", r"pythia{ic}_[^_]+_x64-setup\.exe", "Installer (.exe)", "x64"),
-    ("windows", r"pythia{ic}_[^_]+_x64_en-US\.msi", "Installer (.msi)", None),
-    ("windows", r"pythia-v[^-]+-windows-x86_64{ic}\.zip", "Portable (.zip)", None),
-    ("mac", r"Pythia{ic}_[^_]+_aarch64\.dmg", "Apple silicon (.dmg)", "arm64"),
-    ("mac", r"Pythia{ic}_[^_]+_x64\.dmg", "Intel (.dmg)", "x64"),
-    ("mac", r"pythia-v[^-]+-macos-aarch64{ic}\.tar\.gz", "Apple silicon, plain binary (.tar.gz)", None),
-    ("mac", r"pythia-v[^-]+-macos-x86_64{ic}\.tar\.gz", "Intel, plain binary (.tar.gz)", None),
-    ("linux", r"pythia{ic}_[^_]+_x86_64\.AppImage", "AppImage, any distribution", "x64"),
-    ("linux", r"pythia{ic}_[^_]+_amd64\.deb", "Debian / Ubuntu (.deb)", None),
-    ("linux", r"pythia-v[^-]+-linux-x86_64{ic}\.tar\.gz", "Plain binary (.tar.gz)", None),
+    ("windows", r"dbcraft{ic}_[^_]+_x64-setup\.exe", "Installer (.exe)", "x64"),
+    ("windows", r"dbcraft{ic}_[^_]+_x64_en-US\.msi", "Installer (.msi)", None),
+    ("windows", r"dbcraft-v[^-]+-windows-x86_64{ic}\.zip", "Portable (.zip)", None),
+    ("mac", r"DbCraft{ic}_[^_]+_aarch64\.dmg", "Apple silicon (.dmg)", "arm64"),
+    ("mac", r"DbCraft{ic}_[^_]+_x64\.dmg", "Intel (.dmg)", "x64"),
+    ("mac", r"dbcraft-v[^-]+-macos-aarch64{ic}\.tar\.gz", "Apple silicon, plain binary (.tar.gz)", None),
+    ("mac", r"dbcraft-v[^-]+-macos-x86_64{ic}\.tar\.gz", "Intel, plain binary (.tar.gz)", None),
+    ("linux", r"dbcraft{ic}_[^_]+_x86_64\.AppImage", "AppImage, any distribution", "x64"),
+    ("linux", r"dbcraft{ic}_[^_]+_amd64\.deb", "Debian / Ubuntu (.deb)", None),
+    ("linux", r"dbcraft-v[^-]+-linux-x86_64{ic}\.tar\.gz", "Plain binary (.tar.gz)", None),
 ]
 FLAVORS = {"std": "", "ic": "-instantclient"}
 CHECKSUMS = "SHA256SUMS.txt"
@@ -52,7 +52,7 @@ CHECKSUMS = "SHA256SUMS.txt"
 def fetch_latest():
     req = urllib.request.Request(
         f"https://api.github.com/repos/{REPO}/releases/latest",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "pythia-site-build"},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "dbcraft-site-build"},
     )
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token:
@@ -181,7 +181,7 @@ def render(release, base_url):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=ROOT / "target" / "site")
-    parser.add_argument("--base-url", default="https://ortic.github.io/pythia/",
+    parser.add_argument("--base-url", default="https://ortic.github.io/dbcraft/",
                         help="where the site is published, for its canonical and preview links")
     parser.add_argument("--release-json", type=Path, help="the release's API JSON instead of asking GitHub")
     args = parser.parse_args()
@@ -202,7 +202,7 @@ def main():
         shutil.copy2(ROOT / "docs" / "screenshots" / name, shots / name)
     icons = out / "icons"
     icons.mkdir()
-    for name in ("pythia.svg", "pythia-32.png", "pythia-256.png", "pythia-512.png"):
+    for name in ("dbcraft.svg", "dbcraft-32.png", "dbcraft-256.png", "dbcraft-512.png"):
         shutil.copy2(ROOT / "assets" / "icon" / name, icons / name)
     print(f"{release['tag_name']}: {out / 'index.html'}")
 

@@ -3,7 +3,7 @@
 # releases).
 #
 # Two jobs side by side, each on a runner and a database of its own (#140):
-# pythia-app's tests, the longest, and the rest. On one runner the test
+# dbcraft-app's tests, the longest, and the rest. On one runner the test
 # binaries run one after the other, and the four cores also serve the
 # database. Within a job they can't run in parallel: the tests share the
 # test schema and serialize on in-process locks.
@@ -32,18 +32,18 @@ jobs:
       fail-fast: false
       matrix:
         part:
-          - name: pythia-app
-            packages: -p pythia-app
+          - name: dbcraft-app
+            packages: -p dbcraft-app
           - name: others
-            packages: --workspace --exclude pythia-app
+            packages: --workspace --exclude dbcraft-app
     runs-on: ubuntu-latest
     services:
       oracle:
         image: ${{ inputs.image }}
         env:
           ORACLE_PASSWORD: oracle
-          APP_USER: pythia
-          APP_USER_PASSWORD: pythia
+          APP_USER: dbcraft
+          APP_USER_PASSWORD: dbcraft
         ports:
           - 1521:1521
         options: >-
@@ -52,8 +52,8 @@ jobs:
           --health-timeout 5s
           --health-retries 60
     env:
-      PYTHIA_TEST_DB: pythia/pythia@localhost:1521/${{ inputs.service }}
-      PYTHIA_TEST_DB_DBA: system/oracle@localhost:1521/${{ inputs.service }}
+      DBCRAFT_TEST_DB: dbcraft/dbcraft@localhost:1521/${{ inputs.service }}
+      DBCRAFT_TEST_DB_DBA: system/oracle@localhost:1521/${{ inputs.service }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -67,5 +67,5 @@ jobs:
       - name: Address the database reaches this machine at
         run: |
           gateway=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' ${{ job.services.oracle.id }})
-          echo "PYTHIA_DEBUG_HOST=$gateway" >> "$GITHUB_ENV"
+          echo "DBCRAFT_DEBUG_HOST=$gateway" >> "$GITHUB_ENV"
       - run: cargo test ${{ matrix.part.packages }} --no-fail-fast

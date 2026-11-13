@@ -1,0 +1,19 @@
+[package]
+name = "dbcraft-compare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui_extras.workspace = true
+dbcraft-data.workspace = true
+dbcraft-db.workspace = true
+dbcraft-plsql.workspace = true
+dbcraft-ui.workspace = true
+similar = { version = "2", features = ["inline"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+

@@ -22,7 +22,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # The Instant Client flavor (ODPI-C) of the release must keep
       # compiling; it needs no client libraries to build.
-      - run: cargo clippy --workspace --all-targets --features pythia-db/thick -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features dbcraft-db/thick -- -D warnings
 
   test:
     strategy:
@@ -36,9 +36,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
       # Database, debugger and screenshot tests skip themselves unless
-      # PYTHIA_TEST_DB / PYTHIA_TEST_DB_DBA / PYTHIA_SCREENSHOT_DIR are set
+      # DBCRAFT_TEST_DB / DBCRAFT_TEST_DB_DBA / DBCRAFT_SCREENSHOT_DIR are set
       # (the db job sets the first two). No GPU is needed without
-      # PYTHIA_SCREENSHOT_DIR. --no-fail-fast: a failing crate doesn't hide
+      # DBCRAFT_SCREENSHOT_DIR. --no-fail-fast: a failing crate doesn't hide
       # the other crates' results.
       - run: cargo test --workspace --no-fail-fast
 

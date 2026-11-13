@@ -1,4 +1,4 @@
-# Weekly: the test suite against the older releases Pythia supports (CI
+# Weekly: the test suite against the older releases DbCraft supports (CI
 # covers 23ai on every push).
 name: Database versions
 

@@ -1,4 +1,4 @@
-# Pythia – Oracle PL/SQL IDE in Rust
+# DbCraft – Oracle PL/SQL IDE in Rust
 
 A native, fast, cross-platform alternative to Allround Automations' PL/SQL Developer,
 written in Rust with `egui` on the `wgpu` renderer.
@@ -47,23 +47,23 @@ written in Rust with `egui` on the `wgpu` renderer.
 ## 3. Architecture
 
 ```
-pythia/
+dbcraft/
 ├── crates/
-│   ├── pythia-app          # eframe entry point, docking layout, documents, commands, dialogs, code and data search
-│   ├── pythia-ui           # reusable widgets: code editor, data grid, icon set
-│   ├── pythia-db           # connection mgmt, sessions, query execution, metadata queries
-│   ├── pythia-plsql        # lexer, parser, AST, symbol tables, formatter
-│   ├── pythia-lsp-core     # completion, hover, go-to-definition, diagnostics (no UI)
-│   ├── pythia-debugger     # DBMS_DEBUG_JDWP client, debug session state machine, panel
-│   ├── pythia-data         # import/export
-│   ├── pythia-compare      # schema/DDL and data compare, sync script generation
-│   ├── pythia-monitor      # dashboard, sessions, AWR/ASH, trace analyzer
-│   ├── pythia-ai           # AI backends, prompts, data policy
-│   └── pythia-config       # settings, profiles, keybindings, themes
+│   ├── dbcraft-app          # eframe entry point, docking layout, documents, commands, dialogs, code and data search
+│   ├── dbcraft-ui           # reusable widgets: code editor, data grid, icon set
+│   ├── dbcraft-db           # connection mgmt, sessions, query execution, metadata queries
+│   ├── dbcraft-plsql        # lexer, parser, AST, symbol tables, formatter
+│   ├── dbcraft-lsp-core     # completion, hover, go-to-definition, diagnostics (no UI)
+│   ├── dbcraft-debugger     # DBMS_DEBUG_JDWP client, debug session state machine, panel
+│   ├── dbcraft-data         # import/export
+│   ├── dbcraft-compare      # schema/DDL and data compare, sync script generation
+│   ├── dbcraft-monitor      # dashboard, sessions, AWR/ASH, trace analyzer
+│   ├── dbcraft-ai           # AI backends, prompts, data policy
+│   └── dbcraft-config       # settings, profiles, keybindings, themes
 ```
 
 Integration tests against an Oracle Free container live with the crates
-(`crates/*/tests`, and modules' own tests); they skip without `PYTHIA_TEST_DB`.
+(`crates/*/tests`, and modules' own tests); they skip without `DBCRAFT_TEST_DB`.
 
 ### Core principles
 
@@ -122,7 +122,7 @@ Integration tests against an Oracle Free container live with the crates
 - [x] Multiple simultaneous connections
 - [ ] Session modes: multi-session / dual-session / single-session (multi-session only)
 - [x] Connection health check, auto-reconnect prompt (lost sessions are detected on errors and replaced on the next statement; no periodic ping or prompt)
-- [x] Set NLS settings, `CURRENT_SCHEMA`, module/action/client info on connect (`CURRENT_SCHEMA` per connection, NLS via the login script, module set to `pythia`; no action/client info)
+- [x] Set NLS settings, `CURRENT_SCHEMA`, module/action/client info on connect (`CURRENT_SCHEMA` per connection, NLS via the login script, module set to `dbcraft`; no action/client info)
 - [x] Login script per connection (like `login.sql`)
 - [x] Detect Instant Client and give a helpful message if it's missing
 
@@ -430,7 +430,7 @@ Custom widget, because egui's `TextEdit` doesn't scale to large files or IDE fea
 ## 7. Risks & Open Questions
 
 - [x] **Debugger protocol**: `DBMS_DEBUG` is deprecated, `DBMS_DEBUG_JDWP` needs a JDWP client implementation and network ACLs. Spike both early (before M6) to check feasibility
-- [ ] **Instant Client dependency**: `oracle` crate needs ODPI-C + Instant Client. Is a pure-Rust thin driver (TNS protocol) worth it long-term? (spiked: `--features pythia-db/thin` runs on the pure-Rust `oracledb` crate; no cancel, external authentication or proxy yet)
+- [ ] **Instant Client dependency**: `oracle` crate needs ODPI-C + Instant Client. Is a pure-Rust thin driver (TNS protocol) worth it long-term? (spiked: `--features dbcraft-db/thin` runs on the pure-Rust `oracledb` crate; no cancel, external authentication or proxy yet)
 - [x] **Editor widget effort**: a custom high-quality code editor in egui is a big task. Evaluate existing crates (`egui_code_editor`, `egui-textedit` extensions) vs building our own
 - [x] **PL/SQL grammar coverage**: the grammar is huge; aim for a "good enough" error-tolerant parser for outline, completion, and navigation rather than a full validating parser
 - [ ] **egui text rendering**: check font fallback, CJK, and subpixel quality on all platforms

@@ -1,10 +1,13 @@
-# Pythia
+# DbCraft
 
 A fast, native Oracle PL/SQL IDE written in Rust (egui on wgpu). It covers the
 daily work of an Oracle developer — writing and running SQL, editing and
 compiling PL/SQL, debugging, browsing, editing data, comparing schemas and
 watching what the database is doing — in one responsive, keyboard-first app
 for Linux, Windows and macOS.
+
+DbCraft was called Pythia up to version 0.11.0. On first start it takes over
+Pythia's settings, connections and saved passwords.
 
 ![SQL window with object browser and result grid](docs/screenshots/sql-window.png)
 
@@ -104,7 +107,7 @@ for Linux, Windows and macOS.
   breakpoints, SQL plan) are tabs to arrange as you like.
 - **Debugger setup** (*Debug → Debugger Setup…*, the panel's *Setup…*,
   and on its own when a debug run can't connect): the database connects
-  back to Pythia to debug, which takes `DEBUG CONNECT SESSION`, a network
+  back to DbCraft to debug, which takes `DEBUG CONNECT SESSION`, a network
   ACL entry for the host it connects to, and a way through firewalls.
   The setup tries every host the database might reach this computer by
   (the address it sees for it, the computer's names, one you type) and
@@ -271,7 +274,7 @@ for Linux, Windows and macOS.
   Warnings show as messages.
 - *Edit* on a result of one table changes its rows in place, as on
   Oracle. Rows are found by the table's primary key (or a unique key on
-  NOT NULL columns), which Pythia adds to the result if the query doesn't
+  NOT NULL columns), which DbCraft adds to the result if the query doesn't
   select it; tables without one stay read-only.
 - The object browser lists tables, views, procedures, functions and
   triggers, and the server's users (as `user@host`) and roles; object
@@ -321,7 +324,7 @@ for Linux, Windows and macOS.
   and notices (`RAISE NOTICE`) show as messages.
 - *Edit* on a result of one table changes its rows in place, as on
   MySQL: rows are found by the table's primary key (or a unique key on
-  NOT NULL columns), which Pythia adds to the result if the query doesn't
+  NOT NULL columns), which DbCraft adds to the result if the query doesn't
   select it; views and tables without such a key stay read-only. Applying
   checks the values as they were shown, also json, xml, arrays and
   floats on PostgreSQL and `text`, `xml` and CLR types (`geometry`,
@@ -413,37 +416,37 @@ for Linux, Windows and macOS.
 
 ## Installing
 
-Download Pythia from [its website](https://ortic.github.io/pythia/#download).
+Download DbCraft from [its website](https://ortic.github.io/dbcraft/#download).
 Packages for Linux (`.deb`, AppImage), Windows (MSI, setup `.exe`) and
 macOS (`.dmg`) are attached to each [GitHub
-release](https://github.com/ortic/pythia/releases), in two flavors:
-`pythia_…` with the pure-Rust driver, and `pythia-instantclient_…` on the
+release](https://github.com/ortic/dbcraft/releases), in two flavors:
+`dbcraft_…` with the pure-Rust driver, and `dbcraft-instantclient_…` on the
 Oracle Instant Client (see below). Take the first unless you need the
 second.
 
-Pythia connects to Oracle directly, with a pure-Rust driver: **no Oracle
+DbCraft connects to Oracle directly, with a pure-Rust driver: **no Oracle
 client libraries are needed**. Easy Connect strings (`host:port/service`)
 work as they are; for net service names, point `TNS_ADMIN` at the directory
 with your `tnsnames.ora` (or put it into `$ORACLE_HOME/network/admin`), and
-Pythia offers the aliases when connecting. The tnsnames.ora of an Oracle
+DbCraft offers the aliases when connecting. The tnsnames.ora of an Oracle
 Client that is already installed is found the way Oracle finds it: through
 the registry on Windows (`TNS_ADMIN`, the Oracle homes) and the library path.
 
-**Database versions:** Pythia is developed against Oracle 23ai and tested
+**Database versions:** DbCraft is developed against Oracle 23ai and tested
 against 18c XE and 21c XE. A few features need a newer release: the
 profiler, *Cancel current SQL* in the monitor and restarting a sequence need
 18c; reading trace files through the database needs 12.2.
 
 Proxy authentication works with the usual `proxy_user[target_user]` user
 name. TLS (TCPS) works, cancelling a running statement included; the
-driver's tests run over TLS too, while Pythia itself hasn't been tried on a
+driver's tests run over TLS too, while DbCraft itself hasn't been tried on a
 TLS server yet. For a server certificate from a private CA, put the CA's
 certificate as `ewallet.pem` in a folder and name it in the connect string:
 `tcps://host:2484/service?wallet_location=/path/to/folder`, or
 `(SECURITY=(MY_WALLET_DIRECTORY=/path/to/folder))` in tnsnames.ora.
 `TIMESTAMP WITH TIME ZONE` values with a region show the region's name
 (`2026-07-01 12:00:00 Europe/Zurich`); its offset comes from the IANA time
-zone rules built into Pythia, which can differ from the server's time zone
+zone rules built into DbCraft, which can differ from the server's time zone
 file for very old dates and for rule changes newer than that file.
 
 **When you need the Oracle Instant Client:** Oracle 11.2 databases (12.1 is
@@ -451,24 +454,24 @@ untested), servers that *require* Native Network Encryption (connecting
 fails with *not implemented: Native Network Encryption and Data
 Integrity*; the server has `SQLNET.ENCRYPTION_SERVER = REQUIRED`, use TLS
 instead where you can), and OS or wallet logins (`/@alias`). For these,
-install a `pythia-instantclient_…` package and the [Instant
+install a `dbcraft-instantclient_…` package and the [Instant
 Client](https://www.oracle.com/database/technologies/instant-client/downloads.html)
 (*Basic* or *Basic Light*; on Linux also `libaio`), or use an Oracle Client
-that is already installed. Pythia loads it when connecting; it has to be on
+that is already installed. DbCraft loads it when connecting; it has to be on
 the library path: `PATH` on Windows, on Linux registered with `ldconfig`
 (the Instant Client RPMs do this) or in `LD_LIBRARY_PATH`, on macOS linked
 into `~/lib` (`ln -s ~/Downloads/instantclient_23_3/libclntsh.dylib ~/lib/`).
 Instant Client 23 connects to Oracle 19c and later; for 11.2 take Instant
 Client 19. The Oracle client resolves net service names itself (`TNS_ADMIN`,
-its `network/admin` directory, `sqlnet.ora`). *Help → About Pythia* shows
+its `network/admin` directory, `sqlnet.ora`). *Help → About DbCraft* shows
 which driver a build uses and the client version it found. Installing one
 flavor replaces the other; settings and connections stay. To build this
-flavor yourself: `cargo build --release --features pythia-db/thick`.
+flavor yourself: `cargo build --release --features dbcraft-db/thick`.
 
-**WSL:** under WSLg, Pythia opens its window through X11 (Xwayland), since
-WSLg's compositor crashes on Wayland windows like Pythia's
+**WSL:** under WSLg, DbCraft opens its window through X11 (Xwayland), since
+WSLg's compositor crashes on Wayland windows like DbCraft's
 ([microsoft/wslg#1386](https://github.com/microsoft/wslg/issues/1386)).
-`PYTHIA_WAYLAND=1` keeps Wayland. Through X11 the window starts at 96 DPI
+`DBCRAFT_WAYLAND=1` keeps Wayland. Through X11 the window starts at 96 DPI
 whatever Windows' display scaling; on a scaled display, size the UI with
 Settings → UI scale (or Ctrl + / Ctrl −).
 
@@ -478,15 +481,15 @@ Requirements: Rust (stable).
 
 ```sh
 cargo build --release
-./target/release/pythia
+./target/release/dbcraft
 ```
 
-To run an optimized build while working on Pythia, use the `fast` profile:
+To run an optimized build while working on DbCraft, use the `fast` profile:
 a change rebuilds in 5–15 seconds, where a release build takes about two
 minutes for its link-time optimization.
 
 ```sh
-cargo run --profile fast -p pythia-app
+cargo run --profile fast -p dbcraft-app
 ```
 
 The database driver is our fork of
@@ -498,8 +501,8 @@ Packages are built with [cargo-packager](https://github.com/crabnebula-dev/cargo
 (`cargo install cargo-packager --locked`):
 
 ```sh
-cargo packager --release -p pythia-app            # all formats of this platform
-cargo packager --release -p pythia-app -f deb     # just one
+cargo packager --release -p dbcraft-app            # all formats of this platform
+cargo packager --release -p dbcraft-app -f deb     # just one
 ```
 
 The output lands in `target/packages`. Releases are built by
@@ -516,15 +519,15 @@ docker compose up -d        # or: podman compose up -d
 Tests that need the database are skipped unless configured:
 
 ```sh
-PYTHIA_TEST_DB=pythia/pythia@localhost:1521/FREEPDB1 cargo test
+DBCRAFT_TEST_DB=dbcraft/dbcraft@localhost:1521/FREEPDB1 cargo test
 ```
 
-`--features pythia-db/thick` runs them against the Instant Client instead
-(set `LD_LIBRARY_PATH`); `cargo run -p pythia-db --example thin_probe
+`--features dbcraft-db/thick` runs them against the Instant Client instead
+(set `LD_LIBRARY_PATH`); `cargo run -p dbcraft-db --example thin_probe
 --features thick` compares the two drivers.
 
 Test runs on one machine share the test databases: the first connection
-of a run takes a lock (`pythia-test-databases.lock` in the temp
+of a run takes a lock (`dbcraft-test-databases.lock` in the temp
 directory) that the test process keeps, so a second run, e.g. in another
 worktree, waits for it instead of failing on the same objects.
 
@@ -533,26 +536,26 @@ files in the temp directory.
 
 | Variable | Used by |
 |---|---|
-| `PYTHIA_TEST_DB` | integration tests (app user) |
-| `PYTHIA_TEST_MYSQL` | MySQL tests, e.g. `pythia/pythia@localhost:3306/pythia` for `docker compose up -d mysql` |
-| `PYTHIA_TEST_MYSQL_DBA` | MySQL dashboard tests that need privileges, e.g. `root/mysql@localhost:3306/pythia` |
-| `PYTHIA_TEST_SSH`, `PYTHIA_TEST_MYSQL_VIA_SSH` | SSH tunnel tests: `pythia:pythia@localhost:2222` and `pythia/pythia@mysql:3306/pythia` for `docker compose up -d mysql ssh` |
-| `PYTHIA_TEST_POSTGRES_VIA_SSH` | PostgreSQL through the SSH tunnel test (with `PYTHIA_TEST_SSH`): `pythia/pythia@postgres:5432/pythia` for `docker compose up -d postgres ssh` |
-| `PYTHIA_TEST_MSSQL_VIA_SSH` | SQL Server through the SSH tunnel test (with `PYTHIA_TEST_SSH`): `pythia/pythia@mssql:1433/pythia?trust` for `docker compose up -d mssql ssh` |
-| `PYTHIA_TEST_POSTGRES` | PostgreSQL tests (a superuser), e.g. `pythia/pythia@localhost:5432/pythia` for `docker compose up -d postgres`, which loads `pg_stat_statements` |
-| `PYTHIA_TEST_MSSQL` | SQL Server tests, e.g. `pythia/pythia@localhost:1433/pythia?trust` for `docker compose up -d mssql mssql-init` |
-| `PYTHIA_TEST_MSSQL_DBA` | SQL Server dashboard tests that need VIEW SERVER STATE, e.g. `sa/Pythia-2026@localhost:1433/pythia?trust` |
-| `PYTHIA_TEST_DB_DBA` | monitor, compare and debugger tests (`system/oracle@…`) |
-| `PYTHIA_DEBUG_HOST` | debugger tests: how the database reaches this machine (`host.containers.internal` for a local Podman container; with Docker on Linux, the compose network's gateway from `docker network inspect pythia_default`) |
-| `PYTHIA_SCREENSHOT_DIR` | renders the real UI offscreen into PNGs (`cargo test -p pythia-app screenshots`) |
+| `DBCRAFT_TEST_DB` | integration tests (app user) |
+| `DBCRAFT_TEST_MYSQL` | MySQL tests, e.g. `dbcraft/dbcraft@localhost:3306/dbcraft` for `docker compose up -d mysql` |
+| `DBCRAFT_TEST_MYSQL_DBA` | MySQL dashboard tests that need privileges, e.g. `root/mysql@localhost:3306/dbcraft` |
+| `DBCRAFT_TEST_SSH`, `DBCRAFT_TEST_MYSQL_VIA_SSH` | SSH tunnel tests: `dbcraft:dbcraft@localhost:2222` and `dbcraft/dbcraft@mysql:3306/dbcraft` for `docker compose up -d mysql ssh` |
+| `DBCRAFT_TEST_POSTGRES_VIA_SSH` | PostgreSQL through the SSH tunnel test (with `DBCRAFT_TEST_SSH`): `dbcraft/dbcraft@postgres:5432/dbcraft` for `docker compose up -d postgres ssh` |
+| `DBCRAFT_TEST_MSSQL_VIA_SSH` | SQL Server through the SSH tunnel test (with `DBCRAFT_TEST_SSH`): `dbcraft/dbcraft@mssql:1433/dbcraft?trust` for `docker compose up -d mssql ssh` |
+| `DBCRAFT_TEST_POSTGRES` | PostgreSQL tests (a superuser), e.g. `dbcraft/dbcraft@localhost:5432/dbcraft` for `docker compose up -d postgres`, which loads `pg_stat_statements` |
+| `DBCRAFT_TEST_MSSQL` | SQL Server tests, e.g. `dbcraft/dbcraft@localhost:1433/dbcraft?trust` for `docker compose up -d mssql mssql-init` |
+| `DBCRAFT_TEST_MSSQL_DBA` | SQL Server dashboard tests that need VIEW SERVER STATE, e.g. `sa/DbCraft-2026@localhost:1433/dbcraft?trust` |
+| `DBCRAFT_TEST_DB_DBA` | monitor, compare and debugger tests (`system/oracle@…`) |
+| `DBCRAFT_DEBUG_HOST` | debugger tests: how the database reaches this machine (`host.containers.internal` for a local Podman container; with Docker on Linux, the compose network's gateway from `docker network inspect dbcraft_default`) |
+| `DBCRAFT_SCREENSHOT_DIR` | renders the real UI offscreen into PNGs (`cargo test -p dbcraft-app screenshots`) |
 
 The debugger needs `DEBUG CONNECT SESSION`, `DEBUG ANY PROCEDURE` and a JDWP
-network ACL; `pythia_debugger::target::setup_script` prints what a DBA has to
-run (the app's *Debugger Setup…* finds and fixes the same). `crates/pythia-debugger/tests/scenario.rs` steps through a larger
+network ACL; `dbcraft_debugger::target::setup_script` prints what a DBA has to
+run (the app's *Debugger Setup…* finds and fixes the same). `crates/dbcraft-debugger/tests/scenario.rs` steps through a larger
 scenario (packages, records, collections, an object type, a trigger).
 
 The tests set up what they need on a new database: the demo schema
-several app tests use, and, with `PYTHIA_TEST_DB_DBA` set,
+several app tests use, and, with `DBCRAFT_TEST_DB_DBA` set,
 `SELECT_CATALOG_ROLE` and the debugger privileges for the test user
 (without a DBA, grant those yourself). CI runs the whole suite against a
 fresh Oracle Free container.
@@ -561,17 +564,17 @@ fresh Oracle Free container.
 
 | Crate | Purpose |
 |---|---|
-| `pythia-app` | the application: documents, docking, commands, dialogs |
-| `pythia-ui` | code editor, data grid, icon set |
-| `pythia-db` | sessions on worker threads (Oracle, MySQL, PostgreSQL, SQL Server, SQLite), dictionary queries, what each database supports (`Dialect`, `Feature`), SSH tunnels |
-| `pythia-plsql` | lexer, statement splitter, error-tolerant parser |
-| `pythia-lsp-core` | completion, hover, navigation, outline, diagnostics |
-| `pythia-data` | export and import |
-| `pythia-debugger` | JDWP debugger and panel |
-| `pythia-monitor` | dashboard, sessions, AWR/ASH, trace analyzer |
-| `pythia-compare` | schema and data compare |
-| `pythia-ai` | AI backends (HTTP, command line), prompts and the data policy |
-| `pythia-config` | settings and saved connections |
+| `dbcraft-app` | the application: documents, docking, commands, dialogs |
+| `dbcraft-ui` | code editor, data grid, icon set |
+| `dbcraft-db` | sessions on worker threads (Oracle, MySQL, PostgreSQL, SQL Server, SQLite), dictionary queries, what each database supports (`Dialect`, `Feature`), SSH tunnels |
+| `dbcraft-plsql` | lexer, statement splitter, error-tolerant parser |
+| `dbcraft-lsp-core` | completion, hover, navigation, outline, diagnostics |
+| `dbcraft-data` | export and import |
+| `dbcraft-debugger` | JDWP debugger and panel |
+| `dbcraft-monitor` | dashboard, sessions, AWR/ASH, trace analyzer |
+| `dbcraft-compare` | schema and data compare |
+| `dbcraft-ai` | AI backends (HTTP, command line), prompts and the data policy |
+| `dbcraft-config` | settings and saved connections |
 
 See [CONCEPT.md](CONCEPT.md) for the full plan and status.
 

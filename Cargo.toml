@@ -9,22 +9,22 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.95"
 
 [workspace.dependencies]
-pythia-ai = { path = "crates/pythia-ai" }
-pythia-config = { path = "crates/pythia-config" }
-pythia-compare = { path = "crates/pythia-compare" }
-pythia-data = { path = "crates/pythia-data" }
-pythia-db = { path = "crates/pythia-db" }
-pythia-debugger = { path = "crates/pythia-debugger" }
-pythia-lsp-core = { path = "crates/pythia-lsp-core" }
-pythia-monitor = { path = "crates/pythia-monitor" }
-pythia-plsql = { path = "crates/pythia-plsql" }
-pythia-ui = { path = "crates/pythia-ui" }
+dbcraft-ai = { path = "crates/dbcraft-ai" }
+dbcraft-config = { path = "crates/dbcraft-config" }
+dbcraft-compare = { path = "crates/dbcraft-compare" }
+dbcraft-data = { path = "crates/dbcraft-data" }
+dbcraft-db = { path = "crates/dbcraft-db" }
+dbcraft-debugger = { path = "crates/dbcraft-debugger" }
+dbcraft-lsp-core = { path = "crates/dbcraft-lsp-core" }
+dbcraft-monitor = { path = "crates/dbcraft-monitor" }
+dbcraft-plsql = { path = "crates/dbcraft-plsql" }
+dbcraft-ui = { path = "crates/dbcraft-ui" }
 
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit", "wayland", "x11", "persistence"] }
 egui = "0.36"
 egui_extras = "0.36"
 egui_dock = { version = "0.21", features = ["serde"] }
-# Only for `--features pythia-db/thick` (ODPI-C, needs the Instant Client).
+# Only for `--features dbcraft-db/thick` (ODPI-C, needs the Instant Client).
 oracle = "0.6"
 # The pure-Rust driver: our fork of oracle/rust-oracledb (branch `pythia`),
 # upstream main plus fixes that aren't released yet and Connection::cancel()
@@ -64,7 +64,7 @@ ropey = "1.6"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 directories = "6"
-# The Oracle homes in the Windows registry (pythia-config::tns).
+# The Oracle homes in the Windows registry (dbcraft-config::tns).
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -88,7 +88,7 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 
-# Optimized builds to run locally (`cargo run --profile fast -p pythia-app`):
+# Optimized builds to run locally (`cargo run --profile fast -p dbcraft-app`):
 # like release without its whole-program LTO, and incremental, so a change
 # rebuilds in 5–15 s instead of release's two minutes (#99).
 [profile.fast]
