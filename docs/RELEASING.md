@@ -14,11 +14,10 @@
    git push origin master v0.2.0
    ```
 
-5. `.github/workflows/release.yml` builds on Linux (x86_64), Windows (x86_64)
-   and macOS (Apple Silicon and Intel), each in both flavors (see below), and
-   creates a **draft** GitHub release with all packages, plain archives and
-   `SHA256SUMS.txt`. Review the
-   notes and publish it.
+5. `.github/workflows/release.yml` builds on Linux (x86_64), Windows (x86_64
+   and ARM64) and macOS (Apple Silicon and Intel), each in both flavors (see
+   below), and creates a **draft** GitHub release with all packages, plain
+   archives and `SHA256SUMS.txt`. Review the notes and publish it.
 6. Publishing the release updates the website's downloads (see below).
 
 The workflow can also be started by hand (*Actions → Release → Run
@@ -48,7 +47,7 @@ Locally: `python3 site/build.py` builds into `target/site`, and
 | Platform | Formats | Notes |
 |---|---|---|
 | Linux | `.deb`, `.AppImage`, `.tar.gz` | |
-| Windows | `.msi` (WiX), `-setup.exe` (NSIS), `.zip` | per-machine install |
+| Windows | `.msi` (WiX), `-setup.exe` (NSIS), `.zip` | per-machine install; ARM64 without `.msi` (cargo-packager's WiX 3.11 can't build it) |
 | macOS | `.dmg` (containing `DbCraft.app`), `.tar.gz` | minimum macOS 11 |
 
 Build locally with `cargo packager --release -p dbcraft-app [-f deb]`; output

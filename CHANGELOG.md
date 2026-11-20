@@ -6,6 +6,11 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Packages for Windows on ARM64: a setup `.exe` and a `.zip`, in both
+  flavors, built natively. No MSI yet: the WiX version cargo-packager
+  uses can't build one for ARM64.
+
 ### Fixed
 - MariaDB: the Sessions tab lists a thread once while it runs `OPTIMIZE
   TABLE` or an ALTER that rebuilds an InnoDB table (#492). It showed
