@@ -34,4 +34,4 @@ Never publish the generated body alone.
 4. Once every job of the run has succeeded, put the notes on the draft
    and publish it: `gh release edit vX.Y.Z --notes-file notes.md
    --draft=false --latest`. Check with `gh release view vX.Y.Z` that the
-   body is the notes and the packages (25 files) are attached.
+   body is the notes and the packages (27 files) are attached.

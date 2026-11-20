@@ -47,7 +47,7 @@ Locally: `python3 site/build.py` builds into `target/site`, and
 | Platform | Formats | Notes |
 |---|---|---|
 | Linux | `.deb`, `.AppImage`, `.tar.gz` | |
-| Windows | `.msi` (WiX), `-setup.exe` (NSIS), `.zip` | per-machine install; ARM64 without `.msi` (cargo-packager's WiX 3.11 can't build it) |
+| Windows | `.msi` (WiX), `-setup.exe` (NSIS), `.zip` | per-machine install; x64 and ARM64; WiX 3.14 and `assets/windows/main.wxs`, as cargo-packager's WiX 3.11 and template have no ARM64 |
 | macOS | `.dmg` (containing `DbCraft.app`), `.tar.gz` | minimum macOS 11 |
 
 Build locally with `cargo packager --release -p dbcraft-app [-f deb]`; output
