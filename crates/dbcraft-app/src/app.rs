@@ -115,8 +115,8 @@ pub struct DbCraftApp {
     /// since goes to the file (#196).
     saved_settings: Settings,
     saved: SavedConnections,
-    /// When `connections.toml` was written as `saved` has it.
-    connections_modified: Option<std::time::SystemTime>,
+    /// `connections.toml` as it was when `saved` was read or written.
+    connections_seen: Option<FileSeen>,
     keymap: Keymap,
     /// The code and interface font files installed.
     loaded_fonts: Option<(String, String)>,
@@ -228,7 +228,9 @@ impl DbCraftApp {
             .as_ref()
             .map(|p| load_or_default(&p.connections_file()))
             .unwrap_or_default();
-        let connections_modified = paths.as_ref().and_then(|p| modified(&p.connections_file()));
+        let connections_seen = paths
+            .as_ref()
+            .and_then(|p| FileSeen::of(&p.connections_file()));
         let history: History = paths
             .as_ref()
             .map(|p| load_or_default(&history_file(p)))
@@ -250,7 +252,7 @@ impl DbCraftApp {
             loaded_fonts: None,
             saved_settings: settings.clone(),
             settings,
-            connections_modified,
+            connections_seen,
             saved,
             notify: Notify(cc.egui_ctx.clone()),
             dock: DockState::new(vec![]),
@@ -507,7 +509,7 @@ impl DbCraftApp {
     fn change_connections(&mut self, change: impl FnOnce(&mut SavedConnections)) {
         let path = self.paths.as_ref().map(Paths::connections_file);
         crate::shared::change_toml(path.as_deref(), &mut self.saved, change);
-        self.connections_modified = path.as_deref().and_then(modified);
+        self.connections_seen = path.as_deref().and_then(FileSeen::of);
     }
 
     /// Takes the connections another DbCraft saved since they were read.
@@ -515,9 +517,8 @@ impl DbCraftApp {
         let Some(path) = self.paths.as_ref().map(Paths::connections_file) else {
             return;
         };
-        let now = modified(&path);
-        if now != self.connections_modified {
-            self.connections_modified = now;
+        if FileSeen::changed(&path, self.connections_seen.as_ref()) {
+            self.connections_seen = FileSeen::of(&path);
             match load_toml(&path) {
                 Ok(saved) => self.saved = saved,
                 Err(e) => error!("{e:#}"),
@@ -6573,9 +6574,55 @@ fn history_file(paths: &Paths) -> std::path::PathBuf {
     paths.data_dir.join("history.toml")
 }
 
-/// When a file was last written, to tell another DbCraft's saves.
-fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// A file as this DbCraft read or wrote it last, to tell another
+/// DbCraft's saves. Two saves can get the same time and size: Windows
+/// stamps a file with a clock that moves in steps of some milliseconds.
+/// While its time is that recent, the file's text tells them apart.
+#[derive(Debug, Clone, PartialEq)]
+struct FileSeen {
+    modified: std::time::SystemTime,
+    len: u64,
+    hash: u64,
+}
+
+impl FileSeen {
+    /// Longer than any clock step a file system stamps files with.
+    const RECENT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn of(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: meta.modified().ok()?,
+            len: meta.len(),
+            hash: Self::hash(&std::fs::read(path).ok()?),
+        })
+    }
+
+    fn hash(bytes: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Whether the file at `path` isn't as `seen`. It reads the file only
+    /// when its time and size are as seen and the time is recent.
+    fn changed(path: &std::path::Path, seen: Option<&Self>) -> bool {
+        let meta = std::fs::metadata(path);
+        let (Ok(meta), Some(seen)) = (meta.as_ref(), seen) else {
+            return meta.is_ok() != seen.is_some();
+        };
+        let Ok(modified) = meta.modified() else {
+            return true;
+        };
+        if modified != seen.modified || meta.len() != seen.len {
+            return true;
+        }
+        let recent = std::time::SystemTime::now()
+            .duration_since(modified)
+            .map_or(true, |age| age < Self::RECENT);
+        recent && std::fs::read(path).map_or(true, |b| Self::hash(&b) != seen.hash)
+    }
 }
 
 fn load_or_default<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path) -> T {
@@ -6872,6 +6919,43 @@ mod workspace_tests {
         // The database last picked in the browser (#133).
         assert_eq!(app.browser.marks.databases["shop@mysql"], "shop");
         assert_eq!(app.docs.len(), 1, "a new SQL window");
+    }
+
+    /// Another DbCraft's save shows even with the time and size of the
+    /// save before it, as Windows stamps two quick saves; an old file is
+    /// told by its time and size alone.
+    #[test]
+    fn file_seen_tells_saves_of_one_time() {
+        let dir = std::env::temp_dir().join(format!("dbcraft-seen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connections.toml");
+        let set_time = |time| {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap()
+        };
+        std::fs::write(&path, "a").unwrap();
+        let seen = FileSeen::of(&path).unwrap();
+        assert!(!FileSeen::changed(&path, Some(&seen)));
+        std::fs::write(&path, "b").unwrap();
+        set_time(seen.modified);
+        assert!(FileSeen::changed(&path, Some(&seen)), "same time and size");
+
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        set_time(old);
+        let seen = FileSeen::of(&path).unwrap();
+        assert!(!FileSeen::changed(&path, Some(&seen)));
+        std::fs::write(&path, "bc").unwrap();
+        set_time(old);
+        assert!(FileSeen::changed(&path, Some(&seen)), "another size");
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(FileSeen::changed(&path, Some(&seen)), "removed");
+        assert!(!FileSeen::changed(&path, None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Two DbCrafts on one profile folder keep each other's changes (#196):
