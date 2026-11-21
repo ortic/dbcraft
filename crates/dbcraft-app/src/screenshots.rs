@@ -680,6 +680,133 @@ fn data_editing() {
     );
 }
 
+/// Export tables on MySQL (`DBCRAFT_TEST_MYSQL`): every table into a file
+/// of its own, batch after batch, its DDL next to it; INSERTs leave out
+/// generated columns but not invisible ones; a WHERE clause per table; the
+/// tables consistently, in one transaction, or table by table.
+#[test]
+fn mysql_export_tables() {
+    let Some(spec) = std::env::var("DBCRAFT_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: dbcraft_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let digits = "(select 0 d union all select 1 union all select 2 union all select 3 \
+                  union all select 4 union all select 5 union all select 6 union all select 7 \
+                  union all select 8 union all select 9)";
+    let big = format!(
+        "insert into dbcraft_xbig select n + 1 from (select a.d + 10 * b.d + 100 * c.d \
+           + 1000 * e.d n from {digits} a, {digits} b, {digits} c, {digits} e) t where n < 2500"
+    );
+    crate::test_db::run_on(
+        "DBCRAFT_TEST_MYSQL",
+        dbcraft_config::DbKind::MySql,
+        move |c| {
+            for sql in [
+                "drop table if exists dbcraft_xa, dbcraft_xbig, `Dbcraft_Xc`",
+                "create table dbcraft_xa (id int primary key, name varchar(20), \
+               twice int as (id * 2) virtual, hidden int invisible)",
+                "insert into dbcraft_xa (id, name, hidden) values (1, 'one', 10), (2, 'two', 20), \
+               (3, null, 30)",
+                "create table dbcraft_xbig (id int primary key)",
+                &big,
+                "create table `Dbcraft_Xc` (v varchar(5))",
+                "insert into `Dbcraft_Xc` values ('c')",
+            ] {
+                c.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+        },
+    )
+    .unwrap();
+    let folder = std::env::temp_dir().join(format!("dbcraft-mysql-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    assert!(h.query_by_label("Database").is_some());
+    assert_eq!(h.query_all_by_label("dbcraft_xbig").count(), 1);
+    let export = |h: &mut Harness<'_, DbCraftApp>, tables: &[(&str, &str)]| {
+        let e = h.state_mut().test_export_tables();
+        e.set_tables(tables);
+        let effects = e.start_now();
+        h.state_mut().test_apply_focused(effects);
+        wait_until(h, "export", |app| !app.test_focused_busy());
+        h.state_mut().test_export_tables().message().cloned()
+    };
+    let read = |name: &str| std::fs::read_to_string(folder.join(name)).unwrap();
+
+    let e = h.state_mut().test_export_tables();
+    e.folder = Some(folder.clone());
+    e.format = dbcraft_data::Format::Insert;
+    e.include_ddl = true;
+    e.read = crate::export_tables::Read::Consistent;
+    let message = export(
+        &mut h,
+        &[
+            ("dbcraft_xa", ""),
+            ("dbcraft_xbig", "-- all"),
+            ("Dbcraft_Xc", ""),
+        ],
+    );
+    assert!(
+        matches!(&message, Some((false, m)) if m.starts_with("Exported 2504 rows from 3 table(s)")),
+        "{message:?}"
+    );
+    let a = read("dbcraft_xa.sql");
+    assert!(a.contains("(id, name, hidden)"), "{a}");
+    assert!(!a.contains("twice"), "{a}");
+    assert!(a.contains("'one'") && a.contains("NULL"), "{a}");
+    assert!(read("dbcraft_xa.ddl.sql").starts_with("CREATE TABLE `dbcraft_xa`"));
+    assert_eq!(read("dbcraft_xbig.sql").matches("2500").count(), 1);
+    assert!(read("^d^bcraft_^x^c.sql").contains("'c'"));
+    assert!(
+        !std::fs::read_dir(&folder).unwrap().any(|f| f
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|e| e == "part")),
+        "no .part files left"
+    );
+
+    let e = h.state_mut().test_export_tables();
+    e.format = dbcraft_data::Format::Csv;
+    e.include_ddl = false;
+    e.read = crate::export_tables::Read::Chunks;
+    let message = export(&mut h, &[("dbcraft_xa", "id >= 2 # not one")]);
+    assert!(
+        matches!(&message, Some((false, m)) if m.starts_with("Exported 2 rows from 1 table(s)")),
+        "{message:?}"
+    );
+    assert_eq!(
+        read("dbcraft_xa.csv").lines().collect::<Vec<_>>(),
+        ["id,name,twice,hidden", "2,two,4,20", "3,,6,30"]
+    );
+    let message = export(&mut h, &[("dbcraft_xa", "no_such_column = 1")]);
+    assert!(
+        matches!(&message, Some((true, m)) if m.starts_with("dbcraft_xa: ")),
+        "{message:?}"
+    );
+    h.state_mut().test_close_focused();
+
+    crate::test_db::run_on("DBCRAFT_TEST_MYSQL", dbcraft_config::DbKind::MySql, |c| {
+        c.execute("drop table dbcraft_xa, dbcraft_xbig, `Dbcraft_Xc`")
+            .unwrap();
+    });
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
 /// Edits MySQL results (`DBCRAFT_TEST_MYSQL`, #101): rows are found by the
 /// table's key, selected or not; values MySQL takes as they are (a date
 /// for a DATETIME) aren't conflicts, rows changed by another session are;

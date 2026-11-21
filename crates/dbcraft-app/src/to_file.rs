@@ -55,21 +55,32 @@ impl Sink {
         progress: Arc<AtomicU64>,
     ) -> Result<Self, DbError> {
         let format = format_for(path)?;
+        let defaults = Options::default();
+        let options = Options {
+            table: crate::data_edit::single_table(dialect, sql).unwrap_or(defaults.table.clone()),
+            dialect,
+            time_zone,
+            ..defaults
+        };
+        Self::new(path, format, options, progress)
+    }
+
+    /// Creates the file at `path` for rows written as `format` with
+    /// `options` (*Export tables*).
+    pub fn new(
+        path: &Path,
+        format: Format,
+        options: Options,
+        progress: Arc<AtomicU64>,
+    ) -> Result<Self, DbError> {
         let part = part_path(path);
         let file =
             File::create(&part).map_err(|e| DbError::new(format!("{}: {e}", part.display())))?;
-        let defaults = Options::default();
         Ok(Self {
             path: path.to_owned(),
             part,
             format,
-            options: Options {
-                table: crate::data_edit::single_table(dialect, sql)
-                    .unwrap_or(defaults.table.clone()),
-                dialect,
-                time_zone,
-                ..defaults
-            },
+            options,
             out: Some(BufWriter::with_capacity(1 << 20, file)),
             writer: None,
             progress,

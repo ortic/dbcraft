@@ -108,6 +108,7 @@ impl Dialect {
                     | Feature::EditResults
                     | Feature::AccountEditors
                     | Feature::ExecuteToFile
+                    | Feature::ExportTables
             ),
             DbKind::Postgres | DbKind::SqlServer => matches!(
                 feature,
@@ -440,9 +441,11 @@ mod tests {
             Feature::SshTunnel,
             Feature::EditResults,
             Feature::Sessions,
+            Feature::ExportTables,
         ] {
             assert!(Dialect::MYSQL.supports(feature));
         }
+        assert!(!Dialect::POSTGRES.supports(Feature::ExportTables));
         // Execute to file streams any database's result (the window fetches
         // it batch by batch).
         for dialect in [

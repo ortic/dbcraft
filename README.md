@@ -295,8 +295,14 @@ Pythia's settings, connections and saved passwords.
   storage and top statements from `performance_schema`. Other users'
   threads, transactions and lock waits need the `PROCESS` privilege; top
   statements and lock waits `SELECT` on `performance_schema`.
+- *Tools → Export Tables…* as on Oracle: pick a database's tables, a
+  WHERE per table, one file per table (`orders.csv`, `orders.ddl.sql` from
+  `SHOW CREATE TABLE`), each streamed from the session. *Read: Table by
+  table* reads each table as of its own query; *Consistent* all of them
+  in one transaction `WITH CONSISTENT SNAPSHOT` (InnoDB tables). INSERTs
+  leave out generated columns.
 - Everything built on Oracle's dictionary or PL/SQL — debugger, profiler,
-  the rest of the monitor, reports, scheduler jobs, compare, import/export,
+  the rest of the monitor, reports, scheduler jobs, compare, import,
   the other form editors — isn't offered on MySQL connections. End a
   routine with `/` on a line of its own, as in SQL\*Plus, or with a
   `DELIMITER` of its own, as for the `mysql` client (`DELIMITER ;;` …

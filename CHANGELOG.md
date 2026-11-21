@@ -7,6 +7,12 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- MySQL and MariaDB: *Export tables*, as on Oracle: the tables of a
+  database, a WHERE per table, one file per table with its DDL (`SHOW
+  CREATE TABLE`) next to it. Each table streams from the session into its
+  file batch by batch; *Read: Consistent* reads all of them in one
+  transaction with a consistent snapshot. INSERTs leave out generated
+  columns and keep invisible ones.
 - Oracle: *Export tables* reads a large table in chunks, ranges of ROWIDs
   of about 256 MB each (from DBA_EXTENTS, or a sample of the table's
   blocks without access to it), every one a query of its own: a
