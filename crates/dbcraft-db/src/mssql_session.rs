@@ -738,6 +738,12 @@ impl Worker {
                     report_messages(&mut stream, events);
                     return Ok(Ran::Break("Cancelled while fetching"));
                 }
+                // Rows of a file that end in an error aren't its last ones:
+                // the error answers, or the file would look whole.
+                if whole && let Some(Err(e)) = after {
+                    report_messages(&mut stream, events);
+                    return Err(failed(e));
+                }
                 // A file has the first result only.
                 if after.is_some() && !whole {
                     events.send(DbEvent::MoreResults { id });
