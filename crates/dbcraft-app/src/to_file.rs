@@ -25,37 +25,44 @@ pub struct ToFile {
     pub sql: String,
     pub rows: Arc<AtomicU64>,
     pub started: Instant,
-    /// Where the window writes the rows it fetches (databases other than
-    /// Oracle); `None` while a task writes them.
-    pub sink: Option<Sink>,
 }
 
 /// Writes a query's rows into a file as they come: its columns first, then
-/// batches of rows. The file is removed unless it is finished.
+/// batches of rows. They go into `<name>.part`, which becomes the file once
+/// it is finished; dropped before, the sink removes it, and a DbCraft that
+/// was killed leaves no file that looks whole.
 pub struct Sink {
     path: PathBuf,
+    part: PathBuf,
     format: Format,
     options: Options,
     out: Option<BufWriter<File>>,
     writer: Option<StreamWriter<BufWriter<File>>>,
+    progress: Arc<AtomicU64>,
+    done: bool,
 }
 
 impl Sink {
     /// Creates the file for the rows of `sql`; INSERT statements go into
     /// the table a one-table query reads (#158), in `dialect`'s SQL, and set
-    /// the session's `time_zone` on MySQL (#213).
+    /// the session's `time_zone` on MySQL (#213). `progress` counts the
+    /// rows written.
     pub fn create(
         path: &Path,
         sql: &str,
         dialect: Dialect,
         time_zone: Option<String>,
+        progress: Arc<AtomicU64>,
     ) -> Result<Self, DbError> {
+        let format = format_for(path)?;
+        let part = part_path(path);
         let file =
-            File::create(path).map_err(|e| DbError::new(format!("{}: {e}", path.display())))?;
+            File::create(&part).map_err(|e| DbError::new(format!("{}: {e}", part.display())))?;
         let defaults = Options::default();
         Ok(Self {
             path: path.to_owned(),
-            format: format_for(path),
+            part,
+            format,
             options: Options {
                 table: crate::data_edit::single_table(dialect, sql)
                     .unwrap_or(defaults.table.clone()),
@@ -65,6 +72,8 @@ impl Sink {
             },
             out: Some(BufWriter::with_capacity(1 << 20, file)),
             writer: None,
+            progress,
+            done: false,
         })
     }
 
@@ -96,41 +105,86 @@ impl Sink {
             return Err(DbError::new("Rows before the columns"));
         };
         let written = writer.write(rows).map(|()| writer.rows());
-        written.map_err(|e| self.io(e))
+        let written = written.map_err(|e| self.io(e))?;
+        self.progress.store(written, Ordering::Relaxed);
+        Ok(written)
     }
 
-    /// Completes the file (a JSON array's end, an Excel sheet).
+    /// Completes the file (a JSON array's end) and gives it its name.
     pub fn finish(mut self) -> Result<(), DbError> {
-        let result = match self.writer.take() {
-            Some(writer) => writer.finish().map(|_| ()).map_err(|e| self.io(e)),
-            None => Ok(()),
-        };
-        if result.is_err() {
-            let _ = std::fs::remove_file(&self.path);
+        if let Some(writer) = self.writer.take() {
+            writer.finish().map_err(|e| self.io(e))?;
         }
-        result
+        self.out = None;
+        std::fs::rename(&self.part, &self.path)
+            .map_err(|e| DbError::new(format!("{}: {e}", self.path.display())))?;
+        self.done = true;
+        Ok(())
     }
 
     /// Gives up: the incomplete file is removed.
-    pub fn abandon(mut self) {
-        self.writer = None;
-        self.out = None;
-        let _ = std::fs::remove_file(&self.path);
+    pub fn abandon(self) {}
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        if !self.done {
+            self.writer = None;
+            self.out = None;
+            let _ = std::fs::remove_file(&self.part);
+        }
     }
 }
 
-/// The format for a file name; CSV when the extension isn't a streaming one.
-pub fn format_for(path: &Path) -> Format {
+impl dbcraft_db::RowSink for Sink {
+    fn columns(&mut self, columns: &[Column]) -> Result<(), DbError> {
+        Sink::columns(self, columns)
+    }
+
+    fn retype(&mut self, columns: &[Column]) {
+        Sink::retype(self, columns)
+    }
+
+    fn rows(&mut self, rows: &[Vec<Cell>]) -> Result<u64, DbError> {
+        Sink::rows(self, rows)
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), DbError> {
+        Sink::finish(*self)
+    }
+}
+
+/// Where the rows for `path` go until they are all written.
+pub fn part_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".part");
+    path.with_file_name(name)
+}
+
+/// The format for a file name; CSV when the extension is none of the
+/// formats. Excel and HTML can't be written as rows come: a `.xlsx` given
+/// CSV would be a file Excel calls broken.
+pub fn format_for(path: &Path) -> Result<Format, DbError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    Format::STREAMING
-        .iter()
-        .copied()
-        .find(|f| f.extension() == ext)
-        .unwrap_or(Format::Csv)
+    if let Some(format) = Format::STREAMING.iter().find(|f| f.extension() == ext) {
+        return Ok(*format);
+    }
+    match Format::ALL.iter().find(|f| f.extension() == ext) {
+        Some(format) => Err(DbError::new(format!(
+            "{} can't be written as the rows come; choose {}, or export the grid's rows",
+            format.label(),
+            Format::STREAMING
+                .iter()
+                .map(|f| format!(".{}", f.extension()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        None => Ok(Format::Csv),
+    }
 }
 
 /// Runs `sql` and writes every row to `path`; removes the file on failure
@@ -139,16 +193,16 @@ pub fn run(
     conn: &Connection,
     sql: &str,
     path: &Path,
-    progress: &AtomicU64,
+    progress: Arc<AtomicU64>,
 ) -> Result<u64, DbError> {
-    let mut sink = Sink::create(path, sql, Dialect::ORACLE, None)?;
+    let mut sink = Sink::create(path, sql, Dialect::ORACLE, None, progress)?;
     let mut started = false;
     let streamed = dbcraft_db::stream_query(conn, sql, BATCH, |columns, rows| {
         if !started {
             sink.columns(columns)?;
             started = true;
         }
-        progress.store(sink.rows(rows)?, Ordering::Relaxed);
+        sink.rows(rows)?;
         Ok(())
     });
     match streamed {
@@ -179,9 +233,13 @@ mod tests {
 
     #[test]
     fn picks_format_from_extension() {
-        assert_eq!(format_for(Path::new("a.json")), Format::Json);
-        assert_eq!(format_for(Path::new("a.SQL")), Format::Insert);
-        assert_eq!(format_for(Path::new("a.txt")), Format::Csv);
+        let format = |name: &str| format_for(Path::new(name)).ok();
+        assert_eq!(format("a.json"), Some(Format::Json));
+        assert_eq!(format("a.SQL"), Some(Format::Insert));
+        assert_eq!(format("a.txt"), Some(Format::Csv));
+        // Not CSV under a name Excel opens as its own (it calls it broken).
+        assert_eq!(format("a.xlsx"), None);
+        assert_eq!(format("a.HTML"), None);
     }
 
     /// The rows as the window hands them over, batch by batch, in another
@@ -201,8 +259,14 @@ mod tests {
                 numeric: false,
             },
         ];
-        let mut sink =
-            Sink::create(&path, "select id, note from notes", Dialect::SQLITE, None).unwrap();
+        let mut sink = Sink::create(
+            &path,
+            "select id, note from notes",
+            Dialect::SQLITE,
+            None,
+            Default::default(),
+        )
+        .unwrap();
         sink.columns(&columns).unwrap();
         assert_eq!(
             sink.rows(&[vec![Some("1".into()), Some("it's".into())]])
@@ -221,10 +285,20 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
 
-        let sink = Sink::create(&path, "select 1", Dialect::SQLITE, None).unwrap();
-        assert!(path.exists());
+        // Until it is finished, the rows go into a file of another name,
+        // removed when given up or dropped.
+        let part = part_path(&path);
+        let sink =
+            Sink::create(&path, "select 1", Dialect::SQLITE, None, Default::default()).unwrap();
+        assert!(part.exists() && !path.exists());
         sink.abandon();
-        assert!(!path.exists());
+        assert!(!part.exists() && !path.exists());
+        let mut sink =
+            Sink::create(&path, "select 1", Dialect::SQLITE, None, Default::default()).unwrap();
+        sink.columns(&columns).unwrap();
+        sink.rows(&[vec![Some("1".into()), None]]).unwrap();
+        drop(sink);
+        assert!(!part.exists() && !path.exists());
     }
 
     #[test]
@@ -236,12 +310,12 @@ mod tests {
         let (user, pw) = cred.split_once('/').unwrap();
         let conn = Connection::connect(user, pw, db).unwrap();
         let path = std::env::temp_dir().join(format!("dbcraft-to-file-{}.csv", std::process::id()));
-        let progress = AtomicU64::new(0);
+        let progress = Arc::new(AtomicU64::new(0));
         let n = run(
             &conn,
             "select level as n, 'row ' || level as label from dual connect by level <= 2500",
             &path,
-            &progress,
+            progress.clone(),
         )
         .unwrap();
         assert_eq!(n, 2500);
@@ -253,7 +327,7 @@ mod tests {
 
         // INSERTs go into the table the query reads (#158).
         let sql_path = path.with_extension("sql");
-        run(&conn, "select * from dual", &sql_path, &progress).unwrap();
+        run(&conn, "select * from dual", &sql_path, progress.clone()).unwrap();
         let text = std::fs::read_to_string(&sql_path).unwrap();
         std::fs::remove_file(&sql_path).unwrap();
         assert!(
@@ -267,7 +341,7 @@ mod tests {
             &conn,
             "select 'Missing (H&L) && &x.' as name from dual",
             &sql_path,
-            &progress,
+            progress.clone(),
         )
         .unwrap();
         let text = std::fs::read_to_string(&sql_path).unwrap();
@@ -286,7 +360,15 @@ mod tests {
         assert_eq!(back, "Missing (H&L) && &x.");
 
         // A failing query leaves no file behind.
-        assert!(run(&conn, "select * from no_such_table_xyz", &path, &progress).is_err());
+        assert!(
+            run(
+                &conn,
+                "select * from no_such_table_xyz",
+                &path,
+                progress.clone()
+            )
+            .is_err()
+        );
         assert!(!path.exists());
     }
 
@@ -327,8 +409,14 @@ mod tests {
         .unwrap();
         let path =
             std::env::temp_dir().join(format!("dbcraft-long-binary-{}.sql", std::process::id()));
-        let progress = AtomicU64::new(0);
-        let n = run(&conn, "select * from r65_lv order by id", &path, &progress).unwrap();
+        let progress = Arc::new(AtomicU64::new(0));
+        let n = run(
+            &conn,
+            "select * from r65_lv order by id",
+            &path,
+            progress.clone(),
+        )
+        .unwrap();
         assert_eq!(n, 4);
         let script = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -391,8 +479,14 @@ mod tests {
         .unwrap();
         let path =
             std::env::temp_dir().join(format!("dbcraft-long-text-{}.sql", std::process::id()));
-        let progress = AtomicU64::new(0);
-        let n = run(&conn, "select * from r65_lt order by id", &path, &progress).unwrap();
+        let progress = Arc::new(AtomicU64::new(0));
+        let n = run(
+            &conn,
+            "select * from r65_lt order by id",
+            &path,
+            progress.clone(),
+        )
+        .unwrap();
         assert_eq!(n, 3);
         let script = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -433,7 +527,7 @@ mod tests {
     /// `copy` instead of `table`: how many statements there were.
     fn insert_into_copy(conn: &Connection, sql: &str, table: &str, copy: &str) -> usize {
         let path = std::env::temp_dir().join(format!("dbcraft-{copy}-{}.sql", std::process::id()));
-        run(conn, sql, &path, &AtomicU64::new(0)).unwrap();
+        run(conn, sql, &path, Default::default()).unwrap();
         let script = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         let statements = dbcraft_plsql::split_statements(&script);

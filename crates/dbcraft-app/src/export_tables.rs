@@ -574,7 +574,10 @@ pub fn export(
             .folder
             .join(format!("{base}.{}", settings.format.extension()));
         let io = |e: &dyn std::fmt::Display| DbError::new(format!("{}: {e}", path.display()));
-        let file = std::fs::File::create(&path).map_err(|e| io(&e))?;
+        // Under its name once it is whole: a DbCraft that was killed leaves
+        // no file that looks complete.
+        let part = crate::to_file::part_path(&path);
+        let file = std::fs::File::create(&part).map_err(|e| io(&e))?;
         let mut out = Some(std::io::BufWriter::with_capacity(1 << 20, file));
         let mut writer: Option<StreamWriter<std::io::BufWriter<std::fs::File>>> = None;
         let options = insert_options(settings, &job.table);
@@ -596,16 +599,19 @@ pub fn export(
                 .fetch_add(rows.len() as u64, Ordering::Relaxed);
             Ok(())
         });
-        match result {
-            Ok(rows) => {
-                if let Some(w) = writer.take() {
-                    w.finish().map_err(|e| io(&e))?;
-                }
-                total += rows;
+        let result = result.and_then(|rows| {
+            if let Some(w) = writer.take() {
+                w.finish().map_err(|e| io(&e))?;
             }
+            std::fs::rename(&part, &path).map_err(|e| io(&e))?;
+            Ok(rows)
+        });
+        match result {
+            Ok(rows) => total += rows,
             Err(e) => {
                 drop(writer);
-                let _ = std::fs::remove_file(&path);
+                drop(out);
+                let _ = std::fs::remove_file(&part);
                 return Err(DbError::new(format!("{}: {}", job.table, e.message)));
             }
         }

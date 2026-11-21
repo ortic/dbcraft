@@ -736,8 +736,8 @@ impl SqlWindow {
     }
 
     /// Starts writing once the file was chosen; shows progress. Oracle's
-    /// rows are written by a task on the session; other databases' come as
-    /// results the window fetches batch by batch (see `export_event`).
+    /// rows are written by a task on the session; other databases' by the
+    /// session too, fetched batch by batch (`ExecuteInto`).
     fn poll_to_file(&mut self, ui: &mut Ui, dialect: dbcraft_db::Dialect) -> Effects {
         let mut effects = Effects::default();
         if let Some((rx, sql)) = &self.state.to_file_pick {
@@ -746,25 +746,27 @@ impl SqlWindow {
                     let sql = sql.clone();
                     self.state.to_file_pick = None;
                     let zone = self.state.time_zone.clone();
-                    match crate::to_file::Sink::create(&path, &sql, dialect, zone) {
+                    let rows = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    match crate::to_file::Sink::create(&path, &sql, dialect, zone, rows.clone()) {
                         Ok(sink) => {
                             let id = request_id();
                             self.state.to_file = Some(crate::to_file::ToFile {
                                 id,
                                 path,
                                 sql: sql.clone(),
-                                rows: Default::default(),
+                                rows,
                                 started: std::time::Instant::now(),
-                                sink: Some(sink),
                             });
                             // Binary values whole, not cut short as for
-                            // the grid (#204).
+                            // the grid (#204); the session writes them, batch
+                            // after batch, without waiting for frames.
                             effects.request(
                                 Target::Own,
-                                DbRequest::ExecuteWhole {
+                                DbRequest::ExecuteInto {
                                     id,
                                     sql,
                                     max_rows: crate::to_file::BATCH,
+                                    sink: Box::new(sink),
                                 },
                             );
                         }
@@ -779,7 +781,7 @@ impl SqlWindow {
                     let (task_sql, task_path, progress) = (sql.clone(), path.clone(), rows.clone());
                     let task: dbcraft_db::TaskFn =
                         Box::new(move |conn: &dbcraft_db::oracle::Connection| {
-                            let n = crate::to_file::run(conn, &task_sql, &task_path, &progress)?;
+                            let n = crate::to_file::run(conn, &task_sql, &task_path, progress)?;
                             Ok(Box::new(n) as Box<dyn std::any::Any + Send>)
                         });
                     self.state.to_file = Some(crate::to_file::ToFile {
@@ -788,7 +790,6 @@ impl SqlWindow {
                         sql,
                         rows,
                         started: std::time::Instant::now(),
-                        sink: None,
                     });
                     effects.request(Target::Own, DbRequest::Task { id, task });
                 }
@@ -814,79 +815,6 @@ impl SqlWindow {
             stack: Vec::new(),
         });
         self.state.bottom = BottomTab::Messages;
-    }
-
-    /// Whether `id` is the query the window streams into a file.
-    fn streams_to_file(&self, id: u64) -> bool {
-        self.state
-            .to_file
-            .as_ref()
-            .is_some_and(|job| job.id == id && job.sink.is_some())
-    }
-
-    /// The events of the query streamed into a file: its columns are the
-    /// file's header, each batch of rows is written and the next fetched,
-    /// until the last. A failure (or Break) removes the file.
-    fn export_event(&mut self, event: DbEvent, effects: &mut Effects) {
-        let Some(job) = self.state.to_file.as_mut() else {
-            return;
-        };
-        let id = job.id;
-        let Some(sink) = job.sink.as_mut() else {
-            return;
-        };
-        let failed = match event {
-            DbEvent::QueryStarted { columns, .. } => sink.columns(&columns).err(),
-            DbEvent::Retyped { columns, .. } => {
-                sink.retype(&columns);
-                None
-            }
-            DbEvent::Rows { rows, more, .. } => match sink.rows(&rows) {
-                Ok(written) => {
-                    job.rows
-                        .store(written, std::sync::atomic::Ordering::Relaxed);
-                    if more {
-                        effects.request(
-                            Target::Own,
-                            DbRequest::FetchMore {
-                                id,
-                                max_rows: crate::to_file::BATCH,
-                            },
-                        );
-                        return;
-                    }
-                    let job = self.state.to_file.take().expect("the running export");
-                    match job.sink.map(crate::to_file::Sink::finish) {
-                        Some(Err(e)) => self.export_failed(&e.text()),
-                        _ => {
-                            effects.executed.push(job.sql);
-                            self.info(format!(
-                                "{written} rows written to {} in {}",
-                                job.path.display(),
-                                fmt_duration(job.started.elapsed())
-                            ));
-                            self.state.bottom = BottomTab::Messages;
-                        }
-                    }
-                    return;
-                }
-                Err(e) => Some(e),
-            },
-            DbEvent::Failed { error, .. } => Some(error),
-            DbEvent::Executed { .. } => Some(dbcraft_db::DbError::new("It isn't a query")),
-            // Another request closed it (MySQL, PostgreSQL, SQL Server,
-            // SQLite): the rows left can't be written.
-            DbEvent::QueryClosed { .. } => Some(dbcraft_db::DbError::new(
-                "its query was closed by what ran after it, before all rows were written",
-            )),
-            _ => return,
-        };
-        if let Some(error) = failed {
-            if let Some(sink) = self.state.to_file.take().and_then(|job| job.sink) {
-                sink.abandon();
-            }
-            self.export_failed(&error.text());
-        }
     }
 
     /// Stops the run: a read-only connection only runs queries.
@@ -1944,19 +1872,6 @@ impl SqlWindow {
         let Some(event) = self.value_event(event) else {
             return effects;
         };
-        let streamed = match &event {
-            DbEvent::QueryStarted { id, .. }
-            | DbEvent::Retyped { id, .. }
-            | DbEvent::Rows { id, .. }
-            | DbEvent::QueryClosed { id }
-            | DbEvent::Executed { id, .. }
-            | DbEvent::Failed { id, .. } => self.streams_to_file(*id),
-            _ => false,
-        };
-        if streamed {
-            self.export_event(event, &mut effects);
-            return effects;
-        }
         match event {
             DbEvent::QueryStarted { id, columns } => {
                 // Another result of the statement whose result `id` is
@@ -4848,42 +4763,6 @@ mod tests {
         w.on_event(DbEvent::QueryClosed { id }, &mysql);
         assert!(w.state.results[0].ended);
         assert_eq!(w.state.messages.len(), before);
-
-        let path = std::env::temp_dir().join(format!("dbcraft-closed-{}.csv", std::process::id()));
-        let sql = "select 1 from t";
-        let sink = crate::to_file::Sink::create(&path, sql, dbcraft_db::Dialect::MYSQL, None)
-            .expect("the file");
-        w.state.to_file = Some(crate::to_file::ToFile {
-            id: 7,
-            path: path.clone(),
-            sql: sql.into(),
-            rows: Default::default(),
-            started: std::time::Instant::now(),
-            sink: Some(sink),
-        });
-        let columns = vec![Column {
-            name: "N".into(),
-            type_name: "INT".into(),
-            numeric: true,
-        }];
-        w.on_event(DbEvent::QueryStarted { id: 7, columns }, &cx);
-        let effects = w.on_event(
-            DbEvent::Rows {
-                id: 7,
-                rows: vec![vec![Some("1".into())]],
-                more: true,
-                elapsed: Duration::ZERO,
-            },
-            &cx,
-        );
-        assert_eq!(effects.requests.len(), 1, "the next batch is fetched");
-        w.on_event(DbEvent::QueryClosed { id: 7 }, &cx);
-        assert!(w.state.to_file.is_none() && !path.exists());
-        assert!(w.state.messages.last().is_some_and(|m| {
-            m.level == Level::Error
-                && m.text
-                    .starts_with("Execute to file failed: its query was closed")
-        }));
     }
 
     /// The Messages tab places the messages in view by their measured

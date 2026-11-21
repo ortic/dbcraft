@@ -100,6 +100,97 @@ struct Envelope {
 /// The script statement the worker runs: its request id, and its script.
 type Current = Arc<Mutex<Option<(u64, Script)>>>;
 
+/// The [`DbRequest::ExecuteInto`] the worker runs, shared by its
+/// [`Requests`] and [`Events`]: the result's events go to the sink instead
+/// of the window, and the next batch's `FetchMore` comes before any other
+/// request, so the rows don't wait for the window's frames.
+type Streaming = Arc<Mutex<Stream>>;
+
+#[derive(Default)]
+struct Stream {
+    into: Option<Into>,
+    /// The request the worker takes next.
+    next: Option<DbRequest>,
+}
+
+struct Into {
+    id: u64,
+    max_rows: usize,
+    sink: Box<dyn crate::RowSink>,
+    written: u64,
+}
+
+impl Stream {
+    /// Whether `event` is of the result going into the sink.
+    fn owns(&self, event: &DbEvent) -> bool {
+        let Some(into) = &self.into else {
+            return false;
+        };
+        match event {
+            DbEvent::QueryStarted { id, .. }
+            | DbEvent::Retyped { id, .. }
+            | DbEvent::MoreResults { id }
+            | DbEvent::Rows { id, .. }
+            | DbEvent::Failed { id, .. }
+            | DbEvent::Executed { id, .. }
+            | DbEvent::QueryClosed { id } => *id == into.id,
+            _ => false,
+        }
+    }
+
+    /// Takes an event it [`owns`](Self::owns); gives back what answers the
+    /// request once it is done.
+    fn take(&mut self, event: DbEvent) -> Option<DbEvent> {
+        let into = self.into.as_mut()?;
+        let ended = match event {
+            DbEvent::QueryStarted { id, columns } if id == into.id => {
+                into.sink.columns(&columns).err()
+            }
+            DbEvent::Retyped { id, columns } if id == into.id => {
+                into.sink.retype(&columns);
+                None
+            }
+            DbEvent::MoreResults { id } if id == into.id => None,
+            DbEvent::Rows { id, rows, more, .. } if id == into.id => match into.sink.rows(&rows) {
+                Ok(written) => {
+                    into.written = written;
+                    if !more {
+                        return Some(self.end(None));
+                    }
+                    self.next = Some(DbRequest::FetchMore {
+                        id,
+                        max_rows: into.max_rows,
+                    });
+                    None
+                }
+                Err(e) => Some(e),
+            },
+            DbEvent::Failed { id, error, .. } if id == into.id => Some(error),
+            DbEvent::Executed { id, .. } if id == into.id => Some(DbError::new("It isn't a query")),
+            // Another request closed it: the rows left can't be written.
+            DbEvent::QueryClosed { id } if id == into.id => Some(DbError::new(
+                "its query was closed by what ran after it, before all rows were written",
+            )),
+            _ => None,
+        };
+        ended.map(|error| self.end(Some(error)))
+    }
+
+    /// The answer of the request: its sink finished, or on `error` dropped.
+    fn end(&mut self, error: Option<DbError>) -> DbEvent {
+        let into = self.into.take().expect("a stream");
+        self.next = None;
+        let result = match error {
+            Some(e) => Err(e),
+            None => into.sink.finish().map(|()| into.written),
+        };
+        DbEvent::TaskDone {
+            id: into.id,
+            result: result.map(|n| Box::new(n) as Box<dyn std::any::Any + Send>),
+        }
+    }
+}
+
 /// The worker's side of the requests: a script's statements are skipped
 /// once it stopped or the session's handle is gone, and the one handed
 /// out is noted, so that [`Events::send`] stops its script when it fails.
@@ -107,10 +198,14 @@ pub(crate) struct Requests {
     rx: Receiver<Envelope>,
     current: Current,
     closing: Arc<AtomicBool>,
+    streaming: Streaming,
 }
 
 impl Requests {
     pub(crate) fn recv(&self) -> Result<DbRequest, RecvError> {
+        if let Some(next) = self.next() {
+            return Ok(next);
+        }
         loop {
             if let Some(request) = self.take(self.rx.recv()?) {
                 return Ok(request);
@@ -120,6 +215,9 @@ impl Requests {
 
     /// [`recv`](Self::recv), waiting at most `timeout`.
     pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<DbRequest, RecvTimeoutError> {
+        if let Some(next) = self.next() {
+            return Ok(next);
+        }
         let until = Instant::now() + timeout;
         loop {
             let envelope = self
@@ -131,9 +229,32 @@ impl Requests {
         }
     }
 
-    /// The request of `envelope`, none if its script stopped.
+    /// The next batch of the rows going into a sink.
+    fn next(&self) -> Option<DbRequest> {
+        self.streaming.lock().expect("stream mutex").next.take()
+    }
+
+    /// The request of `envelope`, none if its script stopped. An
+    /// `ExecuteInto` is the worker's `ExecuteWhole`, its sink kept aside.
     fn take(&self, envelope: Envelope) -> Option<DbRequest> {
         let Envelope { request, script } = envelope;
+        let request = match request {
+            DbRequest::ExecuteInto {
+                id,
+                sql,
+                max_rows,
+                sink,
+            } => {
+                self.streaming.lock().expect("stream mutex").into = Some(Into {
+                    id,
+                    max_rows,
+                    sink,
+                    written: 0,
+                });
+                DbRequest::ExecuteWhole { id, sql, max_rows }
+            }
+            request => request,
+        };
         let mut current = self.current.lock().expect("script mutex");
         *current = None;
         if let Some(script) = script {
@@ -161,10 +282,12 @@ impl Session {
         let shared = cancel.clone();
         let closing = Arc::new(AtomicBool::new(false));
         let current = Current::default();
+        let streaming = Streaming::default();
         let req_rx = Requests {
             rx: req_rx,
             current: current.clone(),
             closing: closing.clone(),
+            streaming: streaming.clone(),
         };
         thread::Builder::new()
             .name(format!("db-{}", params.username))
@@ -173,6 +296,7 @@ impl Session {
                     tx: ev_tx,
                     notify: Box::new(notify),
                     script: current,
+                    streaming,
                 };
                 match params.kind {
                     // Rather than connecting around the tunnel.
@@ -265,10 +389,22 @@ pub(crate) struct Events {
     notify: Box<dyn Fn() + Send>,
     /// The script statement running, whose failure stops its script.
     script: Current,
+    /// The request whose rows go into a sink, not to the window.
+    streaming: Streaming,
 }
 
 impl Events {
     pub(crate) fn send(&self, event: DbEvent) {
+        let event = {
+            let mut stream = self.streaming.lock().expect("stream mutex");
+            if !stream.owns(&event) {
+                event
+            } else if let Some(answer) = stream.take(event) {
+                answer
+            } else {
+                return;
+            }
+        };
         if let DbEvent::Failed { id, .. } = &event
             && let Some((running, script)) = &*self.script.lock().expect("script mutex")
             && running == id
@@ -343,6 +479,9 @@ impl Worker {
                     binds,
                 } => worker.execute(id, &sql, max_rows, &binds),
                 // Values are whole; Execute to file streams through a task.
+                DbRequest::ExecuteInto { .. } => {
+                    unreachable!("the session hands it over as ExecuteWhole")
+                }
                 DbRequest::ExecuteWhole { id, sql, max_rows } => {
                     worker.execute(id, &sql, max_rows, &[])
                 }
@@ -750,7 +889,14 @@ pub fn stream_query(
     batch: usize,
     mut sink: impl FnMut(&[Column], &[Vec<Cell>]) -> Result<(), DbError>,
 ) -> Result<u64, DbError> {
-    let mut stmt = conn.statement(sql).fetch_array_size(batch as u32).build()?;
+    // Each round trip brings a whole array of rows: of rows with LOBs, a few
+    // at a time, not a thousand values of megabytes each.
+    let fetch = if has_lobs(conn, sql) {
+        LOB_FETCH.min(batch)
+    } else {
+        batch
+    };
+    let mut stmt = conn.statement(sql).fetch_array_size(fetch as u32).build()?;
     let rows = stmt.query(&[])?;
     let columns: Vec<Column> = rows
         .column_info()
@@ -758,15 +904,21 @@ pub fn stream_query(
         .map(|c| column(c.name(), c.oracle_type()))
         .collect();
     sink(&columns, &[])?;
-    let mut buffer = Vec::with_capacity(batch);
+    let mut buffer: Vec<Vec<Cell>> = Vec::with_capacity(batch);
+    let mut bytes = 0;
     let mut count = 0u64;
     for row in rows {
         let row = row?;
-        buffer.push(row.sql_values().iter().map(cell).collect());
-        if buffer.len() == batch {
+        let cells: Vec<Cell> = row.sql_values().iter().map(cell).collect();
+        bytes += crate::sql_text::row_bytes(&cells);
+        buffer.push(cells);
+        // A batch also ends once it holds 64 MB, as on the other
+        // databases: 1000 rows of large LOBs don't fit in memory.
+        if buffer.len() == batch || bytes >= crate::sql_text::WHOLE_BATCH_BYTES {
             count += buffer.len() as u64;
             sink(&columns, &buffer)?;
             buffer.clear();
+            bytes = 0;
         }
     }
     count += buffer.len() as u64;
@@ -774,6 +926,33 @@ pub fn stream_query(
         sink(&columns, &buffer)?;
     }
     Ok(count)
+}
+
+/// Rows fetched per round trip by [`stream_query`] when they have LOBs.
+const LOB_FETCH: usize = 16;
+
+/// Whether `sql`'s result has LOB or LONG columns, from its columns without
+/// rows. A query that can't be wrapped so (`for update`) counts as none.
+fn has_lobs(conn: &Connection, sql: &str) -> bool {
+    let body = sql.trim().trim_end_matches(';');
+    let probe = format!("select * from (\n{body}\n) where 1 = 0");
+    let Ok(mut stmt) = conn.statement(&probe).build() else {
+        return false;
+    };
+    let Ok(rows) = stmt.query(&[]) else {
+        return false;
+    };
+    rows.column_info().iter().any(|c| {
+        matches!(
+            c.oracle_type(),
+            OracleType::CLOB
+                | OracleType::NCLOB
+                | OracleType::BLOB
+                | OracleType::BFILE
+                | OracleType::Long
+                | OracleType::LongRaw
+        )
+    })
 }
 
 fn column(name: &str, ty: &OracleType) -> Column {
@@ -841,4 +1020,112 @@ fn current_schema(conn: &Connection) -> crate::oracle::Result<String> {
         "select sys_context('USERENV', 'CURRENT_SCHEMA') from dual",
         &[],
     )
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// Notes what reaches it, in `log`.
+    struct Log(Arc<Mutex<Vec<String>>>, u64);
+
+    impl crate::RowSink for Log {
+        fn columns(&mut self, columns: &[Column]) -> Result<(), DbError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("columns {}", columns.len()));
+            Ok(())
+        }
+        fn retype(&mut self, _: &[Column]) {
+            self.0.lock().unwrap().push("retype".into());
+        }
+        fn rows(&mut self, rows: &[Vec<Cell>]) -> Result<u64, DbError> {
+            self.1 += rows.len() as u64;
+            self.0.lock().unwrap().push(format!("rows {}", rows.len()));
+            Ok(self.1)
+        }
+        fn finish(self: Box<Self>) -> Result<(), DbError> {
+            self.0.lock().unwrap().push("finish".into());
+            Ok(())
+        }
+    }
+
+    impl Drop for Log {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("dropped".into());
+        }
+    }
+
+    fn rows(id: u64, n: usize, more: bool) -> DbEvent {
+        DbEvent::Rows {
+            id,
+            rows: vec![vec![Some("1".into())]; n],
+            more,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn stream(log: &Arc<Mutex<Vec<String>>>) -> Stream {
+        Stream {
+            into: Some(Into {
+                id: 7,
+                max_rows: 1000,
+                sink: Box::new(Log(log.clone(), 0)),
+                written: 0,
+            }),
+            next: None,
+        }
+    }
+
+    /// The rows go into the sink, the next batch is asked for without the
+    /// window, and the last one answers with the rows written; the events
+    /// of other requests pass.
+    #[test]
+    fn rows_go_into_the_sink() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut s = stream(&log);
+        let columns = vec![Column {
+            name: "N".into(),
+            type_name: "INT".into(),
+            numeric: true,
+        }];
+        assert!(s.take(DbEvent::QueryStarted { id: 7, columns }).is_none());
+        assert!(s.take(rows(7, 1000, true)).is_none());
+        assert!(matches!(
+            s.next.take(),
+            Some(DbRequest::FetchMore {
+                id: 7,
+                max_rows: 1000
+            })
+        ));
+        assert!(!s.owns(&DbEvent::QueryClosed { id: 8 }));
+        let Some(DbEvent::TaskDone { id: 7, result }) = s.take(rows(7, 5, false)) else {
+            panic!("the answer");
+        };
+        assert_eq!(*result.unwrap().downcast::<u64>().unwrap(), 1005);
+        assert!(s.into.is_none() && s.next.is_none());
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["columns 1", "rows 1000", "rows 5", "finish", "dropped"]
+        );
+        assert!(!s.owns(&rows(7, 1, false)), "done");
+    }
+
+    /// Closed by another request (MySQL, PostgreSQL, SQL Server, SQLite)
+    /// or failed, the sink is dropped, which removes its file.
+    #[test]
+    fn a_closed_query_drops_the_sink() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut s = stream(&log);
+        assert!(s.owns(&rows(7, 3, true)));
+        assert!(s.take(rows(7, 3, true)).is_none());
+        let Some(DbEvent::TaskDone { id: 7, result }) = s.take(DbEvent::QueryClosed { id: 7 })
+        else {
+            panic!("the answer");
+        };
+        assert!(result.unwrap_err().text().contains("closed"));
+        assert!(s.next.is_none(), "no more batches asked for");
+        assert_eq!(*log.lock().unwrap(), ["rows 3", "dropped"]);
+    }
 }

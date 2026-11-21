@@ -6,7 +6,27 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- *Execute to file* on MySQL, MariaDB, PostgreSQL, SQL Server and SQLite:
+  the session writes the rows itself, fetching batch after batch, as on
+  Oracle. The window fetched the next batch once it had written one, a
+  frame later: a large export ran as fast as the window drew, ten times
+  slower minimized, and a window that stalled for a minute ended a
+  MySQL export at its `net_write_timeout`.
+- *Execute to file* and *Export tables* write into `<file>.part` and give
+  the file its name once it is complete. A DbCraft that was killed or lost
+  its power left a file cut short under its name, which looked whole.
+
 ### Fixed
+- Oracle: *Execute to file* and *Export tables* of a table with large LOBs
+  no longer run out of memory. A batch held 1000 rows whatever their size,
+  and the driver fetched as many at once; a batch now ends at 64 MB, as on
+  the other databases, and rows with LOBs come 16 per round trip.
+- *Export tables*: a file whose last write failed (a full disk) is
+  removed, as when any other write fails.
+- *Execute to file* to a `.xlsx` or `.html` file says it can't write that
+  format as the rows come. It wrote CSV under that name, which Excel
+  called broken.
 - The Connect dialog shows a connection another DbCraft saved just after
   this one saved its own. On Windows the two saves could get the same
   file time, and the dialog kept the list without the other's change.
