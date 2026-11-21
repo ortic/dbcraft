@@ -6,6 +6,11 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- The Connect dialog shows a connection another DbCraft saved just after
+  this one saved its own. On Windows the two saves could get the same
+  file time, and the dialog kept the list without the other's change.
+
 ## [0.13.0] - 2026-11-21
 
 ### Added
