@@ -417,8 +417,8 @@ Pythia's settings, connections and saved passwords.
 ## Installing
 
 Download DbCraft from [its website](https://ortic.github.io/dbcraft/#download).
-Packages for Linux (`.deb`, AppImage), Windows (MSI, setup `.exe`) and
-macOS (`.dmg`) are attached to each [GitHub
+Packages for Linux (`.deb`, AppImage), Windows (MSI, setup `.exe`; x64
+and ARM64) and macOS (`.dmg`) are attached to each [GitHub
 release](https://github.com/ortic/dbcraft/releases), in two flavors:
 `dbcraft_…` with the pure-Rust driver, and `dbcraft-instantclient_…` on the
 Oracle Instant Client (see below). Take the first unless you need the

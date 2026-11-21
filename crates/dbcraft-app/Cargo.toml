@@ -121,3 +121,5 @@ installMode = "perMachine"
 
 [package.metadata.packager.wix]
 languages = ["en-US"]
+# cargo-packager's template with arm64; needs WiX 3.14 (see release.yml).
+template = "../../assets/windows/main.wxs"

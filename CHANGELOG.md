@@ -6,6 +6,10 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Packages for Windows on ARM64: MSI, setup `.exe` and `.zip`, in both
+  flavors, built natively.
+
 ### Fixed
 - MariaDB: the Sessions tab lists a thread once while it runs `OPTIMIZE
   TABLE` or an ALTER that rebuilds an InnoDB table (#492). It showed

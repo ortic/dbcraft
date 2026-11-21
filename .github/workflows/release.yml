@@ -37,6 +37,10 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             formats: wix,nsis
+          - name: windows-aarch64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            formats: wix,nsis
           - name: macos-aarch64
             os: macos-15
             target: aarch64-apple-darwin
@@ -74,6 +78,28 @@ jobs:
       - name: Linux packaging dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfuse2
+
+      # cargo-packager downloads WiX 3.11, which can't build arm64; 3.14 can.
+      # It takes the WiX it finds in its tools folder.
+      - name: WiX 3.14
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o wix.zip \
+            https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+          echo "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31  wix.zip" | sha256sum -c
+          7z x -y -o"$LOCALAPPDATA/.cargo-packager/WixTools" wix.zip > /dev/null
+
+      # ring builds its aarch64 assembly for MSVC with clang.
+      - name: Windows ARM64 packaging dependencies
+        if: matrix.platform.target == 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          if ! command -v clang >/dev/null; then
+            choco install llvm -y --no-progress
+            echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Build packages
         shell: bash
