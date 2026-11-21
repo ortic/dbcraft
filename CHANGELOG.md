@@ -6,6 +6,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-21
+
 ### Added
 - Packages for Windows on ARM64: MSI, setup `.exe` and `.zip`, in both
   flavors, built natively.
@@ -2847,7 +2849,8 @@ First release.
 - Scheduler jobs window: run, stop, enable, disable, drop, run history.
 - Saved user reports with parameters.
 
-[Unreleased]: https://github.com/ortic/dbcraft/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/ortic/dbcraft/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/ortic/dbcraft/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/ortic/dbcraft/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ortic/dbcraft/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ortic/dbcraft/compare/v0.9.0...v0.10.0

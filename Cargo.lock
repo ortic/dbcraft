@@ -1278,7 +1278,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "dbcraft-ai"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "dbcraft-config",
  "serde_json",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-app"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-compare"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "dbcraft-data",
  "dbcraft-db",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-config"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "dbcraft-plsql",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-data"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "calamine",
  "chrono",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-db"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-debugger"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "dbcraft-db",
  "dbcraft-plsql",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-lsp-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "dbcraft-plsql",
  "insta",
@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-monitor"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "dbcraft-config",
  "dbcraft-db",
@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-plsql"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "insta",
  "logos",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "dbcraft-ui"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "dbcraft-data",
  "dbcraft-db",
