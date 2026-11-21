@@ -27,8 +27,24 @@ pub struct ExportTables {
     pub delimiter: u8,
     pub null_text: String,
     pub include_ddl: bool,
+    #[serde(default)]
+    pub read: Read,
     #[serde(skip)]
     state: State,
+}
+
+/// How the tables are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Read {
+    /// A large table in ROWID ranges, each a short query of its own: each
+    /// needs undo for its own minutes only, and one that hits ORA-01555
+    /// (snapshot too old) is read again. Each range reads its own moment.
+    #[default]
+    Chunks,
+    /// All tables at one moment, in a read-only transaction: as the
+    /// database was when the export began. The undo has to reach back to
+    /// then until the last table is read.
+    Consistent,
 }
 
 /// Formats are stored by extension.
@@ -60,6 +76,7 @@ impl Default for ExportTables {
             delimiter: b',',
             null_text: String::new(),
             include_ddl: false,
+            read: Read::default(),
             state: State::default(),
         }
     }
@@ -111,6 +128,9 @@ pub struct Settings {
     pub format: Format,
     pub options: Options,
     pub include_ddl: bool,
+    pub read: Read,
+    /// The bytes of a table's extents a range of rows holds ([`Read::Chunks`]).
+    pub chunk_bytes: u64,
 }
 
 impl ExportTables {
@@ -219,6 +239,8 @@ impl ExportTables {
                 ..Options::default()
             },
             include_ddl: self.include_ddl,
+            read: self.read,
+            chunk_bytes: CHUNK_BYTES,
         };
         let progress = Arc::new(Progress::default());
         let id = request_id();
@@ -438,6 +460,23 @@ impl ExportTables {
                         .on_hover_text("Writes <table>.ddl.sql next to each data file");
                 });
                 ui.end_row();
+                ui.label("Read");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.read, Read::Chunks, "In chunks")
+                        .on_hover_text(
+                            "Large tables are read in ranges of rows, each a short query: \
+                             a range that fails with ORA-01555 (snapshot too old) is read \
+                             again. Tables, and ranges, are read at different moments.",
+                        );
+                    ui.selectable_value(&mut self.read, Read::Consistent, "Consistent")
+                        .on_hover_text(
+                            "All tables as they were when the export began, in a read-only \
+                             transaction. Oracle has to keep the undo until the last table is \
+                             read: a long export may fail with ORA-01555 unless UNDO_RETENTION \
+                             covers it.",
+                        );
+                });
+                ui.end_row();
             });
         ui.add_space(4.0);
         let selected = match &self.state.tables {
@@ -530,94 +569,364 @@ pub fn export(
     progress.tables.store(jobs.len(), Ordering::Relaxed);
     std::fs::create_dir_all(&settings.folder)
         .map_err(|e| DbError::new(format!("{}: {e}", settings.folder.display())))?;
-    let mut total = 0;
-    for job in jobs {
-        if progress.stop.load(Ordering::Relaxed) {
-            return Err(DbError::new("stopped"));
-        }
-        *progress.current.lock().expect("current") = job.table.clone();
-        // A file of its own for each table, as Export schema writes (#280).
-        let base = crate::object_files::file_stem(&job.table);
-        if settings.include_ddl {
+    // The DDL first: DBMS_METADATA doesn't run in a read-only transaction.
+    if settings.include_ddl {
+        for job in jobs {
+            if progress.stop.load(Ordering::Relaxed) {
+                return Err(DbError::new("stopped"));
+            }
+            *progress.current.lock().expect("current") = job.table.clone();
+            // A file of its own for each table, as Export schema writes (#280).
+            let base = crate::object_files::file_stem(&job.table);
             let ddl =
                 crate::object_files::object_text(conn, &owner, &job.table, ObjectType::Table)?;
             let path = settings.folder.join(format!("{base}.ddl.sql"));
             std::fs::write(&path, ddl)
                 .map_err(|e| DbError::new(format!("{}: {e}", path.display())))?;
         }
-        // Invisible columns too (#444); INSERTs without the virtual ones,
-        // which Oracle refuses to write (#443).
-        let with_virtual = settings.format != Format::Insert;
-        let columns = dbcraft_db::compat::table_columns(conn, &owner, &job.table, with_virtual)?;
-        let list = if columns.is_empty() {
-            "*".to_owned()
-        } else {
-            columns
-                .iter()
-                .map(|c| quote_ident(c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let mut sql = format!(
-            "select {list} from {}.{}",
-            quote_ident(&owner),
-            quote_ident(&job.table)
-        );
-        // A filter that is all comment is none (#427): `where -- x` failed.
-        if dbcraft_plsql::tokenize(&job.filter)
-            .iter()
-            .any(|t| !t.kind.is_trivia())
-        {
-            sql.push_str(&format!(" where {}", job.filter));
-        }
-        let path = settings
-            .folder
-            .join(format!("{base}.{}", settings.format.extension()));
-        let io = |e: &dyn std::fmt::Display| DbError::new(format!("{}: {e}", path.display()));
-        // Under its name once it is whole: a DbCraft that was killed leaves
-        // no file that looks complete.
-        let part = crate::to_file::part_path(&path);
-        let file = std::fs::File::create(&part).map_err(|e| io(&e))?;
-        let mut out = Some(std::io::BufWriter::with_capacity(1 << 20, file));
-        let mut writer: Option<StreamWriter<std::io::BufWriter<std::fs::File>>> = None;
-        let options = insert_options(settings, &job.table);
-        let result = dbcraft_db::stream_query(conn, &sql, 1000, |columns, rows| {
-            if progress.stop.load(Ordering::Relaxed) {
-                return Err(DbError::new("stopped"));
-            }
-            if let Some(out) = out.take() {
-                writer = Some(
-                    StreamWriter::new(settings.format, columns.to_vec(), options.clone(), out)
-                        .map_err(|e| io(&e))?,
-                );
-            }
-            if let Some(w) = writer.as_mut() {
-                w.write(rows).map_err(|e| io(&e))?;
-            }
-            progress
-                .rows
-                .fetch_add(rows.len() as u64, Ordering::Relaxed);
-            Ok(())
+    }
+    if settings.read == Read::Consistent {
+        // Every query of the transaction reads the database as it was when
+        // it began, as one query would. It can't begin with changes not
+        // committed, which stay as they are.
+        conn.execute("set transaction read only", &[])
+            .map_err(DbError::from)
+            .map_err(|e| match e.code {
+                Some(1453) => DbError::new(
+                    "Commit or roll back first: a consistent export reads in a transaction \
+                     of its own",
+                ),
+                _ => e,
+            })?;
+        let exported = export_tables(conn, &owner, settings, jobs, progress);
+        // Ends the read-only transaction; it changed nothing.
+        let _ = conn.rollback();
+        return exported.map_err(|e| match e.code {
+            Some(SNAPSHOT_TOO_OLD) => DbError::new(format!(
+                "{}: the undo doesn't reach back to the start of the export any more. Export \
+                 in chunks, or ask for a longer UNDO_RETENTION",
+                e.message
+            )),
+            Some(DEFINITION_CHANGED) => DbError::new(format!(
+                "{}: the table was changed (DDL) after the export began, or a few seconds \
+                 before it: export again",
+                e.message
+            )),
+            _ => e,
         });
-        let result = result.and_then(|rows| {
-            if let Some(w) = writer.take() {
-                w.finish().map_err(|e| io(&e))?;
-            }
-            std::fs::rename(&part, &path).map_err(|e| io(&e))?;
-            Ok(rows)
-        });
-        match result {
-            Ok(rows) => total += rows,
-            Err(e) => {
-                drop(writer);
-                drop(out);
-                let _ = std::fs::remove_file(&part);
-                return Err(DbError::new(format!("{}: {}", job.table, e.message)));
-            }
+    }
+    export_tables(conn, &owner, settings, jobs, progress)
+}
+
+/// ORA-01555 "snapshot too old": the undo a query needs to read the rows
+/// as they were when it started was overwritten.
+const SNAPSHOT_TOO_OLD: i32 = 1555;
+
+/// ORA-01466 "table definition has changed": a read-only transaction can't
+/// read a table whose definition is newer than the transaction.
+const DEFINITION_CHANGED: i32 = 1466;
+
+/// How often a range of rows is read again after ORA-01555.
+const RETRIES: usize = 3;
+
+/// The tables' rows, each table into a file of its own.
+fn export_tables(
+    conn: &Connection,
+    owner: &str,
+    settings: &Settings,
+    jobs: &[Job],
+    progress: &Progress,
+) -> Result<u64, DbError> {
+    let mut total = 0;
+    for job in jobs {
+        if progress.stop.load(Ordering::Relaxed) {
+            return Err(DbError::new("stopped"));
         }
+        *progress.current.lock().expect("current") = job.table.clone();
+        let rows = export_table(conn, owner, settings, job, progress).map_err(|e| {
+            // Its code, for what the export says of ORA-01555.
+            let mut error = DbError::new(format!("{}: {}", job.table, e.message));
+            error.code = e.code;
+            error
+        })?;
+        total += rows;
         progress.tables_done.fetch_add(1, Ordering::Relaxed);
     }
     Ok(total)
+}
+
+/// One table's rows into its file, under its name once they are all in it.
+fn export_table(
+    conn: &Connection,
+    owner: &str,
+    settings: &Settings,
+    job: &Job,
+    progress: &Progress,
+) -> Result<u64, DbError> {
+    let base = crate::object_files::file_stem(&job.table);
+    // Invisible columns too (#444); INSERTs without the virtual ones,
+    // which Oracle refuses to write (#443).
+    let with_virtual = settings.format != Format::Insert;
+    let columns = dbcraft_db::compat::table_columns(conn, owner, &job.table, with_virtual)?;
+    let list = if columns.is_empty() {
+        "*".to_owned()
+    } else {
+        columns
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let select = format!(
+        "select {list} from {}.{}",
+        quote_ident(owner),
+        quote_ident(&job.table)
+    );
+    // A filter that is all comment is none (#427): `where -- x` failed.
+    let filter = dbcraft_plsql::tokenize(&job.filter)
+        .iter()
+        .any(|t| !t.kind.is_trivia())
+        .then_some(job.filter.as_str());
+    let ranges = match settings.read {
+        Read::Chunks => rowid_ranges(conn, owner, &job.table, settings.chunk_bytes),
+        Read::Consistent => vec![(None, None)],
+    };
+    let path = settings
+        .folder
+        .join(format!("{base}.{}", settings.format.extension()));
+    let io = |e: &dyn std::fmt::Display| DbError::new(format!("{}: {e}", path.display()));
+    // Under its name once it is whole: a DbCraft that was killed leaves no
+    // file that looks complete.
+    let part = crate::to_file::part_path(&path);
+    let create = || {
+        std::fs::File::create(&part)
+            .map(|file| std::io::BufWriter::with_capacity(1 << 20, file))
+            .map_err(|e| io(&e))
+    };
+    let mut out = Some(create()?);
+    let mut writer: Option<StreamWriter<std::io::BufWriter<std::fs::File>>> = None;
+    let options = insert_options(settings, &job.table);
+    let mut written = || -> Result<u64, DbError> {
+        let mut total = 0;
+        for (lo, hi) in &ranges {
+            let sql = range_query(&select, lo.as_deref(), hi.as_deref(), filter);
+            let mut retries = 0;
+            loop {
+                let mark = match writer.as_mut() {
+                    Some(w) => Some(w.mark().map_err(|e| io(&e))?),
+                    None => None,
+                };
+                let mut fetched = 0;
+                let result = dbcraft_db::stream_query(conn, &sql, 1000, |columns, rows| {
+                    if progress.stop.load(Ordering::Relaxed) {
+                        return Err(DbError::new("stopped"));
+                    }
+                    if let Some(out) = out.take() {
+                        writer = Some(
+                            StreamWriter::new(
+                                settings.format,
+                                columns.to_vec(),
+                                options.clone(),
+                                out,
+                            )
+                            .map_err(|e| io(&e))?,
+                        );
+                    }
+                    if let Some(w) = writer.as_mut() {
+                        w.write(rows).map_err(|e| io(&e))?;
+                    }
+                    fetched += rows.len() as u64;
+                    progress
+                        .rows
+                        .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                    Ok(())
+                });
+                match result {
+                    Ok(rows) => {
+                        total += rows;
+                        break;
+                    }
+                    // Read again, the rows of this range cut off the file:
+                    // each range is a query of its own, short enough that
+                    // the undo it needs is still there, most of the time.
+                    Err(e)
+                        if e.code == Some(SNAPSHOT_TOO_OLD)
+                            && settings.read == Read::Chunks
+                            && retries < RETRIES =>
+                    {
+                        retries += 1;
+                        tracing::warn!(table = job.table, retries, "{}: read again", e.text());
+                        progress.rows.fetch_sub(fetched, Ordering::Relaxed);
+                        match (&mark, writer.as_mut()) {
+                            (Some(mark), Some(w)) => w.rewind(mark).map_err(|e| io(&e))?,
+                            // Not even the header was written before.
+                            _ => {
+                                writer = None;
+                                out = Some(create()?);
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(total)
+    };
+    let result = written().and_then(|rows| {
+        if let Some(w) = writer.take() {
+            w.finish().map_err(|e| io(&e))?;
+        }
+        std::fs::rename(&part, &path).map_err(|e| io(&e))?;
+        Ok(rows)
+    });
+    if result.is_err() {
+        drop(writer);
+        drop(out);
+        let _ = std::fs::remove_file(&part);
+    }
+    result
+}
+
+/// `select`, the rows of the ROWID range from `lo` (inclusive) to `hi`
+/// (exclusive), either end open when `None`, and of `filter`.
+fn range_query(select: &str, lo: Option<&str>, hi: Option<&str>, filter: Option<&str>) -> String {
+    let mut conditions = Vec::new();
+    if let Some(lo) = lo {
+        conditions.push(format!("rowid >= chartorowid('{lo}')"));
+    }
+    if let Some(hi) = hi {
+        conditions.push(format!("rowid < chartorowid('{hi}')"));
+    }
+    // On a line of its own: a filter that ends in a `--` comment.
+    if let Some(filter) = filter {
+        conditions.push(format!("(\n{filter}\n)"));
+    }
+    if conditions.is_empty() {
+        select.to_owned()
+    } else {
+        format!("{select} where {}", conditions.join(" and "))
+    }
+}
+
+/// How much of a table a range of rows is read in.
+pub const CHUNK_BYTES: u64 = 256 << 20;
+
+/// ROWID ranges that a table's rows are read in, about `chunk` bytes of its
+/// extents each: from one range's start to the next one's, the first and
+/// the last open, so that together they hold every ROWID there is, whatever
+/// the extents are. Without access to DBA_EXTENTS, from a sample of the
+/// table's blocks instead. One range, open at both ends, when the table is
+/// small, isn't a heap (an index-organized table has no such ROWIDs) or its
+/// size isn't known (another user's table without statistics).
+fn rowid_ranges(
+    conn: &Connection,
+    owner: &str,
+    table: &str,
+    chunk: u64,
+) -> Vec<(Option<String>, Option<String>)> {
+    let starts = range_starts(conn, owner, table, chunk).unwrap_or_else(|e| {
+        tracing::debug!(table, "no ROWID ranges: {}", e.text());
+        Vec::new()
+    });
+    let mut ranges = Vec::with_capacity(starts.len() + 1);
+    let mut lo = None;
+    for start in starts {
+        ranges.push((lo, Some(start.clone())));
+        lo = Some(start);
+    }
+    ranges.push((lo, None));
+    ranges
+}
+
+/// The first ROWID of each range but the first: of the extent where the
+/// bytes of the extents before it pass another `chunk`. Needs DBA_EXTENTS:
+/// USER_EXTENTS has no blocks.
+fn range_starts(
+    conn: &Connection,
+    owner: &str,
+    table: &str,
+    chunk: u64,
+) -> Result<Vec<String>, DbError> {
+    // Binds go by position, in the order they appear.
+    let all = "select rowidtochar(dbms_rowid.rowid_create(1, obj, fno, block, 0))
+                 from (select obj, fno, block, g, lag(g) over (order by obj, fno, block) prev
+                         from (select o.data_object_id obj, e.relative_fno fno, e.block_id block,
+                                      trunc((sum(e.bytes) over (order by o.data_object_id,
+                                               e.relative_fno, e.block_id) - e.bytes) / :1) g
+                                 from dba_extents e
+                                 join all_objects o
+                                   on o.object_name = e.segment_name
+                                  and o.object_type = e.segment_type
+                                  and nvl(o.subobject_name, ' ') = nvl(e.partition_name, ' ')
+                                  and o.owner = e.owner and e.owner = :2
+                                where e.segment_name = :3
+                                  and e.segment_type in
+                                      ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')))
+                where prev is not null and g <> prev
+                order by obj, fno, block";
+    let chunk = chunk as i64;
+    let read = conn
+        .query_as::<String>(all, &[&chunk, &owner, &table])
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+    match read {
+        Ok(starts) => Ok(starts),
+        Err(e) => {
+            tracing::debug!(table, "no extents: {e}");
+            sampled_starts(conn, owner, table, chunk)
+        }
+    }
+}
+
+/// Range starts from the ROWIDs of a sample of a table's blocks, a few
+/// blocks a range: the table's size from USER_SEGMENTS for the user's own
+/// tables, else from its statistics. Ranges of uneven size where the
+/// sample is, but together still every row. Oracle samples blocks a
+/// multiblock read at a time, so that a table of few extents may give no
+/// rows or all of them: then from a sample of its rows, which reads it all,
+/// but a table that small is quick to read.
+fn sampled_starts(
+    conn: &Connection,
+    owner: &str,
+    table: &str,
+    chunk: i64,
+) -> Result<Vec<String>, DbError> {
+    let bytes: Option<i64> = conn.query_row_as(
+        "select case when t.iot_type is null then
+                  nvl((select sum(bytes) from user_segments
+                        where segment_name = :1 and segment_type like 'TABLE%'
+                          and user = :2),
+                      t.num_rows * t.avg_row_len)
+                end
+           from all_tables t
+          where t.owner = :3 and t.table_name = :4",
+        &[&table, &owner, &owner, &table],
+    )?;
+    let ranges = bytes.unwrap_or(0) / chunk.max(1);
+    if ranges < 2 {
+        return Ok(Vec::new());
+    }
+    let blocks = (bytes.unwrap_or(0) / 8192).max(1);
+    let percent = (100.0 * (ranges * 8) as f64 / blocks as f64).clamp(0.000001, 99.999999);
+    let sample = |of: &str| {
+        let sql = format!(
+            "select rowidtochar(min(rid))
+               from (select rowid rid, ntile(:1) over (order by rowid) g
+                       from {}.{} sample {of}({percent:.6}))
+              group by g
+             having g > 1
+              order by g",
+            quote_ident(owner),
+            quote_ident(table)
+        );
+        conn.query_as::<String>(&sql, &[&ranges])?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DbError::from)
+    };
+    let starts = sample("block ")?;
+    if (starts.len() as i64) + 1 < ranges {
+        return sample("");
+    }
+    Ok(starts)
 }
 
 #[cfg(test)]
@@ -634,6 +943,8 @@ mod tests {
             format: Format::Insert,
             options: Options::default(),
             include_ddl: false,
+            read: Read::Chunks,
+            chunk_bytes: CHUNK_BYTES,
         };
         let target = |table: &str| insert_options(&settings, table).table;
         assert_eq!(target("DEMO_EMPLOYEES"), "demo_employees");
@@ -669,6 +980,8 @@ mod tests {
             format: Format::Insert,
             options: Options::default(),
             include_ddl: false,
+            read: Read::Chunks,
+            chunk_bytes: CHUNK_BYTES,
         };
         let jobs = [Job {
             table: "R54_EXP_WORDS".into(),
@@ -719,6 +1032,8 @@ mod tests {
                 format,
                 options: Options::default(),
                 include_ddl: false,
+                read: Read::Chunks,
+                chunk_bytes: CHUNK_BYTES,
             };
             let jobs = [Job {
                 table: "FD_EXP_COLS".into(),
@@ -781,6 +1096,8 @@ mod tests {
             format: Format::Csv,
             options: Options::default(),
             include_ddl: true,
+            read: Read::Chunks,
+            chunk_bytes: CHUNK_BYTES,
         };
         let jobs: Vec<Job> = names
             .iter()
@@ -852,6 +1169,8 @@ mod tests {
                 ..Options::default()
             },
             include_ddl: true,
+            read: Read::Chunks,
+            chunk_bytes: CHUNK_BYTES,
         };
         let jobs = [Job {
             table: "DBCRAFT_EXP_A".into(),
@@ -885,5 +1204,130 @@ mod tests {
 
         conn.execute("drop table dbcraft_exp_a purge", &[]).unwrap();
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// A table larger than a chunk is read in ROWID ranges, which hold
+    /// every row once, also with a filter; read consistently, it is one
+    /// query, and not with changes not committed (they stay).
+    #[test]
+    fn exports_in_chunks_and_consistently() {
+        let Some(conn) = crate::test_db::connect("DBCRAFT_TEST_DB") else {
+            return;
+        };
+        let _ = conn.execute("drop table dbcraft_exp_c purge", &[]);
+        conn.execute(
+            "create table dbcraft_exp_c (id number primary key, pad varchar2(400))
+               storage (initial 64k next 64k)",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into dbcraft_exp_c
+             select level, rpad('x', 400, 'x') from dual connect by level <= 20000",
+            &[],
+        )
+        .unwrap();
+        conn.commit().unwrap();
+        let owner: String = conn.query_row_as("select user from dual", &[]).unwrap();
+        // 8 MB of rows, about 64 extents of 64 KB to 1 MB: from a sample of
+        // its blocks as the user, from DBA_EXTENTS as the DBA.
+        let ranges = rowid_ranges(&conn, &owner, "DBCRAFT_EXP_C", 256 << 10);
+        assert!(ranges.len() > 4, "{ranges:?}");
+        assert!(ranges[0].0.is_none() && ranges.last().unwrap().1.is_none());
+        if let Some(dba) = crate::test_db::connect("DBCRAFT_TEST_DB_DBA") {
+            let extents = range_starts(&dba, &owner, "DBCRAFT_EXP_C", 256 << 10).unwrap();
+            assert!(extents.len() > 4, "{extents:?}");
+        }
+        assert_eq!(
+            rowid_ranges(&conn, &owner, "DBCRAFT_EXP_C", CHUNK_BYTES),
+            [(None, None)],
+            "smaller than a chunk"
+        );
+
+        let folder = std::env::temp_dir().join(format!("dbcraft-exp-c-{}", std::process::id()));
+        let mut settings = Settings {
+            owner: String::new(),
+            folder: folder.clone(),
+            format: Format::Csv,
+            options: Options {
+                header: false,
+                ..Options::default()
+            },
+            include_ddl: false,
+            read: Read::Chunks,
+            chunk_bytes: 256 << 10,
+        };
+        let job = |filter: &str| Job {
+            table: "DBCRAFT_EXP_C".into(),
+            filter: filter.into(),
+        };
+        let ids = || {
+            let csv = std::fs::read_to_string(folder.join("dbcraft_exp_c.csv")).unwrap();
+            let mut ids: Vec<u32> = csv
+                .lines()
+                .map(|l| l.split(',').next().unwrap().parse().unwrap())
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let progress = Progress::default();
+        assert_eq!(
+            export(&conn, &settings, &[job("")], &progress).unwrap(),
+            20000
+        );
+        assert_eq!(progress.rows.load(Ordering::Relaxed), 20000);
+        assert_eq!(ids(), (1..=20000).collect::<Vec<_>>());
+        let filtered = export(
+            &conn,
+            &settings,
+            &[job("mod(id, 7) = 0 -- sevens")],
+            &Progress::default(),
+        );
+        assert_eq!(filtered.unwrap(), 20000 / 7);
+        assert_eq!(ids(), (1..=20000 / 7).map(|i| i * 7).collect::<Vec<_>>());
+
+        settings.read = Read::Consistent;
+        // Oracle maps SCNs to times by the few seconds: once in a while the
+        // table just created is too new for the transaction (ORA-01466).
+        let consistent = || export(&conn, &settings, &[job("")], &Progress::default());
+        let exported = consistent().or_else(|e| {
+            assert!(e.message.contains("export again"), "{e}");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            consistent()
+        });
+        assert_eq!(exported.unwrap(), 20000);
+        assert_eq!(ids().len(), 20000);
+        conn.execute("delete from dbcraft_exp_c where id = 1", &[])
+            .unwrap();
+        let err = export(&conn, &settings, &[job("")], &Progress::default()).unwrap_err();
+        assert!(
+            err.message.starts_with("Commit or roll back first"),
+            "{err}"
+        );
+        let left: i64 = conn
+            .query_row_as("select count(*) from dbcraft_exp_c", &[])
+            .unwrap();
+        assert_eq!(left, 19999, "the delete still pending");
+        conn.rollback().unwrap();
+
+        conn.execute("drop table dbcraft_exp_c purge", &[]).unwrap();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// The ranges' conditions, and a filter after them on a line of its
+    /// own, so that a `--` comment ends with it.
+    #[test]
+    fn range_queries() {
+        let select = "select a from s.t";
+        assert_eq!(range_query(select, None, None, None), select);
+        assert_eq!(
+            range_query(select, Some("AAA"), Some("BBB"), Some("a > 1 -- big")),
+            "select a from s.t where rowid >= chartorowid('AAA') and rowid < \
+             chartorowid('BBB') and (\na > 1 -- big\n)"
+        );
+        assert_eq!(
+            range_query(select, None, Some("BBB"), None),
+            "select a from s.t where rowid < chartorowid('BBB')"
+        );
     }
 }
