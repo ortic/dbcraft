@@ -1,6 +1,9 @@
 //! Export tables: several tables at once, each with an optional WHERE
 //! clause, one file per table (optionally with its DDL), streamed so table
-//! size doesn't matter.
+//! size doesn't matter. Oracle's tables are read by a task on the session;
+//! MySQL's and MariaDB's stream from the session itself ([`mysql`]).
+
+mod mysql;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -84,6 +87,11 @@ impl Default for ExportTables {
 
 #[derive(Default)]
 struct State {
+    /// The connection's database, as the window last drew (Oracle until it
+    /// did).
+    dialect: Option<Dialect>,
+    /// The MySQL session's time zone, which INSERT scripts set (#213).
+    time_zone: Option<String>,
     tables: Option<Result<Vec<Choice>, String>>,
     tables_request: Option<u64>,
     filter: String,
@@ -101,8 +109,20 @@ pub struct Choice {
 }
 
 struct Run {
+    /// The request running: the task, or on MySQL the table being read.
     id: u64,
     progress: Arc<Progress>,
+    mysql: Option<MySqlRun>,
+}
+
+/// An export on MySQL: the tables' columns first, then one table after the
+/// other.
+struct MySqlRun {
+    settings: Settings,
+    jobs: Vec<Job>,
+    prepared: Option<mysql::Prepared>,
+    /// The table being read.
+    next: usize,
 }
 
 #[derive(Default)]
@@ -112,6 +132,9 @@ pub struct Progress {
     pub rows: AtomicU64,
     pub current: Mutex<String>,
     pub stop: AtomicBool,
+    /// The rows of the table being written, on MySQL; `rows` has the
+    /// tables' before it.
+    pub current_rows: Arc<AtomicU64>,
 }
 
 /// One table to export.
@@ -170,10 +193,19 @@ impl ExportTables {
         self.start()
     }
 
-    /// The schema as typed, as Oracle reads it: `"my_schema"` as written,
-    /// others in uppercase (#337); empty for the current one.
+    fn dialect(&self) -> Dialect {
+        self.state.dialect.unwrap_or(Dialect::ORACLE)
+    }
+
+    fn mysql(&self) -> bool {
+        self.dialect() == Dialect::MYSQL
+    }
+
+    /// The schema as typed, as the database reads it: on Oracle
+    /// `"my_schema"` as written, others in uppercase (#337); empty for the
+    /// current one.
     fn owner(&self) -> String {
-        Dialect::ORACLE.typed_name(&self.owner)
+        self.dialect().typed_name(&self.owner)
     }
 
     fn load_tables(&mut self) -> Effects {
@@ -181,6 +213,11 @@ impl ExportTables {
         let owner = self.owner();
         let id = request_id();
         self.state.tables_request = Some(id);
+        if self.mysql() {
+            let task = mysql::load_tables(owner);
+            effects.request(Target::Own, DbRequest::Run { id, task });
+            return effects;
+        }
         let task: dbcraft_db::TaskFn = Box::new(move |conn: &Connection| {
             let owner = if owner.is_empty() {
                 conn.query_row_as::<String>(
@@ -244,11 +281,33 @@ impl ExportTables {
         };
         let progress = Arc::new(Progress::default());
         let id = request_id();
+        self.state.message = None;
+        if self.mysql() {
+            let task = mysql::prepare(
+                settings.owner.clone(),
+                jobs.clone(),
+                settings.folder.clone(),
+                settings.include_ddl,
+                settings.read == Read::Consistent,
+            );
+            self.state.run = Some(Run {
+                id,
+                progress,
+                mysql: Some(MySqlRun {
+                    settings,
+                    jobs,
+                    prepared: None,
+                    next: 0,
+                }),
+            });
+            effects.request(Target::Own, DbRequest::Run { id, task });
+            return effects;
+        }
         self.state.run = Some(Run {
             id,
             progress: progress.clone(),
+            mysql: None,
         });
-        self.state.message = None;
         let task: dbcraft_db::TaskFn = Box::new(move |conn: &Connection| {
             let rows = export(conn, &settings, &jobs, &progress)?;
             Ok(Box::new(rows) as Box<dyn std::any::Any + Send>)
@@ -258,9 +317,22 @@ impl ExportTables {
     }
 
     pub fn on_event(&mut self, event: DbEvent) -> Effects {
-        let DbEvent::TaskDone { id, result } = event else {
-            return Effects::default();
+        let (id, result) = match event {
+            DbEvent::TaskDone { id, result } => (id, result),
+            DbEvent::TimeZone(zone) => {
+                self.state.time_zone = Some(zone);
+                return Effects::default();
+            }
+            _ => return Effects::default(),
         };
+        if self
+            .state
+            .run
+            .as_ref()
+            .is_some_and(|r| r.id == id && r.mysql.is_some())
+        {
+            return self.mysql_step(result);
+        }
         let s = &mut self.state;
         if s.tables_request == Some(id) {
             s.tables_request = None;
@@ -288,12 +360,148 @@ impl ExportTables {
         Effects::default()
     }
 
+    /// A MySQL export's next step, once the one before is done: the first
+    /// table once the columns were read, the next once a table is written.
+    fn mysql_step(&mut self, result: dbcraft_db::TaskResult) -> Effects {
+        let unexpected = || DbError::new("unexpected result");
+        let Some(run) = self.state.run.as_mut() else {
+            return Effects::default();
+        };
+        let progress = run.progress.clone();
+        let Some(steps) = run.mysql.as_mut() else {
+            return Effects::default();
+        };
+        let done = match &steps.prepared {
+            None => result
+                .and_then(|r| r.downcast::<mysql::Prepared>().map_err(|_| unexpected()))
+                .map(|prepared| {
+                    progress
+                        .tables
+                        .store(prepared.tables.len(), Ordering::Relaxed);
+                    steps.prepared = Some(*prepared);
+                }),
+            Some(prepared) => {
+                let table = &prepared.tables[steps.next].name;
+                result
+                    .map_err(|e| mysql::failed(table, &e))
+                    .and_then(|r| r.downcast::<u64>().map_err(|_| unexpected()))
+                    .map(|rows| {
+                        progress.rows.fetch_add(*rows, Ordering::Relaxed);
+                        progress.current_rows.store(0, Ordering::Relaxed);
+                        progress.tables_done.fetch_add(1, Ordering::Relaxed);
+                        steps.next += 1;
+                    })
+            }
+        };
+        let next = done.and_then(|()| self.mysql_table());
+        match next {
+            Ok(Some(effects)) => effects,
+            Ok(None) => self.mysql_finish(None),
+            Err(e) => self.mysql_finish(Some(e)),
+        }
+    }
+
+    /// Starts writing the next table; `None` when all are written.
+    fn mysql_table(&mut self) -> Result<Option<Effects>, DbError> {
+        let time_zone = self.state.time_zone.clone();
+        let Some(run) = self.state.run.as_mut() else {
+            return Ok(None);
+        };
+        let Some(steps) = run.mysql.as_ref() else {
+            return Ok(None);
+        };
+        let Some(prepared) = &steps.prepared else {
+            return Ok(None);
+        };
+        let (Some(table), Some(job)) =
+            (prepared.tables.get(steps.next), steps.jobs.get(steps.next))
+        else {
+            return Ok(None);
+        };
+        if run.progress.stop.load(Ordering::Relaxed) {
+            return Err(DbError::new("stopped"));
+        }
+        let settings = &steps.settings;
+        *run.progress.current.lock().expect("current") = table.name.clone();
+        let path = mysql::data_path(&settings.folder, &table.name, settings.format.extension());
+        let options = Options {
+            table: Dialect::MYSQL.quote_ident(&table.name),
+            dialect: Dialect::MYSQL,
+            time_zone,
+            generated: table.generated.clone(),
+            ..settings.options.clone()
+        };
+        let sink = crate::to_file::Sink::new(
+            &path,
+            settings.format,
+            options,
+            run.progress.current_rows.clone(),
+        )?;
+        let filter = dbcraft_plsql::tokenize_in(&job.filter, Dialect::MYSQL.syntax())
+            .iter()
+            .any(|t| !t.kind.is_trivia())
+            .then_some(job.filter.as_str());
+        let sql = mysql::select(&prepared.schema, table, filter);
+        let id = request_id();
+        run.id = id;
+        let mut effects = Effects::default();
+        effects.request(
+            Target::Own,
+            DbRequest::ExecuteInto {
+                id,
+                sql,
+                max_rows: crate::to_file::BATCH,
+                sink: Box::new(sink),
+            },
+        );
+        Ok(Some(effects))
+    }
+
+    /// Ends a MySQL export, the transaction of a consistent one too.
+    fn mysql_finish(&mut self, error: Option<DbError>) -> Effects {
+        let mut effects = Effects::default();
+        let Some(run) = self.state.run.take() else {
+            return effects;
+        };
+        let Some(steps) = run.mysql else {
+            return effects;
+        };
+        if steps.settings.read == Read::Consistent && steps.prepared.is_some() {
+            let task = mysql::end_transaction();
+            effects.request(
+                Target::Own,
+                DbRequest::Run {
+                    id: request_id(),
+                    task,
+                },
+            );
+        }
+        let p = &run.progress;
+        let tables = p.tables_done.load(Ordering::Relaxed);
+        self.state.message = Some(match error {
+            None => (
+                false,
+                format!(
+                    "Exported {} rows from {tables} table(s) to {}",
+                    p.rows.load(Ordering::Relaxed),
+                    steps.settings.folder.display()
+                ),
+            ),
+            Some(_) if p.stop.load(Ordering::Relaxed) => {
+                (true, format!("Stopped after {tables} table(s)"))
+            }
+            Some(e) => (true, e.text()),
+        });
+        effects
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
         if !cx.connected {
             ui.centered_and_justified(|ui| ui.weak("Connect to export tables"));
             return effects;
         }
+        self.state.dialect = Some(cx.dialect);
         if self.state.tables.is_none() && self.state.tables_request.is_none() {
             effects.extend(self.load_tables());
         }
@@ -308,7 +516,7 @@ impl ExportTables {
 
         let mut reload = false;
         ui.horizontal(|ui| {
-            ui.label("Schema");
+            ui.label(if self.mysql() { "Database" } else { "Schema" });
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.owner)
                     .hint_text("current")
@@ -353,6 +561,12 @@ impl ExportTables {
 
     fn tables_ui(&mut self, ui: &mut Ui) {
         let needle = self.state.filter.trim().to_uppercase();
+        let dialect = self.dialect();
+        let hint = if dialect == Dialect::MYSQL {
+            "all rows, or e.g. created > now() - interval 30 day"
+        } else {
+            "all rows, or e.g. created > sysdate - 30"
+        };
         match &mut self.state.tables {
             None => {
                 ui.spinner();
@@ -382,17 +596,14 @@ impl ExportTables {
                                 {
                                     ui.checkbox(
                                         &mut t.selected,
-                                        RichText::new(crate::browser::shown_name(
-                                            Dialect::ORACLE,
-                                            &t.name,
-                                        ))
-                                        .monospace(),
+                                        RichText::new(crate::browser::shown_name(dialect, &t.name))
+                                            .monospace(),
                                     );
                                     ui.weak(t.rows.map_or_else(|| "?".into(), |r| r.to_string()));
                                     ui.add_enabled(
                                         t.selected,
                                         egui::TextEdit::singleline(&mut t.filter)
-                                            .hint_text("all rows, or e.g. created > sysdate - 30")
+                                            .hint_text(hint)
                                             .font(egui::TextStyle::Monospace)
                                             .desired_width(360.0),
                                     );
@@ -461,7 +672,24 @@ impl ExportTables {
                 });
                 ui.end_row();
                 ui.label("Read");
+                let mysql = self.mysql();
                 ui.horizontal(|ui| {
+                    if mysql {
+                        ui.selectable_value(&mut self.read, Read::Chunks, "Table by table")
+                            .on_hover_text(
+                                "Each table is one query, as the table was when it began: \
+                                 MySQL keeps a query's snapshot as long as it runs. Tables are \
+                                 read at different moments.",
+                            );
+                        ui.selectable_value(&mut self.read, Read::Consistent, "Consistent")
+                            .on_hover_text(
+                                "All tables as they were when the export began, in one \
+                                 transaction with a consistent snapshot (InnoDB tables: \
+                                 MyISAM keeps no versions). The server keeps the old versions \
+                                 of rows changed meanwhile until the last table is read.",
+                            );
+                        return;
+                    }
                     ui.selectable_value(&mut self.read, Read::Chunks, "In chunks")
                         .on_hover_text(
                             "Large tables are read in ranges of rows, each a short query: \
@@ -499,8 +727,8 @@ impl ExportTables {
                 );
                 ui.weak(format!(
                     "{} · {} rows",
-                    crate::browser::shown_name(Dialect::ORACLE, &current),
-                    p.rows.load(Ordering::Relaxed)
+                    crate::browser::shown_name(self.dialect(), &current),
+                    p.rows.load(Ordering::Relaxed) + p.current_rows.load(Ordering::Relaxed)
                 ));
                 if ui.button("Stop").clicked() {
                     p.stop.store(true, Ordering::Relaxed);
