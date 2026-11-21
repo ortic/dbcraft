@@ -6,6 +6,17 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Oracle: *Export tables* reads a large table in chunks, ranges of ROWIDs
+  of about 256 MB each (from DBA_EXTENTS, or a sample of the table's
+  blocks without access to it), every one a query of its own: a
+  multi-hour read of one table could fail with ORA-01555 (snapshot too
+  old) once the undo it needed was overwritten, and the whole file was
+  lost. A range that fails so is cut off the file and read again, up to
+  three times. Or *Read: Consistent*: all tables as they were when the
+  export began, in one read-only transaction, which needs the undo to
+  reach back that far.
+
 ### Changed
 - *Execute to file* on MySQL, MariaDB, PostgreSQL, SQL Server and SQLite:
   the session writes the rows itself, fetching batch after batch, as on

@@ -327,6 +327,41 @@ impl<W: Write> StreamWriter<W> {
     }
 }
 
+/// Where a file stood, to go back to with [`StreamWriter::rewind`].
+#[derive(Debug, Clone)]
+pub struct Mark {
+    len: u64,
+    rows: u64,
+    columns: Vec<Column>,
+}
+
+impl StreamWriter<std::io::BufWriter<std::fs::File>> {
+    /// Where the file stands now, its rows written out.
+    pub fn mark(&mut self) -> Result<Mark> {
+        use std::io::Seek;
+        self.out.flush()?;
+        Ok(Mark {
+            len: self.out.get_mut().stream_position()?,
+            rows: self.rows,
+            columns: self.columns.clone(),
+        })
+    }
+
+    /// Goes back to `mark`: what was written since is cut off the file, to
+    /// be written again (a range of rows read again after an error).
+    pub fn rewind(&mut self, mark: &Mark) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        // What the buffer holds goes out first, and is cut off with the rest.
+        self.out.flush()?;
+        let file = self.out.get_mut();
+        file.set_len(mark.len)?;
+        file.seek(SeekFrom::Start(mark.len))?;
+        self.rows = mark.rows;
+        self.columns = mark.columns.clone();
+        Ok(())
+    }
+}
+
 /// Indents a pretty-printed JSON object by two spaces (array element).
 fn indent(text: &str) -> String {
     text.lines()
@@ -1590,6 +1625,33 @@ mod tests {
     use std::cell::Cell as Counter;
 
     use super::*;
+
+    /// Rows written after a mark are cut off by a rewind, and written
+    /// again they make the file it would have been: a JSON array with its
+    /// commas where they belong.
+    #[test]
+    fn rewind_cuts_off_what_came_after_the_mark() {
+        let path = std::env::temp_dir().join(format!("dbcraft-rewind-{}.json", std::process::id()));
+        let columns = vec![Column {
+            name: "n".into(),
+            type_name: "int".into(),
+            numeric: true,
+        }];
+        let row = |n: i32| vec![Some(n.to_string())];
+        let file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut w = StreamWriter::new(Format::Json, columns, Options::default(), file).unwrap();
+        w.write(&[row(1)]).unwrap();
+        let mark = w.mark().unwrap();
+        w.write(&[row(2), row(3)]).unwrap();
+        w.rewind(&mark).unwrap();
+        assert_eq!(w.rows(), 1);
+        w.write(&[row(2)]).unwrap();
+        w.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value, serde_json::json!([{"n": 1}, {"n": 2}]));
+    }
 
     /// INSERTs leave out the columns the database computes and tell it to
     /// take an identity's values (#457).
