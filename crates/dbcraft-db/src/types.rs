@@ -76,6 +76,19 @@ pub trait Client {
 /// A closure run on the session's worker thread with its [`Client`].
 pub type RunFn = Box<dyn FnOnce(&mut dyn Client) -> TaskResult + Send>;
 
+/// Where the rows of a [`DbRequest::ExecuteInto`] go, on the session's
+/// thread: a file *Execute to file* writes.
+pub trait RowSink: Send {
+    /// The result's columns, before its rows.
+    fn columns(&mut self, columns: &[Column]) -> Result<(), DbError>;
+    /// The columns' types changed, for the rows that come next (#482).
+    fn retype(&mut self, columns: &[Column]);
+    /// Writes rows; returns how many were written so far.
+    fn rows(&mut self, rows: &[Vec<Cell>]) -> Result<u64, DbError>;
+    /// Completes what was written. A sink dropped unfinished removes it.
+    fn finish(self: Box<Self>) -> Result<(), DbError>;
+}
+
 pub enum DbRequest {
     /// Executes one statement. Queries return the first `max_rows` rows.
     Execute {
@@ -93,6 +106,16 @@ pub enum DbRequest {
         id: u64,
         sql: String,
         max_rows: usize,
+    },
+    /// [`ExecuteWhole`](Self::ExecuteWhole) whose rows the session hands
+    /// to `sink` itself, fetching batch after batch without waiting for
+    /// the window to draw a frame. Answered with [`DbEvent::TaskDone`]: the
+    /// rows written (a `u64`), or what stopped them, the sink dropped.
+    ExecuteInto {
+        id: u64,
+        sql: String,
+        max_rows: usize,
+        sink: Box<dyn RowSink>,
     },
     /// Data dictionary lookup; answered with [`DbEvent::Meta`].
     Meta {
@@ -140,6 +163,14 @@ impl fmt::Debug for DbRequest {
                 .finish(),
             DbRequest::ExecuteWhole { id, sql, max_rows } => f
                 .debug_struct("ExecuteWhole")
+                .field("id", id)
+                .field("sql", sql)
+                .field("max_rows", max_rows)
+                .finish(),
+            DbRequest::ExecuteInto {
+                id, sql, max_rows, ..
+            } => f
+                .debug_struct("ExecuteInto")
                 .field("id", id)
                 .field("sql", sql)
                 .field("max_rows", max_rows)

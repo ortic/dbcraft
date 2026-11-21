@@ -474,6 +474,46 @@ fn whole_values_for_a_file() {
     }
 }
 
+/// The session writes the rows of an `ExecuteInto` itself, batch after
+/// batch, without a `FetchMore` from the window (Execute to file), and
+/// answers with the rows written; the session goes on after it.
+#[test]
+fn rows_into_a_sink() {
+    use std::sync::{Arc, Mutex};
+    struct Count(Arc<Mutex<Vec<usize>>>, u64);
+    impl dbcraft_db::RowSink for Count {
+        fn columns(&mut self, _: &[dbcraft_db::Column]) -> Result<(), dbcraft_db::DbError> {
+            Ok(())
+        }
+        fn retype(&mut self, _: &[dbcraft_db::Column]) {}
+        fn rows(&mut self, rows: &[Vec<dbcraft_db::Cell>]) -> Result<u64, dbcraft_db::DbError> {
+            self.0.lock().unwrap().push(rows.len());
+            self.1 += rows.len() as u64;
+            Ok(self.1)
+        }
+        fn finish(self: Box<Self>) -> Result<(), dbcraft_db::DbError> {
+            Ok(())
+        }
+    }
+    let db = TempDb::new("into");
+    let mut h = Harness::connect(&db.create());
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    h.session.send(DbRequest::ExecuteInto {
+        id: 1,
+        sql: "with recursive n(n) as (select 1 union all select n + 1 from n where n < 2500) \
+              select n from n"
+            .into(),
+        max_rows: 1000,
+        sink: Box::new(Count(batches.clone(), 0)),
+    });
+    let DbEvent::TaskDone { id: 1, result } = h.next_result() else {
+        panic!("expected the answer")
+    };
+    assert_eq!(*result.unwrap().downcast::<u64>().unwrap(), 2500);
+    assert_eq!(*batches.lock().unwrap(), [1000, 1000, 500]);
+    assert_eq!(h.scalar("select 42").as_deref(), Some("42"));
+}
+
 #[test]
 fn values_types_and_binds() {
     let db = TempDb::new("values");

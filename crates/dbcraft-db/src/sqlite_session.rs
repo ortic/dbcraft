@@ -123,6 +123,9 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
                 max_rows,
                 binds,
             } => next = worker.execute(id, &sql, max_rows, &binds, &requests, false),
+            DbRequest::ExecuteInto { .. } => {
+                unreachable!("the session hands it over as ExecuteWhole")
+            }
             DbRequest::ExecuteWhole { id, sql, max_rows } => {
                 next = worker.execute(id, &sql, max_rows, &[], &requests, true)
             }
