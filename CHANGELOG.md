@@ -7,12 +7,16 @@ and the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- MySQL and MariaDB: *Export tables*, as on Oracle: the tables of a
-  database, a WHERE per table, one file per table with its DDL (`SHOW
-  CREATE TABLE`) next to it. Each table streams from the session into its
-  file batch by batch; *Read: Consistent* reads all of them in one
-  transaction with a consistent snapshot. INSERTs leave out generated
-  columns and keep invisible ones.
+- *Export tables* on every database, as on Oracle: MySQL and MariaDB,
+  PostgreSQL, SQL Server and SQLite. The tables of a schema (a database
+  on MySQL), a WHERE per table, one file per table with its DDL next to
+  it. Each table streams from the session into its file batch by batch;
+  *Read: Consistent* reads all of them in one transaction: with a
+  consistent snapshot on MySQL, `REPEATABLE READ` on PostgreSQL,
+  `SNAPSHOT` on SQL Server (which says when the database doesn't allow
+  it). INSERTs leave out generated and computed columns, keep MySQL's
+  invisible ones, and give PostgreSQL's and SQL Server's identities their
+  values.
 - Oracle: *Export tables* reads a large table in chunks, ranges of ROWIDs
   of about 256 MB each (from DBA_EXTENTS, or a sample of the table's
   blocks without access to it), every one a query of its own: a
@@ -35,6 +39,9 @@ and the project uses [Semantic Versioning](https://semver.org/).
   its power left a file cut short under its name, which looked whole.
 
 ### Fixed
+- SQL Server: *Execute to file* of a query that failed after its first
+  rows (a divide by zero, a deadlock) left a file cut short that looked
+  whole, and said it was done; the error is said and the file removed.
 - Oracle: *Execute to file* and *Export tables* of a table with large LOBs
   no longer run out of memory. A batch held 1000 rows whatever their size,
   and the driver fetched as many at once; a batch now ends at 64 MB, as on

@@ -120,6 +120,7 @@ impl Dialect {
                     | Feature::EditResults
                     | Feature::AccountEditors
                     | Feature::ExecuteToFile
+                    | Feature::ExportTables
             ),
             // A file: no server to monitor, no accounts, nothing to tunnel.
             DbKind::Sqlite => matches!(
@@ -128,6 +129,7 @@ impl Dialect {
                     | Feature::Completion
                     | Feature::ExecuteToFile
                     | Feature::EditResults
+                    | Feature::ExportTables
             ),
         }
     }
@@ -445,7 +447,10 @@ mod tests {
         ] {
             assert!(Dialect::MYSQL.supports(feature));
         }
-        assert!(!Dialect::POSTGRES.supports(Feature::ExportTables));
+        // Export tables reads any database's tables, one query each.
+        for dialect in [Dialect::POSTGRES, Dialect::SQLSERVER, Dialect::SQLITE] {
+            assert!(dialect.supports(Feature::ExportTables));
+        }
         // Execute to file streams any database's result (the window fetches
         // it batch by batch).
         for dialect in [

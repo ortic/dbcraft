@@ -4362,3 +4362,58 @@ fn module_ddl_keeps_descriptions() {
     }
     cleanup(&mut h);
 }
+
+/// A file's rows that end in an error answer with the error: the file
+/// would look whole otherwise. A divide by zero at row 1500 comes after
+/// the first batch was written.
+#[test]
+fn rows_into_a_sink_that_end_in_an_error() {
+    struct Count(u64);
+    impl dbcraft_db::RowSink for Count {
+        fn columns(&mut self, _: &[dbcraft_db::Column]) -> Result<(), dbcraft_db::DbError> {
+            Ok(())
+        }
+        fn retype(&mut self, _: &[dbcraft_db::Column]) {}
+        fn rows(&mut self, rows: &[Vec<dbcraft_db::Cell>]) -> Result<u64, dbcraft_db::DbError> {
+            self.0 += rows.len() as u64;
+            Ok(self.0)
+        }
+        fn finish(self: Box<Self>) -> Result<(), dbcraft_db::DbError> {
+            Ok(())
+        }
+    }
+    let Some(mut h) = Harness::connect() else {
+        eprintln!("DBCRAFT_TEST_MSSQL not set, skipping");
+        return;
+    };
+    for (id, sql, ok) in [
+        (1, numbers(2500), true),
+        (
+            2,
+            "with r (n) as (select 1 union all select n + 1 from r where n < 2500) \
+             select n, 1 / (1500 - n) as x from r option (maxrecursion 0)"
+                .to_owned(),
+            false,
+        ),
+    ] {
+        h.session.send(DbRequest::ExecuteInto {
+            id,
+            sql,
+            max_rows: 1000,
+            sink: Box::new(Count(0)),
+        });
+        let result = loop {
+            if let DbEvent::TaskDone { id: done, result } = h.next_result()
+                && done == id
+            {
+                break result;
+            }
+        };
+        match result {
+            Ok(rows) if ok => assert_eq!(*rows.downcast::<u64>().unwrap(), 2500),
+            Err(e) if !ok => assert_eq!(e.code, Some(8134), "{e}"),
+            other => panic!("{id}: {:?}", other.map(|r| r.downcast::<u64>().ok())),
+        }
+    }
+    assert_eq!(h.scalar("select 42").as_deref(), Some("42"));
+}

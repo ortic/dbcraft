@@ -1,9 +1,9 @@
 //! Export tables: several tables at once, each with an optional WHERE
 //! clause, one file per table (optionally with its DDL), streamed so table
 //! size doesn't matter. Oracle's tables are read by a task on the session;
-//! MySQL's and MariaDB's stream from the session itself ([`mysql`]).
+//! the other databases' stream from the session itself ([`others`]).
 
-mod mysql;
+mod others;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -90,7 +90,7 @@ struct State {
     /// The connection's database, as the window last drew (Oracle until it
     /// did).
     dialect: Option<Dialect>,
-    /// The MySQL session's time zone, which INSERT scripts set (#213).
+    /// The MySQL session's time zone, which its INSERT scripts set (#213).
     time_zone: Option<String>,
     tables: Option<Result<Vec<Choice>, String>>,
     tables_request: Option<u64>,
@@ -109,18 +109,20 @@ pub struct Choice {
 }
 
 struct Run {
-    /// The request running: the task, or on MySQL the table being read.
+    /// The request running: the task, or on the other databases the table
+    /// being read.
     id: u64,
     progress: Arc<Progress>,
-    mysql: Option<MySqlRun>,
+    streamed: Option<Streamed>,
 }
 
-/// An export on MySQL: the tables' columns first, then one table after the
-/// other.
-struct MySqlRun {
+/// An export on a database other than Oracle: the tables' columns first,
+/// then one table after the other.
+struct Streamed {
+    dialect: Dialect,
     settings: Settings,
     jobs: Vec<Job>,
-    prepared: Option<mysql::Prepared>,
+    prepared: Option<others::Prepared>,
     /// The table being read.
     next: usize,
 }
@@ -132,8 +134,8 @@ pub struct Progress {
     pub rows: AtomicU64,
     pub current: Mutex<String>,
     pub stop: AtomicBool,
-    /// The rows of the table being written, on MySQL; `rows` has the
-    /// tables' before it.
+    /// The rows of the table being written, on the databases other than
+    /// Oracle; `rows` has the tables' before it.
     pub current_rows: Arc<AtomicU64>,
 }
 
@@ -197,8 +199,8 @@ impl ExportTables {
         self.state.dialect.unwrap_or(Dialect::ORACLE)
     }
 
-    fn mysql(&self) -> bool {
-        self.dialect() == Dialect::MYSQL
+    fn oracle(&self) -> bool {
+        self.dialect() == Dialect::ORACLE
     }
 
     /// The schema as typed, as the database reads it: on Oracle
@@ -213,8 +215,8 @@ impl ExportTables {
         let owner = self.owner();
         let id = request_id();
         self.state.tables_request = Some(id);
-        if self.mysql() {
-            let task = mysql::load_tables(owner);
+        if !self.oracle() {
+            let task = others::load_tables(owner);
             effects.request(Target::Own, DbRequest::Run { id, task });
             return effects;
         }
@@ -282,8 +284,8 @@ impl ExportTables {
         let progress = Arc::new(Progress::default());
         let id = request_id();
         self.state.message = None;
-        if self.mysql() {
-            let task = mysql::prepare(
+        if !self.oracle() {
+            let task = others::prepare(
                 settings.owner.clone(),
                 jobs.clone(),
                 settings.folder.clone(),
@@ -293,7 +295,8 @@ impl ExportTables {
             self.state.run = Some(Run {
                 id,
                 progress,
-                mysql: Some(MySqlRun {
+                streamed: Some(Streamed {
+                    dialect: self.dialect(),
                     settings,
                     jobs,
                     prepared: None,
@@ -306,7 +309,7 @@ impl ExportTables {
         self.state.run = Some(Run {
             id,
             progress: progress.clone(),
-            mysql: None,
+            streamed: None,
         });
         let task: dbcraft_db::TaskFn = Box::new(move |conn: &Connection| {
             let rows = export(conn, &settings, &jobs, &progress)?;
@@ -329,9 +332,9 @@ impl ExportTables {
             .state
             .run
             .as_ref()
-            .is_some_and(|r| r.id == id && r.mysql.is_some())
+            .is_some_and(|r| r.id == id && r.streamed.is_some())
         {
-            return self.mysql_step(result);
+            return self.streamed_step(result);
         }
         let s = &mut self.state;
         if s.tables_request == Some(id) {
@@ -360,20 +363,21 @@ impl ExportTables {
         Effects::default()
     }
 
-    /// A MySQL export's next step, once the one before is done: the first
-    /// table once the columns were read, the next once a table is written.
-    fn mysql_step(&mut self, result: dbcraft_db::TaskResult) -> Effects {
+    /// A streamed export's next step, once the one before is done: the
+    /// first table once the columns were read, the next once a table is
+    /// written.
+    fn streamed_step(&mut self, result: dbcraft_db::TaskResult) -> Effects {
         let unexpected = || DbError::new("unexpected result");
         let Some(run) = self.state.run.as_mut() else {
             return Effects::default();
         };
         let progress = run.progress.clone();
-        let Some(steps) = run.mysql.as_mut() else {
+        let Some(steps) = run.streamed.as_mut() else {
             return Effects::default();
         };
         let done = match &steps.prepared {
             None => result
-                .and_then(|r| r.downcast::<mysql::Prepared>().map_err(|_| unexpected()))
+                .and_then(|r| r.downcast::<others::Prepared>().map_err(|_| unexpected()))
                 .map(|prepared| {
                     progress
                         .tables
@@ -383,7 +387,7 @@ impl ExportTables {
             Some(prepared) => {
                 let table = &prepared.tables[steps.next].name;
                 result
-                    .map_err(|e| mysql::failed(table, &e))
+                    .map_err(|e| others::failed(steps.dialect, table, &e))
                     .and_then(|r| r.downcast::<u64>().map_err(|_| unexpected()))
                     .map(|rows| {
                         progress.rows.fetch_add(*rows, Ordering::Relaxed);
@@ -393,23 +397,24 @@ impl ExportTables {
                     })
             }
         };
-        let next = done.and_then(|()| self.mysql_table());
+        let next = done.and_then(|()| self.streamed_table());
         match next {
             Ok(Some(effects)) => effects,
-            Ok(None) => self.mysql_finish(None),
-            Err(e) => self.mysql_finish(Some(e)),
+            Ok(None) => self.streamed_finish(None),
+            Err(e) => self.streamed_finish(Some(e)),
         }
     }
 
     /// Starts writing the next table; `None` when all are written.
-    fn mysql_table(&mut self) -> Result<Option<Effects>, DbError> {
+    fn streamed_table(&mut self) -> Result<Option<Effects>, DbError> {
         let time_zone = self.state.time_zone.clone();
         let Some(run) = self.state.run.as_mut() else {
             return Ok(None);
         };
-        let Some(steps) = run.mysql.as_ref() else {
+        let Some(steps) = run.streamed.as_ref() else {
             return Ok(None);
         };
+        let dialect = steps.dialect;
         let Some(prepared) = &steps.prepared else {
             return Ok(None);
         };
@@ -423,12 +428,13 @@ impl ExportTables {
         }
         let settings = &steps.settings;
         *run.progress.current.lock().expect("current") = table.name.clone();
-        let path = mysql::data_path(&settings.folder, &table.name, settings.format.extension());
+        let path = others::data_path(&settings.folder, &table.name, settings.format.extension());
         let options = Options {
-            table: Dialect::MYSQL.quote_ident(&table.name),
-            dialect: Dialect::MYSQL,
-            time_zone,
+            table: dialect.quote_ident(&table.name),
+            dialect,
+            time_zone: time_zone.filter(|_| dialect == Dialect::MYSQL),
             generated: table.generated.clone(),
+            identity: table.identity.clone(),
             ..settings.options.clone()
         };
         let sink = crate::to_file::Sink::new(
@@ -437,11 +443,11 @@ impl ExportTables {
             options,
             run.progress.current_rows.clone(),
         )?;
-        let filter = dbcraft_plsql::tokenize_in(&job.filter, Dialect::MYSQL.syntax())
+        let filter = dbcraft_plsql::tokenize_in(&job.filter, dialect.syntax())
             .iter()
             .any(|t| !t.kind.is_trivia())
             .then_some(job.filter.as_str());
-        let sql = mysql::select(&prepared.schema, table, filter);
+        let sql = others::select(dialect, &prepared.schema, table, filter);
         let id = request_id();
         run.id = id;
         let mut effects = Effects::default();
@@ -457,17 +463,17 @@ impl ExportTables {
         Ok(Some(effects))
     }
 
-    /// Ends a MySQL export, the transaction of a consistent one too.
-    fn mysql_finish(&mut self, error: Option<DbError>) -> Effects {
+    /// Ends a streamed export, the transaction of a consistent one too.
+    fn streamed_finish(&mut self, error: Option<DbError>) -> Effects {
         let mut effects = Effects::default();
         let Some(run) = self.state.run.take() else {
             return effects;
         };
-        let Some(steps) = run.mysql else {
+        let Some(steps) = run.streamed else {
             return effects;
         };
         if steps.settings.read == Read::Consistent && steps.prepared.is_some() {
-            let task = mysql::end_transaction();
+            let task = others::end_transaction();
             effects.request(
                 Target::Own,
                 DbRequest::Run {
@@ -516,7 +522,11 @@ impl ExportTables {
 
         let mut reload = false;
         ui.horizontal(|ui| {
-            ui.label(if self.mysql() { "Database" } else { "Schema" });
+            ui.label(if self.dialect() == Dialect::MYSQL {
+                "Database"
+            } else {
+                "Schema"
+            });
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.owner)
                     .hint_text("current")
@@ -562,10 +572,12 @@ impl ExportTables {
     fn tables_ui(&mut self, ui: &mut Ui) {
         let needle = self.state.filter.trim().to_uppercase();
         let dialect = self.dialect();
-        let hint = if dialect == Dialect::MYSQL {
-            "all rows, or e.g. created > now() - interval 30 day"
-        } else {
-            "all rows, or e.g. created > sysdate - 30"
+        let hint = match dialect {
+            Dialect::ORACLE => "all rows, or e.g. created > sysdate - 30",
+            Dialect::MYSQL => "all rows, or e.g. created > now() - interval 30 day",
+            Dialect::POSTGRES => "all rows, or e.g. created > now() - interval '30 days'",
+            Dialect::SQLSERVER => "all rows, or e.g. created > dateadd(day, -30, getdate())",
+            _ => "all rows, or e.g. created > date('now', '-30 days')",
         };
         match &mut self.state.tables {
             None => {
@@ -672,22 +684,41 @@ impl ExportTables {
                 });
                 ui.end_row();
                 ui.label("Read");
-                let mysql = self.mysql();
+                let dialect = self.dialect();
                 ui.horizontal(|ui| {
-                    if mysql {
+                    if dialect != Dialect::ORACLE {
                         ui.selectable_value(&mut self.read, Read::Chunks, "Table by table")
                             .on_hover_text(
                                 "Each table is one query, as the table was when it began: \
-                                 MySQL keeps a query's snapshot as long as it runs. Tables are \
-                                 read at different moments.",
+                                 the database keeps a query's snapshot as long as it runs. \
+                                 Tables are read at different moments.",
                             );
-                        ui.selectable_value(&mut self.read, Read::Consistent, "Consistent")
-                            .on_hover_text(
+                        let consistent = match dialect {
+                            Dialect::MYSQL => {
                                 "All tables as they were when the export began, in one \
                                  transaction with a consistent snapshot (InnoDB tables: \
                                  MyISAM keeps no versions). The server keeps the old versions \
-                                 of rows changed meanwhile until the last table is read.",
-                            );
+                                 of rows changed meanwhile until the last table is read."
+                            }
+                            Dialect::POSTGRES => {
+                                "All tables as they were when the export began, in one \
+                                 read-only REPEATABLE READ transaction. VACUUM can't remove \
+                                 rows changed meanwhile until the last table is read."
+                            }
+                            Dialect::SQLSERVER => {
+                                "All tables as they were when the export began, in one \
+                                 SNAPSHOT transaction: the database needs \
+                                 ALLOW_SNAPSHOT_ISOLATION ON. tempdb keeps the old versions \
+                                 of rows changed meanwhile until the last table is read."
+                            }
+                            _ => {
+                                "All tables as they were when the export began, in one \
+                                 transaction. Other connections' writes wait for it unless \
+                                 the database is in WAL mode."
+                            }
+                        };
+                        ui.selectable_value(&mut self.read, Read::Consistent, "Consistent")
+                            .on_hover_text(consistent);
                         return;
                     }
                     ui.selectable_value(&mut self.read, Read::Chunks, "In chunks")

@@ -328,6 +328,13 @@ Pythia's settings, connections and saved passwords.
   Transactions work as with
   Oracle; on PostgreSQL a failing statement doesn't abort the transaction,
   and notices (`RAISE NOTICE`) show as messages.
+- *Tools → Export Tables…* as on MySQL: a schema's tables, a WHERE per
+  table, one file per table and its DDL, each streamed from the session.
+  *Consistent* reads all of them in one read-only `REPEATABLE READ`
+  transaction on PostgreSQL, a `SNAPSHOT` one on SQL Server (which needs
+  `ALLOW_SNAPSHOT_ISOLATION ON`). INSERTs leave out generated and computed
+  columns and rowversions, and give identities their values
+  (`OVERRIDING SYSTEM VALUE`, `SET IDENTITY_INSERT`).
 - *Edit* on a result of one table changes its rows in place, as on
   MySQL: rows are found by the table's primary key (or a unique key on
   NOT NULL columns), which DbCraft adds to the result if the query doesn't
@@ -413,6 +420,10 @@ Pythia's settings, connections and saved passwords.
   index on NOT NULL columns, or else its `rowid`, so every table can be
   edited (a view can't). Applying checks the values that were fetched; a
   number is found whether the column holds it as a number or as text.
+- *Tools → Export Tables…*: a database's tables (`main` or an attached
+  one), a WHERE per table, one file per table and its DDL; *Consistent*
+  reads all of them in one transaction. INSERTs leave out generated
+  columns.
 - Scripts end each statement at `;`; a trigger's `BEGIN … END` keeps its
   own.
 - *Maintenance* of a table or index: `ANALYZE`, `REINDEX` and an integrity
