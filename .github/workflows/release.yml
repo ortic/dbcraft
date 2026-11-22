@@ -117,6 +117,18 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
+      # cargo-packager names the .dmg after the product, DbCraft_0.14.0_x64.dmg,
+      # the others after the binary: dbcraft_0.14.0_amd64.deb. All start dbcraft_.
+      - name: Name the disk image as the other packages
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          cd dist
+          for f in DbCraft_*.dmg; do
+            mv "$f" "dbcraft${f#DbCraft}"
+          done
+
       # dbcraft_0.4.0_amd64.deb -> dbcraft-instantclient_0.4.0_amd64.deb, so
       # both flavors fit in one release.
       - name: Name the flavor's packages

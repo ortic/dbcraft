@@ -6,6 +6,11 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- The macOS disk images are called `dbcraft_…dmg` and
+  `dbcraft-instantclient_…dmg`, as the other packages; they were
+  `DbCraft_…dmg` and `DbCraft-instantclient_…dmg`.
+
 ## [0.14.0] - 2026-11-22
 
 ### Added
