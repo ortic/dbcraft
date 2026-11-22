@@ -6,6 +6,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-22
+
 ### Added
 - *Export tables* on every database, as on Oracle: MySQL and MariaDB,
   PostgreSQL, SQL Server and SQLite. The tables of a schema (a database
@@ -2898,7 +2900,8 @@ First release.
 - Scheduler jobs window: run, stop, enable, disable, drop, run history.
 - Saved user reports with parameters.
 
-[Unreleased]: https://github.com/ortic/dbcraft/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/ortic/dbcraft/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/ortic/dbcraft/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/ortic/dbcraft/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/ortic/dbcraft/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ortic/dbcraft/compare/v0.10.0...v0.11.0
