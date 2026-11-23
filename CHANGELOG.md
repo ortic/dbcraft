@@ -6,6 +6,29 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- *Export tables*: INSERTs into *One file*, a dump to import on another
+  computer with the database's client: `mysql <database> < dump.sql` (as
+  mysqldump's: UTF-8, foreign and unique key checks off while it imports,
+  an id 0 kept), `psql`, `sqlcmd`, `sqlite3` or SQL*Plus. With *Include
+  DDL* each table's CREATE TABLE comes before its rows, and *Drop tables
+  first* makes it import again into a database that has them. The tables
+  come after the ones their foreign keys reference; the rows a hundred an
+  INSERT, committed every 10,000; PostgreSQL's sequences are set past the
+  ids imported, a schema other than `public` (`dbo`) is created.
+- *Export tables* shows each table's size in MB, with its indexes, from
+  the catalog as the rows come from the statistics (none on SQLite;
+  Oracle's from DBA_SEGMENTS, or USER_SEGMENTS for the user's own
+  tables), sorts by name, rows or size (click the column), and says how
+  many tables are selected, with their rows and size.
+
+### Fixed
+- Oracle: a table's DDL no longer creates the indexes of its primary and
+  unique keys again, which CREATE TABLE makes: run as it is, it failed
+  with ORA-01408. Its other indexes are still there.
+- SQL Server: *Export tables*' `.ddl.sql` files ended in `GO;`, which
+  sqlcmd doesn't take as the end of a batch.
+
 ## [0.15.0] - 2026-11-23
 
 ### Added

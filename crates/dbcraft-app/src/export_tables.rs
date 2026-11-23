@@ -1,8 +1,10 @@
 //! Export tables: several tables at once, each with an optional WHERE
-//! clause, one file per table (optionally with its DDL), streamed so table
-//! size doesn't matter. Oracle's tables are read by a task on the session;
-//! the other databases' stream from the session itself ([`others`]).
+//! clause, one file per table (optionally with its DDL) or INSERTs as one
+//! SQL dump to import elsewhere ([`dump`]), streamed so table size doesn't
+//! matter. Oracle's tables are read by a task on the session; the other
+//! databases' stream from the session itself ([`others`]).
 
+mod dump;
 mod others;
 
 use std::path::{Path, PathBuf};
@@ -32,8 +34,32 @@ pub struct ExportTables {
     pub include_ddl: bool,
     #[serde(default)]
     pub read: Read,
+    /// INSERTs as one file, a dump to import with the database's client,
+    /// instead of a file per table.
+    #[serde(default)]
+    pub single_file: bool,
+    /// The dump's file.
+    #[serde(default, with = "crate::serde_path::option")]
+    pub file: Option<PathBuf>,
+    /// The dump drops the tables before it creates them (with their DDL).
+    #[serde(default)]
+    pub drop_tables: bool,
+    /// How the tables are listed.
+    #[serde(default)]
+    pub sort: SortBy,
+    #[serde(default)]
+    pub descending: bool,
     #[serde(skip)]
     state: State,
+}
+
+/// The column the tables are sorted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SortBy {
+    #[default]
+    Name,
+    Rows,
+    Size,
 }
 
 /// How the tables are read.
@@ -80,6 +106,11 @@ impl Default for ExportTables {
             null_text: String::new(),
             include_ddl: false,
             read: Read::default(),
+            single_file: false,
+            file: None,
+            drop_tables: false,
+            sort: SortBy::default(),
+            descending: false,
             state: State::default(),
         }
     }
@@ -96,6 +127,8 @@ struct State {
     tables_request: Option<u64>,
     filter: String,
     picking: Option<Receiver<Option<PathBuf>>>,
+    /// The dump's file being chosen.
+    picking_file: Option<Receiver<Option<PathBuf>>>,
     run: Option<Run>,
     message: Option<(bool, String)>,
 }
@@ -104,6 +137,8 @@ struct State {
 pub struct Choice {
     pub name: String,
     pub rows: Option<i64>,
+    /// The bytes it takes with its indexes, as the catalog says.
+    pub bytes: Option<i64>,
     pub selected: bool,
     pub filter: String,
 }
@@ -125,6 +160,8 @@ struct Streamed {
     prepared: Option<others::Prepared>,
     /// The table being read.
     next: usize,
+    /// One file for all tables, once the tables are prepared.
+    dump: Option<dump::Dump>,
 }
 
 #[derive(Default)]
@@ -156,6 +193,10 @@ pub struct Settings {
     pub read: Read,
     /// The bytes of a table's extents a range of rows holds ([`Read::Chunks`]).
     pub chunk_bytes: u64,
+    /// INSERTs into this one file instead of a file per table in `folder`.
+    pub dump: Option<PathBuf>,
+    /// The dump drops the tables first.
+    pub drop_tables: bool,
 }
 
 impl ExportTables {
@@ -174,6 +215,7 @@ impl ExportTables {
             .map(|(name, filter)| Choice {
                 name: (*name).to_owned(),
                 rows: None,
+                bytes: None,
                 selected: true,
                 filter: (*filter).to_owned(),
             })
@@ -229,31 +271,42 @@ impl ExportTables {
             } else {
                 owner
             };
-            let mut tables = Vec::new();
-            for row in conn.query_as::<(String, Option<i64>)>(
-                "select table_name, num_rows from all_tables
-                  where owner = :1 and nested = 'NO' and secondary = 'N'
-                    and table_name not like 'BIN$%'
-                  order by table_name",
-                &[&owner],
-            )? {
-                let (name, rows) = row?;
-                tables.push(Choice {
-                    name,
-                    rows,
-                    selected: false,
-                    filter: String::new(),
-                });
-            }
+            let tables = oracle_tables(conn, &owner)?;
             Ok(Box::new(tables) as Box<dyn std::any::Any + Send>)
         });
         effects.request(Target::Own, DbRequest::Task { id, task });
         effects
     }
 
+    /// Whether the rows go into one dump file.
+    fn dumping(&self) -> bool {
+        self.format == Format::Insert && self.single_file
+    }
+
+    /// Where the export writes: the dump's file, or the folder.
+    fn destination(&self) -> Option<&Path> {
+        if self.dumping() {
+            self.file.as_deref()
+        } else {
+            self.folder.as_deref()
+        }
+    }
+
     fn start(&mut self) -> Effects {
         let mut effects = Effects::default();
-        let (Some(folder), Some(Ok(tables))) = (&self.folder, &self.state.tables) else {
+        let dump = self.dumping().then(|| self.file.clone());
+        let (folder, dump) = match dump {
+            Some(Some(file)) => (
+                file.parent().unwrap_or(Path::new("")).to_owned(),
+                Some(file),
+            ),
+            Some(None) => return effects,
+            None => match &self.folder {
+                Some(folder) => (folder.clone(), None),
+                None => return effects,
+            },
+        };
+        let Some(Ok(tables)) = &self.state.tables else {
             return effects;
         };
         let jobs: Vec<Job> = tables
@@ -269,7 +322,7 @@ impl ExportTables {
         }
         let settings = Settings {
             owner: self.owner(),
-            folder: folder.clone(),
+            folder,
             format: self.format,
             options: Options {
                 header: self.header,
@@ -280,6 +333,8 @@ impl ExportTables {
             include_ddl: self.include_ddl,
             read: self.read,
             chunk_bytes: CHUNK_BYTES,
+            drop_tables: dump.is_some() && self.include_ddl && self.drop_tables,
+            dump,
         };
         let progress = Arc::new(Progress::default());
         let id = request_id();
@@ -291,6 +346,7 @@ impl ExportTables {
                 settings.folder.clone(),
                 settings.include_ddl,
                 settings.read == Read::Consistent,
+                settings.dump.is_some(),
             );
             self.state.run = Some(Run {
                 id,
@@ -301,6 +357,7 @@ impl ExportTables {
                     jobs,
                     prepared: None,
                     next: 0,
+                    dump: None,
                 }),
             });
             effects.request(Target::Own, DbRequest::Run { id, task });
@@ -336,11 +393,18 @@ impl ExportTables {
         {
             return self.streamed_step(result);
         }
+        let to = self
+            .destination()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let s = &mut self.state;
         if s.tables_request == Some(id) {
             s.tables_request = None;
             s.tables = Some(match result.map(|a| a.downcast::<Vec<Choice>>()) {
-                Ok(Ok(t)) => Ok(*t),
+                Ok(Ok(mut t)) => {
+                    sort_tables(&mut t, self.sort, self.descending);
+                    Ok(*t)
+                }
                 Ok(Err(_)) => Err("unexpected result".into()),
                 Err(e) => Err(e.to_string()),
             });
@@ -350,10 +414,7 @@ impl ExportTables {
             s.message = Some(match result.map(|a| a.downcast::<u64>()) {
                 Ok(Ok(rows)) => (
                     false,
-                    format!(
-                        "Exported {rows} rows from {tables} table(s) to {}",
-                        self.folder.as_deref().unwrap_or(Path::new("")).display()
-                    ),
+                    format!("Exported {rows} rows from {tables} table(s) to {to}"),
                 ),
                 Ok(Err(_)) => (true, "unexpected result".into()),
                 Err(_) if stopped => (true, format!("Stopped after {tables} table(s)")),
@@ -378,11 +439,41 @@ impl ExportTables {
         let done = match &steps.prepared {
             None => result
                 .and_then(|r| r.downcast::<others::Prepared>().map_err(|_| unexpected()))
-                .map(|prepared| {
+                .and_then(|prepared| {
                     progress
                         .tables
                         .store(prepared.tables.len(), Ordering::Relaxed);
+                    // The jobs in the tables' order, a dump's by its
+                    // foreign keys.
+                    let mut jobs = std::mem::take(&mut steps.jobs);
+                    steps.jobs = prepared
+                        .tables
+                        .iter()
+                        .filter_map(|t| {
+                            let i = jobs.iter().position(|j| j.table == t.name)?;
+                            Some(jobs.swap_remove(i))
+                        })
+                        .collect();
+                    if let Some(path) = &steps.settings.dump {
+                        let parts: Vec<dump::Part> = prepared
+                            .tables
+                            .iter()
+                            .map(|t| dump::Part {
+                                name: &t.name,
+                                ddl: t.ddl.as_deref(),
+                            })
+                            .collect();
+                        let header = dump::header(
+                            steps.dialect,
+                            &prepared.schema,
+                            &parts,
+                            steps.settings.drop_tables,
+                            &prepared.cycle,
+                        );
+                        steps.dump = Some(dump::Dump::create(path, &header)?);
+                    }
                     steps.prepared = Some(*prepared);
+                    Ok(())
                 }),
             Some(prepared) => {
                 let table = &prepared.tables[steps.next].name;
@@ -428,7 +519,6 @@ impl ExportTables {
         }
         let settings = &steps.settings;
         *run.progress.current.lock().expect("current") = table.name.clone();
-        let path = others::data_path(&settings.folder, &table.name, settings.format.extension());
         let options = Options {
             table: dialect.quote_ident(&table.name),
             dialect,
@@ -437,12 +527,35 @@ impl ExportTables {
             identity: table.identity.clone(),
             ..settings.options.clone()
         };
-        let sink = crate::to_file::Sink::new(
-            &path,
-            settings.format,
-            options,
-            run.progress.current_rows.clone(),
-        )?;
+        let sink = match &steps.dump {
+            Some(file) => {
+                let part = dump::Part {
+                    name: &table.name,
+                    ddl: table.ddl.as_deref(),
+                };
+                crate::to_file::Sink::shared(
+                    &file.file,
+                    &file.path,
+                    settings.format,
+                    Options {
+                        rows_per_insert: dump::ROWS_PER_INSERT,
+                        ..options
+                    },
+                    dump::around(dialect, &prepared.schema, &part, &table.sequenced),
+                    run.progress.current_rows.clone(),
+                )?
+            }
+            None => {
+                let path =
+                    others::data_path(&settings.folder, &table.name, settings.format.extension());
+                crate::to_file::Sink::new(
+                    &path,
+                    settings.format,
+                    options,
+                    run.progress.current_rows.clone(),
+                )?
+            }
+        };
         let filter = dbcraft_plsql::tokenize_in(&job.filter, dialect.syntax())
             .iter()
             .any(|t| !t.kind.is_trivia())
@@ -469,8 +582,15 @@ impl ExportTables {
         let Some(run) = self.state.run.take() else {
             return effects;
         };
-        let Some(steps) = run.streamed else {
+        let Some(mut steps) = run.streamed else {
             return effects;
+        };
+        let p = &run.progress;
+        let rows = p.rows.load(Ordering::Relaxed);
+        // The dump is complete, or its part goes.
+        let error = match (steps.dump.take(), error) {
+            (Some(file), None) => file.finish(&dump::footer(steps.dialect, rows)).err(),
+            (_, error) => error,
         };
         if steps.settings.read == Read::Consistent && steps.prepared.is_some() {
             let task = others::end_transaction();
@@ -482,15 +602,18 @@ impl ExportTables {
                 },
             );
         }
-        let p = &run.progress;
         let tables = p.tables_done.load(Ordering::Relaxed);
+        let to = steps
+            .settings
+            .dump
+            .as_ref()
+            .unwrap_or(&steps.settings.folder);
         self.state.message = Some(match error {
             None => (
                 false,
                 format!(
-                    "Exported {} rows from {tables} table(s) to {}",
-                    p.rows.load(Ordering::Relaxed),
-                    steps.settings.folder.display()
+                    "Exported {rows} rows from {tables} table(s) to {}",
+                    to.display()
                 ),
             ),
             Some(_) if p.stop.load(Ordering::Relaxed) => {
@@ -517,6 +640,14 @@ impl ExportTables {
             self.state.picking = None;
             if picked.is_some() {
                 self.folder = picked;
+            }
+        }
+        if let Some(rx) = &self.state.picking_file
+            && let Ok(picked) = rx.try_recv()
+        {
+            self.state.picking_file = None;
+            if picked.is_some() {
+                self.file = picked;
             }
         }
 
@@ -555,6 +686,8 @@ impl ExportTables {
                         t.selected = false;
                     }
                 }
+                ui.separator();
+                ui.weak(selection_summary(tables));
             }
         });
         if reload {
@@ -594,12 +727,52 @@ impl ExportTables {
                     .auto_shrink(false)
                     .show(ui, |ui| {
                         egui::Grid::new("export-tables")
-                            .num_columns(3)
+                            .num_columns(4)
                             .striped(true)
                             .spacing([16.0, 4.0])
                             .show(ui, |ui| {
-                                ui.strong("Table");
-                                ui.strong("Rows (statistics)");
+                                let mut header =
+                                    |ui: &mut Ui, label: &str, by: SortBy, hover: &str| {
+                                        let arrow = match (self.sort == by, self.descending) {
+                                            (false, _) => "",
+                                            (true, false) => " ⏶",
+                                            (true, true) => " ⏷",
+                                        };
+                                        let clicked = ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(format!("{label}{arrow}"))
+                                                        .strong(),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .on_hover_text(hover)
+                                            .clicked();
+                                        if clicked {
+                                            // Large first, names A to Z.
+                                            self.descending = if self.sort == by {
+                                                !self.descending
+                                            } else {
+                                                by != SortBy::Name
+                                            };
+                                            self.sort = by;
+                                            sort_tables(tables, self.sort, self.descending);
+                                        }
+                                    };
+                                header(ui, "Table", SortBy::Name, "Sort by name");
+                                header(
+                                    ui,
+                                    "Rows",
+                                    SortBy::Rows,
+                                    "The rows the database's statistics count; sort by them",
+                                );
+                                header(
+                                    ui,
+                                    "Size (MB)",
+                                    SortBy::Size,
+                                    "What the table takes with its indexes, as the database's \
+                                     catalog says; sort by it",
+                                );
                                 ui.strong("WHERE");
                                 ui.end_row();
                                 for t in tables
@@ -612,6 +785,7 @@ impl ExportTables {
                                             .monospace(),
                                     );
                                     ui.weak(t.rows.map_or_else(|| "?".into(), |r| r.to_string()));
+                                    ui.weak(t.bytes.map_or_else(|| "?".into(), megabytes));
                                     ui.add_enabled(
                                         t.selected,
                                         egui::TextEdit::singleline(&mut t.filter)
@@ -662,26 +836,80 @@ impl ExportTables {
                     });
                     ui.end_row();
                 }
-                ui.label("Folder");
-                ui.horizontal(|ui| {
-                    match &self.folder {
-                        Some(f) => {
-                            ui.label(RichText::new(f.display().to_string()).monospace());
+                if self.format == Format::Insert {
+                    ui.label("Files");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.single_file, false, "One per table")
+                            .on_hover_text("<table>.sql in a folder, a file for each table");
+                        ui.selectable_value(&mut self.single_file, true, "One file")
+                            .on_hover_text(
+                                "All tables in one script, to import elsewhere with the \
+                                 database's own client (mysql, psql, sqlcmd, sqlite3, SQL*Plus): \
+                                 the tables after the ones their foreign keys reference, the \
+                                 rows a hundred an INSERT and committed every 10,000",
+                            );
+                    });
+                    ui.end_row();
+                }
+                if self.dumping() {
+                    ui.label("File");
+                    ui.horizontal(|ui| {
+                        match &self.file {
+                            Some(f) => {
+                                ui.label(RichText::new(f.display().to_string()).monospace());
+                            }
+                            None => {
+                                ui.weak("choose the file to write");
+                            }
                         }
-                        None => {
-                            ui.weak("choose where the files go");
+                        if ui.button("Choose…").clicked() && self.state.picking_file.is_none() {
+                            let name = match self.owner.trim() {
+                                "" => "dump.sql".to_owned(),
+                                owner => format!("{owner}.sql"),
+                            };
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let picked = rfd::FileDialog::new()
+                                    .add_filter("SQL", &["sql"])
+                                    .set_file_name(name)
+                                    .save_file();
+                                let _ = tx.send(picked);
+                            });
+                            self.state.picking_file = Some(rx);
                         }
-                    }
-                    if ui.button("Choose…").clicked() && self.state.picking.is_none() {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let _ = tx.send(rfd::FileDialog::new().pick_folder());
-                        });
-                        self.state.picking = Some(rx);
-                    }
-                    ui.checkbox(&mut self.include_ddl, "Include DDL")
-                        .on_hover_text("Writes <table>.ddl.sql next to each data file");
-                });
+                        ui.checkbox(&mut self.include_ddl, "Include DDL")
+                            .on_hover_text("Each table's CREATE TABLE before its rows");
+                        ui.add_enabled(
+                            self.include_ddl,
+                            egui::Checkbox::new(&mut self.drop_tables, "Drop tables first"),
+                        )
+                        .on_hover_text(
+                            "The dump starts with a DROP TABLE of each table, so that it imports \
+                             again into a database that has them",
+                        );
+                    });
+                } else {
+                    ui.label("Folder");
+                    ui.horizontal(|ui| {
+                        match &self.folder {
+                            Some(f) => {
+                                ui.label(RichText::new(f.display().to_string()).monospace());
+                            }
+                            None => {
+                                ui.weak("choose where the files go");
+                            }
+                        }
+                        if ui.button("Choose…").clicked() && self.state.picking.is_none() {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(rfd::FileDialog::new().pick_folder());
+                            });
+                            self.state.picking = Some(rx);
+                        }
+                        ui.checkbox(&mut self.include_ddl, "Include DDL")
+                            .on_hover_text("Writes <table>.ddl.sql next to each data file");
+                    });
+                }
                 ui.end_row();
                 ui.label("Read");
                 let dialect = self.dialect();
@@ -783,7 +1011,7 @@ impl ExportTables {
                     };
                     if ui
                         .add_enabled(
-                            selected > 0 && self.folder.is_some(),
+                            selected > 0 && self.destination().is_some(),
                             egui::Button::image_and_text(
                                 dbcraft_ui::icons::Icon::Export.image(ui),
                                 label,
@@ -799,6 +1027,124 @@ impl ExportTables {
         ui.add_space(4.0);
         effects
     }
+}
+
+/// Sorts the tables by `by`: those of unknown rows or size last either
+/// way, ties by name.
+fn sort_tables(tables: &mut [Choice], by: SortBy, descending: bool) {
+    let name = |t: &Choice| t.name.to_lowercase();
+    tables.sort_by(|a, b| {
+        let key = |t: &Choice| match by {
+            SortBy::Name => None,
+            SortBy::Rows => Some(t.rows),
+            SortBy::Size => Some(t.bytes),
+        };
+        let order = match (key(a), key(b)) {
+            (Some(Some(x)), Some(Some(y))) if descending => y.cmp(&x),
+            (Some(Some(x)), Some(Some(y))) => x.cmp(&y),
+            (Some(Some(_)), Some(None)) => std::cmp::Ordering::Less,
+            (Some(None), Some(Some(_))) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        };
+        let names = || match (by, descending) {
+            (SortBy::Name, true) => name(b).cmp(&name(a)),
+            _ => name(a).cmp(&name(b)),
+        };
+        order.then_with(names)
+    });
+}
+
+/// Bytes in megabytes, as the list shows them.
+fn megabytes(bytes: i64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if bytes > 0 && mb < 0.1 {
+        "< 0.1".into()
+    } else {
+        format!("{mb:.1}")
+    }
+}
+
+/// What the selected tables hold, as the statistics say.
+fn selection_summary(tables: &[Choice]) -> String {
+    let selected: Vec<&Choice> = tables.iter().filter(|t| t.selected).collect();
+    let mut text = format!("{} of {} selected", selected.len(), tables.len());
+    if selected.is_empty() {
+        return text;
+    }
+    let rows: i64 = selected.iter().filter_map(|t| t.rows).sum();
+    let bytes: i64 = selected.iter().filter_map(|t| t.bytes).sum();
+    let some = |f: fn(&Choice) -> Option<i64>| selected.iter().any(|t| f(t).is_some());
+    if some(|t| t.rows) {
+        text.push_str(&format!(" · about {rows} rows"));
+    }
+    if some(|t| t.bytes) {
+        text.push_str(&format!(" · {} MB", megabytes(bytes)));
+    }
+    text
+}
+
+/// The tables of `owner` with the rows their statistics count and the
+/// bytes of their segments, indexes and LOBs too: from DBA_SEGMENTS, or
+/// USER_SEGMENTS for the user's own tables; without either, no sizes.
+fn oracle_tables(conn: &Connection, owner: &str) -> Result<Vec<Choice>, DbError> {
+    let tables = "select table_name, num_rows from all_tables
+                   where owner = :1 and nested = 'NO' and secondary = 'N'
+                     and table_name not like 'BIN$%'";
+    let sized = |segments: &str| {
+        format!(
+            "with seg as (select segment_name, segment_type, bytes from {segments}),
+                  sizes as (select segment_name table_name, bytes from seg
+                             where segment_type like 'TABLE%'
+                            union all
+                            select i.table_name, s.bytes from seg s
+                              join all_indexes i
+                                on i.owner = :2 and i.index_name = s.segment_name
+                             where s.segment_type like 'INDEX%'
+                            union all
+                            select l.table_name, s.bytes from seg s
+                              join all_lobs l
+                                on l.owner = :3 and l.segment_name = s.segment_name
+                             where s.segment_type like 'LOB%')
+             select t.table_name, t.num_rows, z.bytes
+               from ({tables}) t
+               left join (select table_name, sum(bytes) bytes from sizes group by table_name) z
+                 on z.table_name = t.table_name
+              order by t.table_name"
+        )
+    };
+    let read = |sql: &str,
+                binds: &[&dyn dbcraft_db::oracle::sql_type::ToSql]|
+     -> Result<Vec<Choice>, DbError> {
+        let mut found = Vec::new();
+        for row in conn.query_as::<(String, Option<i64>, Option<i64>)>(sql, binds)? {
+            let (name, rows, bytes) = row?;
+            found.push(Choice {
+                name,
+                rows,
+                bytes,
+                selected: false,
+                filter: String::new(),
+            });
+        }
+        Ok(found)
+    };
+    let all = sized(&format!(
+        "dba_segments where owner = '{}'",
+        owner.replace('\'', "''")
+    ));
+    match read(&all, &[&owner, &owner, &owner]) {
+        Ok(tables) => return Ok(tables),
+        Err(e) => tracing::debug!("table sizes from DBA_SEGMENTS: {}", e.text()),
+    }
+    let user: String = conn.query_row_as("select user from dual", &[])?;
+    if user == owner {
+        match read(&sized("user_segments"), &[&owner, &owner, &owner]) {
+            Ok(tables) => return Ok(tables),
+            Err(e) => tracing::debug!("table sizes from USER_SEGMENTS: {}", e.text()),
+        }
+    }
+    let plain = format!("select table_name, num_rows, null from ({tables}) order by table_name");
+    read(&plain, &[&owner])
 }
 
 /// How a table's rows are written: INSERTs go into `table`, quoted unless
@@ -826,25 +1172,69 @@ pub fn export(
         settings.owner.clone()
     };
     progress.tables.store(jobs.len(), Ordering::Relaxed);
-    std::fs::create_dir_all(&settings.folder)
-        .map_err(|e| DbError::new(format!("{}: {e}", settings.folder.display())))?;
+    if settings.dump.is_none() {
+        std::fs::create_dir_all(&settings.folder)
+            .map_err(|e| DbError::new(format!("{}: {e}", settings.folder.display())))?;
+    }
+    // A dump's tables after the ones they reference.
+    let mut cycle = Vec::new();
+    let jobs: Vec<Job> = match &settings.dump {
+        Some(_) => {
+            let sql = dump::foreign_keys_sql(Dialect::ORACLE).expect("Oracle's");
+            let edges = conn
+                .query_as::<(String, String)>(sql, &[&owner])?
+                .collect::<Result<Vec<_>, _>>()?;
+            let names: Vec<String> = jobs.iter().map(|j| j.table.clone()).collect();
+            let (order, tangled) = dump::dependency_order(&names, &edges);
+            cycle = tangled;
+            order.iter().map(|&i| jobs[i].clone()).collect()
+        }
+        None => jobs.to_vec(),
+    };
+    let jobs = &jobs[..];
     // The DDL first: DBMS_METADATA doesn't run in a read-only transaction.
+    let mut ddls: Vec<Option<String>> = vec![None; jobs.len()];
     if settings.include_ddl {
-        for job in jobs {
+        for (job, kept) in jobs.iter().zip(&mut ddls) {
             if progress.stop.load(Ordering::Relaxed) {
                 return Err(DbError::new("stopped"));
             }
             *progress.current.lock().expect("current") = job.table.clone();
-            // A file of its own for each table, as Export schema writes (#280).
-            let base = crate::object_files::file_stem(&job.table);
             let ddl =
                 crate::object_files::object_text(conn, &owner, &job.table, ObjectType::Table)?;
+            if settings.dump.is_some() {
+                *kept = Some(ddl);
+                continue;
+            }
+            // A file of its own for each table, as Export schema writes (#280).
+            let base = crate::object_files::file_stem(&job.table);
             let path = settings.folder.join(format!("{base}.ddl.sql"));
             std::fs::write(&path, ddl)
                 .map_err(|e| DbError::new(format!("{}: {e}", path.display())))?;
         }
     }
-    if settings.read == Read::Consistent {
+    let file = match &settings.dump {
+        Some(path) => {
+            let parts: Vec<dump::Part> = jobs
+                .iter()
+                .zip(&ddls)
+                .map(|(job, ddl)| dump::Part {
+                    name: &job.table,
+                    ddl: ddl.as_deref(),
+                })
+                .collect();
+            let header = dump::header(
+                Dialect::ORACLE,
+                &owner,
+                &parts,
+                settings.drop_tables,
+                &cycle,
+            );
+            Some(dump::Dump::create(path, &header)?)
+        }
+        None => None,
+    };
+    let rows = if settings.read == Read::Consistent {
         // Every query of the transaction reads the database as it was when
         // it began, as one query would. It can't begin with changes not
         // committed, which stay as they are.
@@ -857,10 +1247,10 @@ pub fn export(
                 ),
                 _ => e,
             })?;
-        let exported = export_tables(conn, &owner, settings, jobs, progress);
+        let exported = export_tables(conn, &owner, settings, jobs, &ddls, file.as_ref(), progress);
         // Ends the read-only transaction; it changed nothing.
         let _ = conn.rollback();
-        return exported.map_err(|e| match e.code {
+        exported.map_err(|e| match e.code {
             Some(SNAPSHOT_TOO_OLD) => DbError::new(format!(
                 "{}: the undo doesn't reach back to the start of the export any more. Export \
                  in chunks, or ask for a longer UNDO_RETENTION",
@@ -872,9 +1262,15 @@ pub fn export(
                 e.message
             )),
             _ => e,
-        });
+        })?
+    } else {
+        export_tables(conn, &owner, settings, jobs, &ddls, file.as_ref(), progress)?
+    };
+    // Dropped on an error, the dump removes its part.
+    if let Some(file) = file {
+        file.finish(&dump::footer(Dialect::ORACLE, rows))?;
     }
-    export_tables(conn, &owner, settings, jobs, progress)
+    Ok(rows)
 }
 
 /// ORA-01555 "snapshot too old": the undo a query needs to read the rows
@@ -888,21 +1284,31 @@ const DEFINITION_CHANGED: i32 = 1466;
 /// How often a range of rows is read again after ORA-01555.
 const RETRIES: usize = 3;
 
-/// The tables' rows, each table into a file of its own.
+/// The tables' rows, each table into a file of its own or all into the
+/// dump `file`, each with its DDL (`ddls`) there.
 fn export_tables(
     conn: &Connection,
     owner: &str,
     settings: &Settings,
     jobs: &[Job],
+    ddls: &[Option<String>],
+    file: Option<&dump::Dump>,
     progress: &Progress,
 ) -> Result<u64, DbError> {
     let mut total = 0;
-    for job in jobs {
+    for (job, ddl) in jobs.iter().zip(ddls) {
         if progress.stop.load(Ordering::Relaxed) {
             return Err(DbError::new("stopped"));
         }
         *progress.current.lock().expect("current") = job.table.clone();
-        let rows = export_table(conn, owner, settings, job, progress).map_err(|e| {
+        let into = file.map(|file| {
+            let part = dump::Part {
+                name: &job.table,
+                ddl: ddl.as_deref(),
+            };
+            (file, dump::around(Dialect::ORACLE, owner, &part, &[]))
+        });
+        let rows = export_table(conn, owner, settings, job, into, progress).map_err(|e| {
             // Its code, for what the export says of ORA-01555.
             let mut error = DbError::new(format!("{}: {}", job.table, e.message));
             error.code = e.code;
@@ -914,14 +1320,20 @@ fn export_tables(
     Ok(total)
 }
 
-/// One table's rows into its file, under its name once they are all in it.
+type Out = std::io::BufWriter<std::fs::File>;
+
+/// One table's rows into its file, under its name once they are all in it;
+/// or into a dump, with what goes around them there.
 fn export_table(
     conn: &Connection,
     owner: &str,
     settings: &Settings,
     job: &Job,
+    into: Option<(&dump::Dump, crate::to_file::Around)>,
     progress: &Progress,
 ) -> Result<u64, DbError> {
+    use std::io::{Seek, SeekFrom, Write};
+
     let base = crate::object_files::file_stem(&job.table);
     // Invisible columns too (#444); INSERTs without the virtual ones,
     // which Oracle refuses to write (#443).
@@ -950,9 +1362,12 @@ fn export_table(
         Read::Chunks => rowid_ranges(conn, owner, &job.table, settings.chunk_bytes),
         Read::Consistent => vec![(None, None)],
     };
-    let path = settings
-        .folder
-        .join(format!("{base}.{}", settings.format.extension()));
+    let path = match into {
+        Some((file, _)) => file.path.clone(),
+        None => settings
+            .folder
+            .join(format!("{base}.{}", settings.format.extension())),
+    };
     let io = |e: &dyn std::fmt::Display| DbError::new(format!("{}: {e}", path.display()));
     // Under its name once it is whole: a DbCraft that was killed leaves no
     // file that looks complete.
@@ -962,9 +1377,27 @@ fn export_table(
             .map(|file| std::io::BufWriter::with_capacity(1 << 20, file))
             .map_err(|e| io(&e))
     };
-    let mut out = Some(create()?);
-    let mut writer: Option<StreamWriter<std::io::BufWriter<std::fs::File>>> = None;
+    // A dump's file, after the tables before; where this table starts in it.
+    let (mut out, start, around) = match into {
+        Some((file, around)) => {
+            let mut out = file
+                .file
+                .lock()
+                .expect("dump file")
+                .take()
+                .ok_or_else(|| io(&"a table before wasn't written"))?;
+            out.write_all(around.before.as_bytes())
+                .map_err(|e| io(&e))?;
+            out.flush().map_err(|e| io(&e))?;
+            let start = out.get_mut().stream_position().map_err(|e| io(&e))?;
+            (Some(out), start, Some((file, around)))
+        }
+        None => (Some(create()?), 0, None),
+    };
+    let mut writer: Option<StreamWriter<Out>> = None;
     let options = insert_options(settings, &job.table);
+    let every = around.as_ref().and_then(|(_, a)| a.every.clone());
+    let mut since = 0;
     let mut written = || -> Result<u64, DbError> {
         let mut total = 0;
         for (lo, hi) in &ranges {
@@ -993,6 +1426,14 @@ fn export_table(
                     }
                     if let Some(w) = writer.as_mut() {
                         w.write(rows).map_err(|e| io(&e))?;
+                        // A dump commits every so many rows.
+                        if let Some((n, text)) = &every {
+                            since += rows.len() as u64;
+                            if since >= *n {
+                                since = 0;
+                                w.get_mut().write_all(text.as_bytes()).map_err(|e| io(&e))?;
+                            }
+                        }
                     }
                     fetched += rows.len() as u64;
                     progress
@@ -1018,7 +1459,20 @@ fn export_table(
                         progress.rows.fetch_sub(fetched, Ordering::Relaxed);
                         match (&mark, writer.as_mut()) {
                             (Some(mark), Some(w)) => w.rewind(mark).map_err(|e| io(&e))?,
-                            // Not even the header was written before.
+                            // Not even the header was written before: the
+                            // file as it was before the table.
+                            _ if around.is_some() => {
+                                let mut back = match (writer.take(), out.take()) {
+                                    (Some(w), _) => w.into_inner(),
+                                    (None, Some(out)) => out,
+                                    (None, None) => return Err(io(&"no file")),
+                                };
+                                back.flush().map_err(|e| io(&e))?;
+                                let file = back.get_mut();
+                                file.set_len(start).map_err(|e| io(&e))?;
+                                file.seek(SeekFrom::Start(start)).map_err(|e| io(&e))?;
+                                out = Some(back);
+                            }
                             _ => {
                                 writer = None;
                                 out = Some(create()?);
@@ -1032,13 +1486,25 @@ fn export_table(
         Ok(total)
     };
     let result = written().and_then(|rows| {
-        if let Some(w) = writer.take() {
-            w.finish().map_err(|e| io(&e))?;
+        let done = match writer.take() {
+            Some(w) => Some(w.finish().map_err(|e| io(&e))?),
+            None => out.take(),
+        };
+        match (&around, done) {
+            (Some((file, around)), Some(mut done)) => {
+                done.write_all(around.after.as_bytes())
+                    .map_err(|e| io(&e))?;
+                *file.file.lock().expect("dump file") = Some(done);
+            }
+            (Some(_), None) => return Err(io(&"no file")),
+            (None, done) => {
+                drop(done);
+                std::fs::rename(&part, &path).map_err(|e| io(&e))?;
+            }
         }
-        std::fs::rename(&part, &path).map_err(|e| io(&e))?;
         Ok(rows)
     });
-    if result.is_err() {
+    if result.is_err() && around.is_none() {
         drop(writer);
         drop(out);
         let _ = std::fs::remove_file(&part);
@@ -1204,6 +1670,8 @@ mod tests {
             include_ddl: false,
             read: Read::Chunks,
             chunk_bytes: CHUNK_BYTES,
+            dump: None,
+            drop_tables: false,
         };
         let target = |table: &str| insert_options(&settings, table).table;
         assert_eq!(target("DEMO_EMPLOYEES"), "demo_employees");
@@ -1241,6 +1709,8 @@ mod tests {
             include_ddl: false,
             read: Read::Chunks,
             chunk_bytes: CHUNK_BYTES,
+            dump: None,
+            drop_tables: false,
         };
         let jobs = [Job {
             table: "R54_EXP_WORDS".into(),
@@ -1293,6 +1763,8 @@ mod tests {
                 include_ddl: false,
                 read: Read::Chunks,
                 chunk_bytes: CHUNK_BYTES,
+                dump: None,
+                drop_tables: false,
             };
             let jobs = [Job {
                 table: "FD_EXP_COLS".into(),
@@ -1357,6 +1829,8 @@ mod tests {
             include_ddl: true,
             read: Read::Chunks,
             chunk_bytes: CHUNK_BYTES,
+            dump: None,
+            drop_tables: false,
         };
         let jobs: Vec<Job> = names
             .iter()
@@ -1402,6 +1876,114 @@ mod tests {
         }
     }
 
+    /// One file on Oracle: the parent before its child, everything dropped
+    /// first (the child first), a commit every 10,000 rows, the tables'
+    /// indexes but not their keys' (which CREATE TABLE makes); and the dump
+    /// imports where it came from, as SQL*Plus runs it.
+    #[test]
+    fn dumps_into_one_file() {
+        let Some(conn) = crate::test_db::connect("DBCRAFT_TEST_DB") else {
+            return;
+        };
+        let drop = |conn: &Connection| {
+            for table in ["R55_CHILD", "R55_PARENT", "R55_BIG"] {
+                let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            }
+        };
+        drop(&conn);
+        for sql in [
+            "create table r55_parent (id number primary key, name varchar2(20))",
+            "insert into r55_parent values (1, 'R&D')",
+            "insert into r55_parent values (2, 'it''s')",
+            "create table r55_child (id number primary key, \
+               parent_id number references r55_parent (id))",
+            "insert into r55_child values (10, 1)",
+            "insert into r55_child values (11, 2)",
+            "create table r55_big (n number)",
+            "insert into r55_big select level from dual connect by level <= 25000",
+            "create index r55_big_n on r55_big (n)",
+            "commit",
+        ] {
+            conn.execute(sql, &[])
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let folder = std::env::temp_dir().join(format!("dbcraft-r55-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let path = folder.join("dump.sql");
+        let settings = Settings {
+            owner: String::new(),
+            folder: folder.clone(),
+            format: Format::Insert,
+            options: Options::default(),
+            include_ddl: true,
+            read: Read::Chunks,
+            // Several ranges of rows, where DBA_EXTENTS or a sample says.
+            chunk_bytes: 64 << 10,
+            dump: Some(path.clone()),
+            drop_tables: true,
+        };
+        let jobs: Vec<Job> = ["R55_BIG", "R55_CHILD", "R55_PARENT"]
+            .iter()
+            .map(|name| Job {
+                table: (*name).into(),
+                filter: String::new(),
+            })
+            .collect();
+        let exported = export(&conn, &settings, &jobs, &Progress::default());
+        assert_eq!(exported.map_err(|e| e.message), Ok(25004));
+        let dump = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !std::fs::read_dir(&folder).unwrap().any(|f| f
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|e| e == "part")),
+            "no .part file left"
+        );
+        let at = |needle: &str| {
+            dump.find(needle)
+                .unwrap_or_else(|| panic!("{needle} not in\n{dump}"))
+        };
+        assert!(at("set define off") < at("-- Table"));
+        assert!(
+            at("-- Table r55_parent") < at("-- Table r55_child"),
+            "{dump}"
+        );
+        assert!(
+            at("drop table r55_child") < at("drop table r55_parent"),
+            "{dump}"
+        );
+        // Oracle's literals have `&` as chr(38) anyway.
+        assert!(dump.contains("'R' || chr(38) || 'D'"), "{dump}");
+        // Its own indexes, not the ones of its keys, which CREATE TABLE makes.
+        assert!(dump.contains("CREATE INDEX \"R55_BIG_N\""), "{dump}");
+        assert!(!dump.contains("SYS_C"), "{dump}");
+        assert_eq!(dump.matches("commit;").count(), 2 + 3, "two within R55_BIG");
+
+        // As SQL*Plus runs it: the client's commands aside.
+        let statements = dbcraft_plsql::split_statements_in(&dump, dbcraft_plsql::Syntax::Oracle);
+        for statement in &statements {
+            if statement.kind == dbcraft_plsql::StatementKind::SqlPlus {
+                continue;
+            }
+            let sql = statement.text(&dump);
+            conn.execute(sql, &[])
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let count = |table: &str| -> i64 {
+            conn.query_row_as(&format!("select count(*) from {table}"), &[])
+                .unwrap()
+        };
+        let counts = [count("r55_big"), count("r55_child"), count("r55_parent")];
+        let name: String = conn
+            .query_row_as("select name from r55_parent where id = 1", &[])
+            .unwrap();
+        drop(&conn);
+        std::fs::remove_dir_all(&folder).unwrap();
+        assert_eq!(counts, [25000, 2, 2]);
+        assert_eq!(name, "R&D");
+    }
+
     #[test]
     fn exports_tables_with_filters() {
         let Ok(spec) = std::env::var("DBCRAFT_TEST_DB") else {
@@ -1430,6 +2012,8 @@ mod tests {
             include_ddl: true,
             read: Read::Chunks,
             chunk_bytes: CHUNK_BYTES,
+            dump: None,
+            drop_tables: false,
         };
         let jobs = [Job {
             table: "DBCRAFT_EXP_A".into(),
@@ -1515,6 +2099,8 @@ mod tests {
             include_ddl: false,
             read: Read::Chunks,
             chunk_bytes: 256 << 10,
+            dump: None,
+            drop_tables: false,
         };
         let job = |filter: &str| Job {
             table: "DBCRAFT_EXP_C".into(),

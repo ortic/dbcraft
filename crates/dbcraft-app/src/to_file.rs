@@ -5,10 +5,10 @@
 //! each to a [`Sink`].
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use dbcraft_data::{Format, Options, StreamWriter};
@@ -27,13 +27,37 @@ pub struct ToFile {
     pub started: Instant,
 }
 
+/// A file that several sinks write into one after the other, a dump of
+/// several tables: each takes it, writes its rows and gives it back when
+/// it finishes. A sink dropped before keeps it: the file is then left to
+/// whoever made it to remove.
+pub type SharedFile = Arc<Mutex<Option<BufWriter<File>>>>;
+
+/// What a sink writes into a [`SharedFile`] around its rows.
+#[derive(Debug, Clone, Default)]
+pub struct Around {
+    /// Before the rows: the table's DDL, `start transaction`.
+    pub before: String,
+    /// After them: `commit`.
+    pub after: String,
+    /// Between batches, once this many rows were written since it last
+    /// was: `commit` and a new transaction, so that none grows too large.
+    pub every: Option<(u64, String)>,
+}
+
 /// Writes a query's rows into a file as they come: its columns first, then
 /// batches of rows. They go into `<name>.part`, which becomes the file once
 /// it is finished; dropped before, the sink removes it, and a DbCraft that
-/// was killed leaves no file that looks whole.
+/// was killed leaves no file that looks whole. Or they go into a
+/// [`SharedFile`] after the rows of others.
 pub struct Sink {
     path: PathBuf,
-    part: PathBuf,
+    /// `<name>.part`, or `None` writing into a shared file.
+    part: Option<PathBuf>,
+    shared: Option<SharedFile>,
+    around: Around,
+    /// Rows written since the last `around.every`.
+    since: u64,
     format: Format,
     options: Options,
     out: Option<BufWriter<File>>,
@@ -78,7 +102,10 @@ impl Sink {
             File::create(&part).map_err(|e| DbError::new(format!("{}: {e}", part.display())))?;
         Ok(Self {
             path: path.to_owned(),
-            part,
+            part: Some(part),
+            shared: None,
+            around: Around::default(),
+            since: 0,
             format,
             options,
             out: Some(BufWriter::with_capacity(1 << 20, file)),
@@ -88,13 +115,48 @@ impl Sink {
         })
     }
 
+    /// Takes `file` (the dump at `path`) for rows written as `format` with
+    /// `options`, `around` them; gives it back when it finishes.
+    pub fn shared(
+        file: &SharedFile,
+        path: &Path,
+        format: Format,
+        options: Options,
+        around: Around,
+        progress: Arc<AtomicU64>,
+    ) -> Result<Self, DbError> {
+        let out =
+            file.lock().expect("shared file").take().ok_or_else(|| {
+                DbError::new(format!("{}: written by another table", path.display()))
+            })?;
+        Ok(Self {
+            path: path.to_owned(),
+            part: None,
+            shared: Some(file.clone()),
+            around,
+            since: 0,
+            format,
+            options,
+            out: Some(out),
+            writer: None,
+            progress,
+            done: false,
+        })
+    }
+
+    fn write_io(&self, e: std::io::Error) -> DbError {
+        DbError::new(format!("{}: {e}", self.path.display()))
+    }
+
     fn io(&self, e: dbcraft_data::Error) -> DbError {
         DbError::new(format!("{}: {e}", self.path.display()))
     }
 
     /// The result's columns: writes the header.
     pub fn columns(&mut self, columns: &[Column]) -> Result<(), DbError> {
-        if let Some(out) = self.out.take() {
+        if let Some(mut out) = self.out.take() {
+            out.write_all(self.around.before.as_bytes())
+                .map_err(|e| self.write_io(e))?;
             let writer =
                 StreamWriter::new(self.format, columns.to_vec(), self.options.clone(), out)
                     .map_err(|e| self.io(e))?;
@@ -117,18 +179,44 @@ impl Sink {
         };
         let written = writer.write(rows).map(|()| writer.rows());
         let written = written.map_err(|e| self.io(e))?;
+        if let Some((every, text)) = &self.around.every {
+            self.since += rows.len() as u64;
+            if self.since >= *every {
+                self.since = 0;
+                let out = self.writer.as_mut().expect("a writer").get_mut();
+                let wrote = out.write_all(text.as_bytes());
+                wrote.map_err(|e| self.write_io(e))?;
+            }
+        }
         self.progress.store(written, Ordering::Relaxed);
         Ok(written)
     }
 
-    /// Completes the file (a JSON array's end) and gives it its name.
+    /// Completes the file (a JSON array's end) and gives it its name; a
+    /// shared file goes back to whoever writes into it next.
     pub fn finish(mut self) -> Result<(), DbError> {
-        if let Some(writer) = self.writer.take() {
-            writer.finish().map_err(|e| self.io(e))?;
+        let mut out = match (self.writer.take(), self.out.take()) {
+            (Some(writer), _) => writer.finish().map_err(|e| self.io(e))?,
+            // No columns came: still the table's DDL.
+            (None, Some(mut out)) => {
+                out.write_all(self.around.before.as_bytes())
+                    .map_err(|e| self.write_io(e))?;
+                out
+            }
+            (None, None) => return Err(DbError::new("The file was written already")),
+        };
+        out.write_all(self.around.after.as_bytes())
+            .map_err(|e| self.write_io(e))?;
+        if let Some(shared) = &self.shared {
+            *shared.lock().expect("shared file") = Some(out);
+            self.done = true;
+            return Ok(());
         }
-        self.out = None;
-        std::fs::rename(&self.part, &self.path)
-            .map_err(|e| DbError::new(format!("{}: {e}", self.path.display())))?;
+        drop(out);
+        if let Some(part) = &self.part {
+            std::fs::rename(part, &self.path)
+                .map_err(|e| DbError::new(format!("{}: {e}", self.path.display())))?;
+        }
         self.done = true;
         Ok(())
     }
@@ -142,7 +230,9 @@ impl Drop for Sink {
         if !self.done {
             self.writer = None;
             self.out = None;
-            let _ = std::fs::remove_file(&self.part);
+            if let Some(part) = &self.part {
+                let _ = std::fs::remove_file(part);
+            }
         }
     }
 }
