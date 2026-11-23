@@ -3589,6 +3589,14 @@ impl DbCraftApp {
         true
     }
 
+    /// Connects to the connection given on the command line (launch.rs)
+    /// instead of asking for one.
+    pub fn connect_on_start(&mut self, request: ConnectRequest) {
+        self.connect_dialog
+            .connecting_to(request.profile.clone(), &request.passwords);
+        self.connect(request);
+    }
+
     fn connect(&mut self, request: ConnectRequest) {
         let ConnectRequest {
             profile,

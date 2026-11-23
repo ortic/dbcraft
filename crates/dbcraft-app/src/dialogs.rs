@@ -48,6 +48,7 @@ pub struct ConnectDialog {
     tns_aliases: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct ConnectRequest {
     pub profile: ConnectionProfile,
     pub passwords: Passwords,
@@ -874,6 +875,19 @@ impl ConnectDialog {
     }
 
     /// Called once the connection is established.
+    /// Connecting without the dialog, to a connection given on the command
+    /// line: should it fail, the dialog shows it, password and all, with
+    /// the error.
+    pub fn connecting_to(&mut self, profile: ConnectionProfile, passwords: &Passwords) {
+        self.form = profile;
+        self.password = passwords.database.clone();
+        self.ssh_password = passwords.ssh.clone();
+        self.editing = None;
+        self.error = None;
+        self.open = false;
+        self.connecting = true;
+    }
+
     pub fn connected(&mut self) {
         self.open = false;
         self.connecting = false;

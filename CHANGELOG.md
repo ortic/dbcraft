@@ -21,6 +21,12 @@ and the project uses [Semantic Versioning](https://semver.org/).
   Oracle's from DBA_SEGMENTS, or USER_SEGMENTS for the user's own
   tables), sorts by name, rows or size (click the column), and says how
   many tables are selected, with their rows and size.
+- A MySQL/MariaDB or PostgreSQL connection URL on the command line
+  (`dbcraft "mysql://root:root@127.0.0.1:32768/db?name=ddev-shop"`)
+  connects to it on start instead of showing the connect dialog, as a
+  `ddev dbcraft` command does for a DDEV project's database (README,
+  *Installing*). The connection isn't saved; should it fail, the connect
+  dialog shows it with the error.
 
 ### Fixed
 - Oracle: a table's DDL no longer creates the indexes of its primary and

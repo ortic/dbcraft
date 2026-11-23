@@ -29,6 +29,7 @@ mod icons_ext;
 mod import_window;
 mod invalid_window;
 mod jobs_window;
+mod launch;
 mod maintenance;
 mod monitor_window;
 mod object_editor;
@@ -99,11 +100,21 @@ fn main() -> anyhow::Result<()> {
     let kept = workspace.as_ref().map(|w| w.path.clone());
     // Set when the adapter chosen is DirectX 12's (#491).
     let dx12 = Arc::new(AtomicBool::new(false));
+    // A connection URL among the arguments, as `ddev dbcraft` gives it.
+    let launch = match launch::from_args(std::env::args().skip(1)) {
+        Some(Ok(request)) => Some(request),
+        Some(Err(e)) => {
+            report_error(&e);
+            None
+        }
+        None => None,
+    };
     let result = run(
         eframe::Renderer::Wgpu,
         wgpu_options(true, &dx12),
         paths.clone(),
         kept.clone(),
+        launch.clone(),
         &started,
     )
     .or_else(|e| {
@@ -116,6 +127,7 @@ fn main() -> anyhow::Result<()> {
             wgpu_options(false, &dx12),
             paths.clone(),
             kept.clone(),
+            launch.clone(),
             &started,
         )
     })
@@ -129,6 +141,7 @@ fn main() -> anyhow::Result<()> {
             Default::default(),
             paths.clone(),
             kept,
+            launch,
             &started,
         )
     });
@@ -191,6 +204,7 @@ fn run(
     wgpu_options: eframe::WgpuConfiguration,
     paths: Option<Paths>,
     workspace: Option<std::path::PathBuf>,
+    launch: Option<dialogs::ConnectRequest>,
     started: &Arc<AtomicBool>,
 ) -> eframe::Result {
     let started = started.clone();
@@ -212,7 +226,11 @@ fn run(
         options,
         Box::new(move |cc| {
             started.store(true, Ordering::SeqCst);
-            Ok(Box::new(app::DbCraftApp::new(cc, paths)))
+            let mut app = app::DbCraftApp::new(cc, paths);
+            if let Some(request) = launch {
+                app.connect_on_start(request);
+            }
+            Ok(Box::new(app))
         }),
     )
 }

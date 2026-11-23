@@ -501,6 +501,35 @@ WSLg's compositor crashes on Wayland windows like DbCraft's
 whatever Windows' display scaling; on a scaled display, size the UI with
 Settings → UI scale (or Ctrl + / Ctrl −).
 
+**Connecting from the command line:** a MySQL/MariaDB or PostgreSQL URL as
+argument connects to it on start instead of showing the connect dialog,
+for a local development database's launcher:
+
+```sh
+dbcraft "mysql://root:root@127.0.0.1:32768/db?name=ddev-shop"
+dbcraft "postgres://db:db@127.0.0.1:32769/db?sslmode=disable"
+```
+
+`mysql://`, `mariadb://`, `postgres://` and `postgresql://` are taken; the
+user and password are percent-encoded, `name` names the connection and the
+other query parameters are the connect string's. The connection isn't saved
+and its password not kept. A [DDEV](https://ddev.com) host command,
+`~/.ddev/commands/host/dbcraft`, starts it with the project's database:
+
+```bash
+#!/usr/bin/env bash
+## Description: Open the project's database in DbCraft
+## Usage: dbcraft
+## Example: "ddev dbcraft"
+## DBTypes: mysql,mariadb,postgres
+type="${DDEV_DATABASE%%:*}"
+case "$type" in
+  postgres) url="postgres://db:db@127.0.0.1:${DDEV_HOST_DB_PORT}/db" ;;
+  *) url="mysql://root:root@127.0.0.1:${DDEV_HOST_DB_PORT}/db" ;;
+esac
+dbcraft "${url}?name=ddev-${DDEV_PROJECT}" &>/dev/null & disown
+```
+
 ## Building from source
 
 Requirements: Rust (stable).
