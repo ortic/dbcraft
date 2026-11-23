@@ -37,6 +37,29 @@ tokio-util.workspace = true
 tracing.workspace = true
 webpki-roots.workspace = true
 
+# Security keys: CTAP2 over USB HID on Linux and macOS. The tests run it
+# against a key in software everywhere.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+aes.workspace = true
+ring.workspace = true
+
+[target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dev-dependencies]
+aes.workspace = true
+ring.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+hidapi.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Networking_WindowsWebServices",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [[example]]
 name = "thin_probe"
 # Compares the thin driver with the Instant Client.

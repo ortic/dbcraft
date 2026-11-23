@@ -39,6 +39,13 @@ mysql_common = { version = "0.37", default-features = false }
 # SSH tunnels: pure Rust on ring too. Its tokio runtime only carries the
 # tunnels; the session workers stay synchronous.
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+# Security keys (`ecdsa-sk`, `ed25519-sk` key files): the hashes, ECDH and
+# HMAC of CTAP2's PIN protocols on the ring russh uses, and its AES. hidapi
+# reaches the keys on macOS only (Linux reads hidraw, Windows has WebAuthn).
+ring = "0.17"
+aes = "0.9"
+hidapi = { version = "2.6", default-features = false }
+libc = "0.2"
 # PostgreSQL and SQL Server: pure Rust async drivers, each session worker
 # drives its own single-threaded runtime.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
