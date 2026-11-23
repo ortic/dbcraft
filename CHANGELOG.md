@@ -6,6 +6,8 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-23
+
 ### Added
 - SSH: the key files of security keys (FIDO2 or U2F, as YubiKeys), as
   `ssh-keygen -t ecdsa-sk` and `-t ed25519-sk` make them: the security key
@@ -2915,7 +2917,8 @@ First release.
 - Scheduler jobs window: run, stop, enable, disable, drop, run history.
 - Saved user reports with parameters.
 
-[Unreleased]: https://github.com/ortic/dbcraft/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/ortic/dbcraft/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/ortic/dbcraft/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/ortic/dbcraft/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/ortic/dbcraft/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/ortic/dbcraft/compare/v0.11.0...v0.12.0
