@@ -690,6 +690,9 @@ fn node_ui(
     let open = !collapsed.contains(&s.sid);
     let resp = ui
         .horizontal(|ui| {
+            // A right click on the text opens the menu too, rather than
+            // going to the labels to select their text.
+            ui.style_mut().interaction.selectable_labels = false;
             ui.add_space(depth as f32 * 22.0);
             if node.children.is_empty() {
                 ui.add_space(18.0);
@@ -974,6 +977,52 @@ mod tests {
                 immediate: false
             }]
         ));
+    }
+
+    /// A right click anywhere on a line of the blocking tree, its text too,
+    /// opens the session's menu, as in the session list.
+    #[test]
+    fn blocking_tree_menu() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        let blocker = SessionRow {
+            sid: 11,
+            serial: 1,
+            status: "INACTIVE".into(),
+            ..session("SCOTT", "WAITING", "Idle")
+        };
+        let waiter = SessionRow {
+            sid: 12,
+            serial: 2,
+            blocking_session: Some(11),
+            wait_secs: 30.0,
+            sql_text: Some("update emp set sal = sal * 2".into()),
+            ..session("HR", "WAITING", "Application")
+        };
+        let mut view = SessionsView::default();
+        view.on_sessions(Ok(vec![blocker, waiter]));
+        view.show_blocking();
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1200.0, 500.0))
+            .build_ui_state(
+                |ui, (view, wants): &mut (SessionsView, Wants)| view.ui(ui, 0.0, None, wants),
+                (view, Wants::default()),
+            );
+        h.run_steps(2);
+        for (line, sid) in [("11,1  SCOTT", 11), ("update emp set sal = sal * 2", 12)] {
+            h.get_by_label(line).click_secondary();
+            h.run_steps(2);
+            assert!(h.query_by_label("Kill session…").is_some(), "{line}");
+            h.get_by_label("Details").click();
+            h.run_steps(2);
+            assert!(
+                matches!(
+                    h.state_mut().1.list.pop(),
+                    Some(Want::OpenDetail { sid: s, tab: None, .. }) if s == sid
+                ),
+                "{line}"
+            );
+        }
     }
 
     /// The dashboard's bars open the sessions they count.

@@ -605,6 +605,9 @@ fn node_ui(
     let open = !collapsed.contains(&c.id);
     let resp = ui
         .horizontal(|ui| {
+            // A right click on the text opens the menu too, rather than
+            // going to the labels to select their text.
+            ui.style_mut().interaction.selectable_labels = false;
             ui.add_space(depth as f32 * 22.0);
             if node.children.is_empty() {
                 ui.add_space(18.0);
@@ -816,6 +819,16 @@ mod tests {
             h.query_by_label("final blocker · idle — likely an uncommitted transaction")
                 .is_some()
         );
+        // A right click on a line's text opens the session's menu.
+        h.get_by_label("11  app").click_secondary();
+        h.run_steps(2);
+        assert!(h.query_by_label("Terminate…").is_some());
+        h.get_by_label("Details").click();
+        h.run_steps(2);
+        assert!(matches!(
+            h.state_mut().1.list.pop(),
+            Some(Want::OpenConnection { id: 11 })
+        ));
         h.state_mut().0.confirm = Some(KillConfirm {
             id: 11,
             who: "app".into(),

@@ -6,6 +6,12 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Monitor: a right click on a session in the blocking tree opens its menu
+  (details, SQL details, cancel, kill, disconnect, trace) also on its text,
+  as in the session list: it went to the labels, so only the space between
+  them opened it. On MySQL, PostgreSQL and SQL Server too.
+
 ## [0.16.0] - 2026-11-23
 
 ### Added
