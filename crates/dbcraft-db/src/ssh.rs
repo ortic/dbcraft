@@ -32,6 +32,10 @@ use tracing::{debug, info, warn};
 
 use crate::types::DbError;
 
+mod security_key;
+
+use security_key::SecurityKey;
+
 const DEFAULT_PORT: u16 = 22;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// For the whole login: connecting, key exchange and authentication.
@@ -175,14 +179,21 @@ impl Tunnel {
                 state.forwards.clear();
                 let server = Server::parse(&self.params.host)?;
                 info!(params = ?self.params, "logging in over SSH");
+                // A security key waits for its touch as well.
+                let timeout = match &self.params.key_file {
+                    Some(path) if security_key::is_security_key(path) => {
+                        LOGIN_TIMEOUT + crate::fido::TOUCH_TIMEOUT
+                    }
+                    _ => LOGIN_TIMEOUT,
+                };
                 let ssh = runtime
                     .block_on(async {
-                        tokio::time::timeout(LOGIN_TIMEOUT, login(&server, &self.params)).await
+                        tokio::time::timeout(timeout, login(&server, &self.params)).await
                     })
                     .map_err(|_| {
                         DbError::new(format!(
                             "SSH: {server} didn't complete the login within {} seconds",
-                            LOGIN_TIMEOUT.as_secs()
+                            timeout.as_secs()
                         ))
                     })??;
                 state.ssh.insert(Arc::new(ssh)).clone()
@@ -409,6 +420,26 @@ async fn authenticate(
     let failed = |e: russh::Error| DbError::new(format!("SSH: logging in to {server}: {e}"));
     let (tried, result) = if let Some(path) = &params.key_file {
         let key = load_key(path, &params.password)?;
+        // The password opens an encrypted key file; otherwise it is the
+        // security key's PIN, where DbCraft asks the key itself.
+        let pin =
+            (!cfg!(windows) && !security_key::is_encrypted(path)).then(|| params.password.clone());
+        if let Some(mut signer) = SecurityKey::new(&key, pin) {
+            let result = ssh
+                .authenticate_publickey_with(user, key.public_key().clone(), None, &mut signer)
+                .await
+                .map_err(|e| DbError::new(format!("SSH: logging in to {server}: {}", e.0)))?;
+            return match result {
+                AuthResult::Success => Ok(()),
+                AuthResult::Failure {
+                    remaining_methods, ..
+                } => Err(DbError::new(format!(
+                    "SSH: {server} didn't accept the security key of {} for {user}{}",
+                    path.display(),
+                    accepted(&remaining_methods)
+                ))),
+            };
+        }
         let hash = ssh
             .best_supported_rsa_hash()
             .await

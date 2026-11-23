@@ -6,6 +6,16 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- SSH: the key files of security keys (FIDO2 or U2F, as YubiKeys), as
+  `ssh-keygen -t ecdsa-sk` and `-t ed25519-sk` make them: the security key
+  signs the login. On Windows, Windows asks for the touch and the PIN, as
+  for Windows' OpenSSH. On Linux and macOS, DbCraft asks the key over USB:
+  touch it when it blinks; a key that verifies the user
+  (`-O verify-required`) takes its PIN from the SSH password, or a
+  fingerprint. With several keys plugged in, the one that holds the key
+  signs. They failed with "didn't accept the key file".
+
 ### Changed
 - The macOS disk images are called `dbcraft_…dmg` and
   `dbcraft-instantclient_…dmg`, as the other packages; they were

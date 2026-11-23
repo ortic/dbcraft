@@ -720,8 +720,11 @@ impl ConnectDialog {
                         .password(true)
                         .hint_text(if ssh.key_file.trim().is_empty() {
                             "empty: the SSH agent's keys"
-                        } else {
+                        } else if cfg!(windows) {
                             "the key's passphrase, if it has one"
+                        } else {
+                            // Windows asks for a security key's PIN itself.
+                            "the key's passphrase, or its security key's PIN"
                         })
                         .desired_width(280.0),
                 );

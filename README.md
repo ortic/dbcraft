@@ -259,8 +259,9 @@ Pythia's settings, connections and saved passwords.
 - *Connect through SSH* forwards the connection over an SSH server, like
   `ssh -L` or HeidiSQL's SSH tunnel; the database address is then as the
   SSH server sees it (often `localhost:3306/database`). Log in with a
-  password, a key file (OpenSSH or PuTTY `.ppk`) or the SSH agent (Pageant
-  or Windows' OpenSSH agent). Host keys come from `~/.ssh/known_hosts`; an
+  password, a key file (OpenSSH or PuTTY `.ppk`, and the `ecdsa-sk` and
+  `ed25519-sk` files of security keys such as YubiKeys) or the SSH agent
+  (Pageant or Windows' OpenSSH agent). Host keys come from `~/.ssh/known_hosts`; an
   unknown one is shown with its fingerprint to trust once.
 - SQL windows with results, fetching on demand, Break, explain plan,
   *Execute to file*, completion with columns and comments, and
