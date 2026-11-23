@@ -685,6 +685,8 @@ fn data_editing() {
 /// out generated columns but not MySQL's invisible ones, and take values
 /// for identities that only take one when told to; a WHERE clause per
 /// table; the tables consistently, in one transaction, or table by table.
+/// Or all of them as one dump: the referenced tables first, their DROPs the
+/// other way round, a dump that imports again where it came from.
 /// SQLite always, the servers with `DBCRAFT_TEST_MYSQL`,
 /// `DBCRAFT_TEST_POSTGRES` and `DBCRAFT_TEST_MSSQL`.
 #[test]
@@ -746,10 +748,16 @@ fn export_tables_on(profile: ConnectionProfile, password: String) {
     };
     let c = dialect.quote_ident("Dbcraft_Xc");
     let drops = || -> Vec<String> {
-        ["dbcraft_xa", "dbcraft_xbig", &c]
-            .iter()
-            .map(|t| format!("drop table if exists {t}"))
-            .collect()
+        [
+            "dbcraft_xchild",
+            "dbcraft_xparent",
+            "dbcraft_xa",
+            "dbcraft_xbig",
+            &c,
+        ]
+        .iter()
+        .map(|t| format!("drop table if exists {t}"))
+        .collect()
     };
     let digits = "(select 0 d union all select 1 union all select 2 union all select 3 \
                   union all select 4 union all select 5 union all select 6 union all select 7 \
@@ -795,6 +803,14 @@ fn export_tables_on(profile: ConnectionProfile, password: String) {
         ),
         format!("create table {c} (v varchar(5))"),
         format!("insert into {c} values ('c')"),
+        // A child that sorts before its parent. MySQL ignores a column's
+        // REFERENCES: the key is the table's.
+        "create table dbcraft_xparent (id int primary key, name varchar(20))".to_owned(),
+        "insert into dbcraft_xparent values (1, 'p1'), (2, 'it''s')".to_owned(),
+        "create table dbcraft_xchild (id int primary key, parent_id int, \
+           foreign key (parent_id) references dbcraft_xparent (id))"
+            .to_owned(),
+        "insert into dbcraft_xchild values (10, 1), (11, 2), (12, 1)".to_owned(),
     ]);
     sql(setup);
 
@@ -918,6 +934,121 @@ fn export_tables_on(profile: ConnectionProfile, password: String) {
         matches!(&message, Some((true, m)) if m.starts_with("dbcraft_xa: ")),
         "{kind:?}: {message:?}"
     );
+
+    // One file: the tables after the ones they reference, each with its
+    // DDL, all dropped first, the children before their parents.
+    let e = h.state_mut().test_export_tables();
+    e.format = dbcraft_data::Format::Insert;
+    e.single_file = true;
+    e.file = Some(folder.join("dump.sql"));
+    e.include_ddl = true;
+    e.drop_tables = true;
+    e.read = crate::export_tables::Read::Chunks;
+    let tables = [
+        ("dbcraft_xa", ""),
+        ("dbcraft_xbig", ""),
+        ("dbcraft_xchild", ""),
+        ("dbcraft_xparent", ""),
+        ("Dbcraft_Xc", ""),
+    ];
+    let message = export(&mut h, &tables);
+    assert!(
+        matches!(&message, Some((false, m)) if m.starts_with("Exported 2509 rows from 5 table(s)")
+            && m.ends_with("dump.sql")),
+        "{kind:?}: {message:?}"
+    );
+    let dump = read("dump.sql");
+    let at = |needle: &str| {
+        dump.find(needle)
+            .unwrap_or_else(|| panic!("{kind:?}: {needle} not in\n{dump}"))
+    };
+    let table = |name: &str| {
+        format!(
+            "-- Table {}",
+            match kind {
+                DbKind::Postgres | DbKind::SqlServer => {
+                    let schema = if kind == DbKind::Postgres {
+                        "public"
+                    } else {
+                        "dbo"
+                    };
+                    format!("{schema}.{name}")
+                }
+                _ => name.to_owned(),
+            }
+        )
+    };
+    assert!(
+        at(&table("dbcraft_xparent")) < at(&table("dbcraft_xchild")),
+        "{kind:?}"
+    );
+    assert!(at("drop table if exists") < at("-- Table"), "{kind:?}");
+    let drop_of = |name: &str| {
+        let line = dump
+            .lines()
+            .position(|l| l.starts_with("drop table") && l.contains(name));
+        line.unwrap_or_else(|| panic!("{kind:?}: no drop of {name}"))
+    };
+    assert!(
+        drop_of("dbcraft_xchild") < drop_of("dbcraft_xparent"),
+        "{kind:?}"
+    );
+    // A hundred rows an INSERT.
+    assert_eq!(
+        dump.matches("insert into dbcraft_xbig").count(),
+        25,
+        "{kind:?}"
+    );
+    assert!(
+        !std::fs::read_dir(&folder).unwrap().any(|f| f
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|e| e == "part")),
+        "{kind:?}: no .part file left"
+    );
+    // It imports where it came from, as the database's client would run
+    // it: the tables dropped, made again, their rows back.
+    let syntax = dialect.syntax();
+    let statements: Vec<String> = dbcraft_plsql::split_statements_in(&dump, syntax)
+        .iter()
+        .map(|s| s.text(&dump).to_owned())
+        .collect();
+    sql(statements);
+    let counts = {
+        let (user, pw, at) = (
+            profile.username.clone(),
+            password.clone(),
+            profile.connect_string.clone(),
+        );
+        let c = c.clone();
+        crate::test_db::run_with(kind, &user, &pw, &at, move |client| {
+            [
+                "dbcraft_xa",
+                "dbcraft_xbig",
+                "dbcraft_xchild",
+                "dbcraft_xparent",
+                &c,
+            ]
+            .iter()
+            .map(|t| {
+                let rows = client.query(&format!("select count(*) from {t}"), &[]);
+                rows.unwrap_or_else(|e| panic!("{t}: {e}"))[0][0]
+                    .clone()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(counts, ["3", "2500", "3", "2", "1"], "{kind:?}");
+    // The rows' ids are taken: new rows get new ones.
+    if matches!(kind, DbKind::Postgres | DbKind::SqlServer) {
+        sql(vec![
+            "insert into dbcraft_xa (name) values ('four')".to_owned(),
+        ]);
+    }
+    h.state_mut().test_export_tables().single_file = false;
+
     h.state_mut().test_close_focused();
     drop(h);
 

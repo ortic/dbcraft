@@ -22,6 +22,11 @@ pub struct Table {
     pub generated: Vec<String>,
     /// Identity columns that take a value only when told to.
     pub identity: Vec<String>,
+    /// PostgreSQL's columns that take their values from a sequence
+    /// (serial, identity): a dump sets the sequence past the rows' ids.
+    pub sequenced: Vec<String>,
+    /// The table's DDL, for a dump (one file); `None` without it.
+    pub ddl: Option<String>,
 }
 
 /// What the export reads before the rows: the tables' columns, their DDL
@@ -29,7 +34,11 @@ pub struct Table {
 #[derive(Debug)]
 pub struct Prepared {
     pub schema: String,
+    /// In the order they are exported: for a dump the order their foreign
+    /// keys need.
     pub tables: Vec<Table>,
+    /// Tables of a dump that reference each other.
+    pub cycle: Vec<String>,
 }
 
 /// The database typed, or the session's current one.
@@ -57,34 +66,63 @@ fn schema(client: &mut dyn Client, typed: &str) -> Result<String, DbError> {
         })
 }
 
-/// The tables of `schema` and the rows the database estimates they have
-/// (SQLite keeps no count); the schema is the query's only parameter.
+/// The tables of `schema`, the rows the database estimates they have and
+/// the bytes they take with their indexes, from its statistics and
+/// catalog, which a listing reads without touching the tables (SQLite
+/// keeps neither); the schema is the query's only parameter.
 fn tables_sql(dialect: Dialect, schema: &str) -> String {
     match dialect {
-        Dialect::MYSQL => "select table_name, table_rows from information_schema.tables
+        Dialect::MYSQL => "select table_name, table_rows, data_length + index_length
+                             from information_schema.tables
                             where table_schema = ? and table_type = 'BASE TABLE'
                             order by table_name"
             .into(),
         // Partitioned tables, not their partitions; -1 is never analyzed.
+        // The pages of the table, its TOAST table and indexes (of all its
+        // partitions), as VACUUM and ANALYZE counted them: the sizes
+        // pg_total_relation_size reads from the files would wait for the
+        // lock of a table being altered.
         Dialect::POSTGRES => "select c.relname,
-                                     case when c.reltuples >= 0 then c.reltuples::bigint end
+                                     case when c.reltuples >= 0 then c.reltuples::bigint end,
+                                     case when c.reltuples >= 0 or c.relkind = 'p' then
+                                       (select sum(r.relpages + coalesce(t.relpages, 0)
+                                                 + coalesce((select sum(i.relpages)
+                                                               from pg_index x
+                                                               join pg_class i
+                                                                 on i.oid = x.indexrelid
+                                                              where x.indrelid = r.oid), 0))
+                                          from pg_class r
+                                          left join pg_class t on t.oid = r.reltoastrelid
+                                         where r.oid in (select relid
+                                                           from pg_partition_tree(c.oid)))
+                                       * current_setting('block_size')::bigint
+                                     end
                                 from pg_class c
                                 join pg_namespace n on n.oid = c.relnamespace
                                where n.nspname = $1 and c.relkind in ('r', 'p')
                                  and not c.relispartition
                                order by c.relname"
             .into(),
+        // The pages of all its indexes and LOB data, in-row and overflow
+        // pages in their heap or B-tree (hobt), LOBs by partition.
         Dialect::SQLSERVER => "select t.name,
                                       (select sum(p.rows) from sys.partitions p
                                         where p.object_id = t.object_id
-                                          and p.index_id in (0, 1))
+                                          and p.index_id in (0, 1)),
+                                      (select sum(a.total_pages) * 8192
+                                         from sys.partitions p
+                                         join sys.allocation_units a
+                                           on a.container_id = case when a.type = 2
+                                                                    then p.partition_id
+                                                                    else p.hobt_id end
+                                        where p.object_id = t.object_id)
                                  from sys.tables t
                                  join sys.schemas s on s.schema_id = t.schema_id
                                 where s.name = @P1
                                 order by t.name"
             .into(),
         _ => format!(
-            "select name, null from {}.sqlite_master
+            "select name, null, null from {}.sqlite_master
               where type = 'table' and name not like 'sqlite\\_%' escape '\\'
               order by name",
             dialect.quote_ident(schema)
@@ -110,10 +148,18 @@ pub fn load_tables(owner: String) -> RunFn {
             .filter_map(|row| {
                 let mut row = row.into_iter();
                 let name = row.next().flatten()?;
-                let rows = row.next().flatten().and_then(|r| r.parse().ok());
+                let mut number = || {
+                    row.next()
+                        .flatten()
+                        .and_then(|r| r.parse::<f64>().ok())
+                        .map(|n| n as i64)
+                };
+                let rows = number();
+                let bytes = number();
                 Some(Choice {
                     name,
                     rows,
+                    bytes,
                     selected: false,
                     filter: String::new(),
                 })
@@ -140,7 +186,10 @@ fn columns(client: &mut dyn Client, schema: &str, table: &str) -> Result<Table, 
         Dialect::POSTGRES => client.query(
             "select a.attname,
                     case when a.attgenerated <> '' then 1 else 0 end,
-                    case when a.attidentity = 'a' then 1 else 0 end
+                    case when a.attidentity = 'a' then 1 else 0 end,
+                    case when pg_get_serial_sequence(
+                                quote_ident(n.nspname) || '.' || quote_ident(c.relname),
+                                a.attname) is not null then 1 else 0 end
                from pg_attribute a
                join pg_class c on c.oid = a.attrelid
                join pg_namespace n on n.oid = c.relnamespace
@@ -174,6 +223,8 @@ fn columns(client: &mut dyn Client, schema: &str, table: &str) -> Result<Table, 
         columns: Vec::new(),
         generated: Vec::new(),
         identity: Vec::new(),
+        sequenced: Vec::new(),
+        ddl: None,
     };
     for row in rows {
         let mut row = row.into_iter();
@@ -185,6 +236,9 @@ fn columns(client: &mut dyn Client, schema: &str, table: &str) -> Result<Table, 
         }
         if row.next().flatten().as_deref() == Some("1") {
             found.identity.push(column.clone());
+        }
+        if row.next().flatten().as_deref() == Some("1") {
+            found.sequenced.push(column.clone());
         }
         found.columns.push(column);
     }
@@ -209,15 +263,48 @@ fn begin(client: &mut dyn Client) -> Result<(), DbError> {
     }
 }
 
-/// Reads the tables' columns and writes their DDL when asked to; with
-/// `consistent`, begins the transaction the rows are read in, last, so
-/// that its snapshot is the moment the rows start.
+/// The foreign keys among the tables of `schema`: (referencing,
+/// referenced).
+fn foreign_keys(
+    client: &mut dyn Client,
+    schema: &str,
+    tables: &[Table],
+) -> Result<Vec<(String, String)>, DbError> {
+    let dialect = client.dialect();
+    let rows = match super::dump::foreign_keys_sql(dialect) {
+        Some(sql) => client.query(sql, &[schema])?,
+        None => {
+            let mut rows = Vec::new();
+            for table in tables {
+                rows.extend(client.query(
+                    "select ?, \"table\" from pragma_foreign_key_list(?, ?)",
+                    &[&table.name, &table.name, schema],
+                )?);
+            }
+            rows
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let mut row = row.into_iter();
+            Some((row.next().flatten()?, row.next().flatten()?))
+        })
+        .collect())
+}
+
+/// Reads the tables' columns and writes their DDL when asked to, next to
+/// the data files, or for a `dump` (one file) keeps it and puts the tables
+/// in the order their foreign keys need; with `consistent`, begins the
+/// transaction the rows are read in, last, so that its snapshot is the
+/// moment the rows start.
 pub fn prepare(
     owner: String,
     jobs: Vec<Job>,
     folder: PathBuf,
     include_ddl: bool,
     consistent: bool,
+    dump: bool,
 ) -> RunFn {
     Box::new(move |client| {
         let schema = schema(client, &owner)?;
@@ -237,18 +324,37 @@ pub fn prepare(
                     MetaResult::Text(ddl) => ddl,
                     _ => String::new(),
                 };
-                let path = folder.join(format!("{}.ddl.sql", file_stem(&job.table)));
                 let ddl = ddl.trim_end();
-                let end = if ddl.ends_with(';') { "\n" } else { ";\n" };
+                let end = if ends_statement(ddl) { "\n" } else { ";\n" };
+                if dump {
+                    let mut table = table;
+                    table.ddl = Some(format!("{ddl}{end}"));
+                    tables.push(table);
+                    continue;
+                }
+                let path = folder.join(format!("{}.ddl.sql", file_stem(&job.table)));
                 std::fs::write(&path, format!("{ddl}{end}"))
                     .map_err(|e| DbError::new(format!("{}: {e}", path.display())))?;
             }
             tables.push(table);
         }
+        let mut cycle = Vec::new();
+        if dump {
+            let edges = foreign_keys(client, &schema, &tables)?;
+            let names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
+            let (order, tangled) = super::dump::dependency_order(&names, &edges);
+            let mut slots: Vec<Option<Table>> = tables.into_iter().map(Some).collect();
+            tables = order.iter().filter_map(|&i| slots[i].take()).collect();
+            cycle = tangled;
+        }
         if consistent {
             begin(client).map_err(|e| began(client.dialect(), e))?;
         }
-        Ok(Box::new(Prepared { schema, tables }) as Box<dyn std::any::Any + Send>)
+        Ok(Box::new(Prepared {
+            schema,
+            tables,
+            cycle,
+        }) as Box<dyn std::any::Any + Send>)
     })
 }
 
@@ -306,6 +412,17 @@ pub fn failed(dialect: Dialect, table: &str, error: &DbError) -> DbError {
         return DbError::new(format!("{table}: {}", snapshot_off(error).message));
     }
     DbError::new(format!("{table}: {}", error.text()))
+}
+
+/// Whether DDL ends its last statement: with `;`, or SQL Server's with
+/// `GO` on a line of its own (`GO;` is no batch separator to sqlcmd).
+pub fn ends_statement(ddl: &str) -> bool {
+    let ddl = ddl.trim_end();
+    ddl.ends_with(';')
+        || ddl
+            .rsplit('\n')
+            .next()
+            .is_some_and(|last| last.trim().eq_ignore_ascii_case("go"))
 }
 
 fn qualified(dialect: Dialect, schema: &str, table: &str) -> String {
@@ -375,12 +492,23 @@ mod tests {
     }
 
     #[test]
+    fn statement_ends() {
+        assert!(ends_statement("create table t (id int);\n"));
+        assert!(ends_statement("create table t (id int)\nGO\n"));
+        assert!(ends_statement("create table t (id int);\ngo"));
+        assert!(!ends_statement("create table t (id int)"));
+        assert!(!ends_statement("create table ago (id int)"));
+    }
+
+    #[test]
     fn selects() {
         let table = Table {
             name: "order".into(),
             columns: vec!["id".into(), "total sum".into()],
             generated: vec![],
             identity: vec![],
+            sequenced: vec![],
+            ddl: None,
         };
         assert_eq!(
             select(Dialect::MYSQL, "shop", &table, None),

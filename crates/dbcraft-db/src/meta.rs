@@ -1116,25 +1116,51 @@ pub fn object_ddl(
     let mut ddl = ddl.trim().to_owned();
     if object_type == ObjectType::Table {
         // Append comments and indexes the way PL/SQL Developer's "View" does.
-        for (kind, sql) in [
-            (
-                "COMMENT",
-                "select dbms_metadata.get_dependent_ddl('COMMENT', :1, :2) from dual",
-            ),
-            (
-                "INDEX",
-                "select dbms_metadata.get_dependent_ddl('INDEX', :1, :2) from dual",
-            ),
-        ] {
-            // ORA-31608: no dependent objects of this kind.
-            match conn.query_row_as::<String>(sql, &[&name, &owner]) {
-                Ok(dep) => {
-                    ddl.push_str("\n\n");
-                    ddl.push_str(dep.trim());
-                }
-                Err(e) if e.db_error().is_some_and(|d| d.code() == 31608) => {}
-                Err(e) => tracing::warn!("dependent {kind} ddl: {e}"),
+        // ORA-31608: no comments.
+        match conn.query_row_as::<String>(
+            "select dbms_metadata.get_dependent_ddl('COMMENT', :1, :2) from dual",
+            &[&name, &owner],
+        ) {
+            Ok(dep) => {
+                ddl.push_str("\n\n");
+                ddl.push_str(dep.trim());
             }
+            Err(e) if e.db_error().is_some_and(|d| d.code() == 31608) => {}
+            Err(e) => tracing::warn!("dependent COMMENT ddl: {e}"),
+        }
+        // Not the indexes of its primary and unique keys: CREATE TABLE makes
+        // those, and made again they fail (ORA-01408), which kept the DDL
+        // from running as it is. Nor a LOB's, which belongs to its LOB.
+        let indexes = conn
+            .query_as::<(String, String)>(
+                "select i.owner, i.index_name
+                   from all_indexes i
+                  where i.table_owner = :1 and i.table_name = :2 and i.index_type <> 'LOB'
+                    and not exists (select 1 from all_constraints c
+                                     where c.owner = i.table_owner
+                                       and c.table_name = i.table_name
+                                       and c.index_name = i.index_name
+                                       and c.constraint_type in ('P', 'U'))
+                  order by i.index_name",
+                &[&owner, &name],
+            )
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+        match indexes {
+            Ok(indexes) => {
+                for (index_owner, index) in indexes {
+                    match conn.query_row_as::<String>(
+                        "select dbms_metadata.get_ddl('INDEX', :1, :2) from dual",
+                        &[&index, &index_owner],
+                    ) {
+                        Ok(dep) => {
+                            ddl.push_str("\n\n");
+                            ddl.push_str(dep.trim());
+                        }
+                        Err(e) => tracing::warn!("index {index} ddl: {e}"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("indexes of {owner}.{name}: {e}"),
         }
     }
     Ok(ddl)

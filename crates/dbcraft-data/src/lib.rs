@@ -95,6 +95,10 @@ pub struct Options {
     /// PostgreSQL's GENERATED ALWAYS (`OVERRIDING SYSTEM VALUE`) and SQL
     /// Server's (`SET IDENTITY_INSERT`) (#457).
     pub identity: Vec<String>,
+    /// Rows an INSERT statement takes at most, in one `values` list (not
+    /// on Oracle): a dump that `mysql` imports in a fraction of the time
+    /// one statement per row takes. 1, the default: a statement per row.
+    pub rows_per_insert: usize,
 }
 
 impl Default for Options {
@@ -109,6 +113,7 @@ impl Default for Options {
             time_zone: None,
             generated: Vec::new(),
             identity: Vec::new(),
+            rows_per_insert: 1,
         }
     }
 }
@@ -311,6 +316,16 @@ impl<W: Write> StreamWriter<W> {
 
     pub fn rows(&self) -> u64 {
         self.rows
+    }
+
+    /// The output, for text between batches of rows (a dump's `commit`).
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+
+    /// The output, without what [`finish`](Self::finish) would end it with.
+    pub fn into_inner(self) -> W {
+        self.out
     }
 
     pub fn finish(mut self) -> Result<W> {
@@ -1424,6 +1439,13 @@ fn inserts(
         "insert into {target} ({}){overriding} values (",
         names.join(", ")
     );
+    if dialect.kind() != DbKind::Oracle && options.rows_per_insert > 1 {
+        multi_row_inserts(&head, &columns, &kept, rows, options, out)?;
+        if identity_insert {
+            writeln!(out, "set identity_insert {target} off;")?;
+        }
+        return Ok(());
+    }
     for row in rows {
         let row: Vec<Cell> = kept
             .iter()
@@ -1444,6 +1466,63 @@ fn inserts(
     }
     if identity_insert {
         writeln!(out, "set identity_insert {target} off;")?;
+    }
+    Ok(())
+}
+
+/// The most bytes of one multi-row INSERT: well below MySQL's
+/// `max_allowed_packet` (64 MB; MariaDB's 16 MB), and a statement a client
+/// reads quickly.
+const INSERT_BYTES: usize = 1 << 20;
+
+/// SQL Server's limit of rows in a `values` list.
+const SQLSERVER_VALUES_ROWS: usize = 1000;
+
+/// `rows` as INSERTs of up to `options.rows_per_insert` rows each, a row's
+/// values on a line of their own; a statement ends before it passes
+/// [`INSERT_BYTES`] (a single row longer than that stands alone).
+fn multi_row_inserts(
+    head: &str,
+    columns: &[Column],
+    kept: &[usize],
+    rows: &[Vec<Cell>],
+    options: &Options,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let dialect = options.dialect;
+    let mut most = options.rows_per_insert;
+    if dialect.kind() == DbKind::SqlServer {
+        most = most.min(SQLSERVER_VALUES_ROWS);
+    }
+    // `insert into t (a, b) values (` without its `(`.
+    let head = head.strip_suffix('(').unwrap_or(head).trim_end();
+    let mut statement = String::new();
+    let mut in_statement = 0;
+    for row in rows {
+        let values: Vec<String> = columns
+            .iter()
+            .zip(kept.iter().map(|&i| row.get(i).cloned().flatten()))
+            .map(|(c, v)| literal(dialect, c, v.as_deref()))
+            .collect();
+        let tuple = format!("({})", values.join(", "));
+        if in_statement > 0
+            && (in_statement == most || statement.len() + tuple.len() + 2 > INSERT_BYTES)
+        {
+            writeln!(out, "{statement};")?;
+            statement.clear();
+            in_statement = 0;
+        }
+        if in_statement == 0 {
+            statement.push_str(head);
+            statement.push('\n');
+        } else {
+            statement.push_str(",\n");
+        }
+        statement.push_str(&tuple);
+        in_statement += 1;
+    }
+    if in_statement > 0 {
+        writeln!(out, "{statement};")?;
     }
     Ok(())
 }
@@ -1687,6 +1766,60 @@ mod tests {
             insert(Dialect::MYSQL),
             "insert into t (id, n) values (1, 2);\n"
         );
+    }
+
+    /// A dump's INSERTs take several rows each, their values a line each;
+    /// SQL Server's at most 1000, Oracle's one, as before.
+    #[test]
+    fn multi_row_inserts() {
+        let columns = [
+            Column {
+                name: "id".into(),
+                type_name: "int".into(),
+                numeric: true,
+            },
+            Column {
+                name: "name".into(),
+                type_name: "text".into(),
+                numeric: false,
+            },
+        ];
+        let rows: Vec<Vec<Cell>> = (1..=5)
+            .map(|n| vec![Some(n.to_string()), (n != 3).then(|| format!("n{n}"))])
+            .collect();
+        let insert = |dialect: Dialect, per: usize, rows: &[Vec<Cell>]| {
+            let options = Options {
+                dialect,
+                table: "t".into(),
+                rows_per_insert: per,
+                ..Options::default()
+            };
+            String::from_utf8(export_to_vec(Format::Insert, &columns, rows, &options).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            insert(Dialect::MYSQL, 2, &rows),
+            "insert into t (id, name) values\n(1, 'n1'),\n(2, 'n2');\n\
+             insert into t (id, name) values\n(3, NULL),\n(4, 'n4');\n\
+             insert into t (id, name) values\n(5, 'n5');\n"
+        );
+        assert_eq!(insert(Dialect::MYSQL, 100, &[]), "");
+        let oracle = insert(Dialect::ORACLE, 100, &rows);
+        assert_eq!(oracle.lines().count(), 5, "{oracle}");
+        let many: Vec<Vec<Cell>> = (0..2500).map(|n| vec![Some(n.to_string()), None]).collect();
+        let sqlserver = insert(Dialect::SQLSERVER, 5000, &many);
+        assert_eq!(sqlserver.matches("insert into").count(), 3);
+        // A statement stops short of a megabyte.
+        let wide: Vec<Vec<Cell>> = (0..30)
+            .map(|n| vec![Some(n.to_string()), Some("x".repeat(100_000))])
+            .collect();
+        let mysql = insert(Dialect::MYSQL, 1000, &wide);
+        assert_eq!(
+            mysql.matches("insert into").count(),
+            3,
+            "10 rows a statement"
+        );
+        assert!(mysql.split(";\n").all(|s| s.len() < INSERT_BYTES));
     }
 
     /// PostgreSQL's money as `lc_monetary` writes it, as a plain decimal.

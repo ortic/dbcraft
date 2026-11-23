@@ -174,7 +174,13 @@ Pythia's settings, connections and saved passwords.
 - Schema compare with structural table diffs and safe, ordered sync
   scripts; data compare by key with sync DML.
 - Export tables: pick tables, a WHERE per table, CSV/TSV/JSON/INSERT/
-  Markdown, one file per table plus DDL, streamed with progress.
+  Markdown, one file per table plus DDL, streamed with progress. The list
+  shows each table's rows and size (MB, with its indexes) from the
+  statistics and sorts by name, rows or size. INSERTs can go into *One
+  file*, a dump to import elsewhere with the database's client (`mysql db
+  < dump.sql`, `psql`, `sqlcmd`, `sqlite3`, SQL*Plus): the tables after
+  the ones their foreign keys reference, optionally dropped first, the
+  rows a hundred an INSERT and committed every 10,000.
 - Import CSV/Excel: drop a file, check inferred types (decimal commas,
   date formats), import into a new or existing table with array DML.
   Per column: trim, date format, SQL expression (`upper(:value)`,
@@ -301,7 +307,9 @@ Pythia's settings, connections and saved passwords.
   `SHOW CREATE TABLE`), each streamed from the session. *Read: Table by
   table* reads each table as of its own query; *Consistent* all of them
   in one transaction `WITH CONSISTENT SNAPSHOT` (InnoDB tables). INSERTs
-  leave out generated columns.
+  leave out generated columns. *One file* writes a dump for `mysql db <
+  dump.sql`, as mysqldump's: UTF-8, foreign and unique key checks off
+  while it imports, an id 0 kept.
 - Everything built on Oracle's dictionary or PL/SQL — debugger, profiler,
   the rest of the monitor, reports, scheduler jobs, compare, import,
   the other form editors — isn't offered on MySQL connections. End a
