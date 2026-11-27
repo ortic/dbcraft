@@ -103,6 +103,17 @@ impl ObjectView {
         (ddl, columns)
     }
 
+    /// The Columns tab as the test sees it: `None` while it loads, else
+    /// the column count or what it says instead.
+    #[cfg(test)]
+    pub fn columns_for_test(&self) -> Option<Result<usize, String>> {
+        match &self.state.columns {
+            None | Some(Loaded::Loading) => None,
+            Some(Loaded::Ready(cols)) => Some(Ok(cols.len())),
+            Some(Loaded::Failed(e)) => Some(Err(e.clone())),
+        }
+    }
+
     pub fn is_loading(&self) -> bool {
         !self.state.pending.is_empty() || matches!(self.state.link_test, Some((_, Loaded::Loading)))
     }

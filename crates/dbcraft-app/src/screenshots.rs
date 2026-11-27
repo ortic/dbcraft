@@ -14081,13 +14081,18 @@ fn object_view_of_a_dropped_table() {
     });
     h.run_steps(3);
     h.get_by_label("Refresh").click();
-    wait_until(&mut h, "refresh", |app| !app.test_focused_busy());
+    // Until its columns are in, not only until it's idle, and saying what it
+    // shows otherwise: it failed once on CI with nothing to go by.
+    wait_until(&mut h, "refresh", |app| {
+        !app.test_focused_busy() && app.test_object_view().columns_for_test().is_some()
+    });
     h.run_steps(2);
+    let columns = h.state().test_object_view().columns_for_test();
     assert!(
-        h.query_by_label_contains("There is no table main.dv_b")
-            .is_some(),
-        "Refresh says it's gone"
+        matches!(&columns, Some(Err(e)) if e.starts_with("There is no table main.dv_b")),
+        "Refresh says it's gone, not {columns:?}"
     );
+    assert!(h.query_by_label_contains("There is no table main.dv_b").is_some());
 }
 
 /// A read-only connection drops nothing from the object browser either
