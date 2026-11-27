@@ -4170,8 +4170,8 @@ dependencies = [
 
 [[package]]
 name = "oracledb"
-version = "26.0.0-beta.5"
-source = "git+https://github.com/ortic/rust-oracledb?rev=8dde2372336e1c4c9814a00d94f4eb6db7cff90c#8dde2372336e1c4c9814a00d94f4eb6db7cff90c"
+version = "26.0.0-beta.7"
+source = "git+https://github.com/ortic/rust-oracledb?rev=08222a3104bdf6c1a74f9673d5edcd80f5bc6e91#08222a3104bdf6c1a74f9673d5edcd80f5bc6e91"
 dependencies = [
  "aes",
  "base16ct",
@@ -4179,10 +4179,13 @@ dependencies = [
  "cbc",
  "chrono",
  "chrono-tz",
+ "md-5",
+ "num-bigint 0.5.1",
  "pbkdf2",
  "pkcs8",
  "rand 0.10.3",
  "rustls",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "uuid",
  "webpki-roots",
@@ -6052,7 +6055,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",

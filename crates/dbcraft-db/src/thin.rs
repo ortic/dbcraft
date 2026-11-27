@@ -828,7 +828,7 @@ impl Batch<'_> {
             .statement(&self.sql)?
             .batch_errors()
             .build()?;
-        let result = statement.execute_batch(slices.as_slice().into())?;
+        let result = statement.execute_batch(oracledb::BindParameters::Slice(&slices))?;
         let errors: Vec<DbError> = result
             .batch_errors()
             .iter()
