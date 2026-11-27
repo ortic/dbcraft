@@ -137,8 +137,8 @@ pub fn def(icon: Icon) -> Def {
         ),
         Icon::Rollback => color(
             "rollback",
-            AMBER,
-            AMBER,
+            RED,
+            RED,
             r#"<path d="M5.25 2.75 2.5 5.5l2.75 2.75" stroke="$A"/><path d="M2.75 5.5h6.5a4 4 0 0 1 0 8H6" stroke="$A"/>"#,
         ),
         Icon::NewSql => color(

@@ -12,6 +12,11 @@ and the project uses [Semantic Versioning](https://semver.org/).
   which an empty result hasn't got, so a table without rows couldn't get
   its first one.
 
+### Changed
+- The toolbar's *Rollback* is red, *Commit* green, and they keep their
+  colors while a transaction is pending (the buttons framed in amber):
+  both were amber then, hard to tell apart.
+
 ### Fixed
 - Monitor: a right click on a session in the blocking tree opens its menu
   (details, SQL details, cancel, kill, disconnect, trace) also on its text,

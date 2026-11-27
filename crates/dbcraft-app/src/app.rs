@@ -6704,9 +6704,12 @@ fn tool_button(
     emphasis: Emphasis,
 ) -> bool {
     let enabled = state.is_ok();
+    // A colored icon keeps its color when emphasized: Commit (green) and
+    // Rollback (red) were both drawn in the warning color while a
+    // transaction was pending, when telling them apart matters most.
     let mut image = match (icon.is_colored(), emphasis) {
-        (_, Emphasis::Warn) => icon.mono(theme::WARN),
         (true, _) => icon.image(ui),
+        (false, Emphasis::Warn) => icon.mono(theme::WARN),
         (false, _) => icon.mono(Color32::WHITE),
     };
     if !enabled {
