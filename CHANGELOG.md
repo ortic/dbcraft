@@ -18,6 +18,13 @@ and the project uses [Semantic Versioning](https://semver.org/).
   both were amber then, hard to tell apart.
 
 ### Fixed
+- Oracle: an account with only an 11G (SHA-1) password verifier, the
+  default on 12.1 and common on databases upgraded from 11g, connects
+  without the Instant Client (#498): the driver had only the 12C verifier
+  and failed. The driver is rust-oracledb 26.0.0-beta.6 and later
+  (oracle/rust-oracledb#63), with its fixes: TIMESTAMP WITH LOCAL TIME
+  ZONE values are right when the database time zone (DBTIMEZONE) is an
+  offset other than +00:00 (they were off by it).
 - Monitor: a right click on a session in the blocking tree opens its menu
   (details, SQL details, cancel, kill, disconnect, trace) also on its text,
   as in the session list: it went to the labels, so only the space between
