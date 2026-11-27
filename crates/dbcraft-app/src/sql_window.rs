@@ -2712,6 +2712,24 @@ impl SqlWindow {
                                 edit_action = Some(EditAction::Apply(i));
                             }
                             ui.separator();
+                            // Also on a cell's menu, which an empty result
+                            // hasn't got: it could take no new row.
+                            if ui
+                                .add_enabled(result.grid.has_selection(), egui::Button::new("Delete rows"))
+                                .on_hover_text(
+                                    "Delete the selected rows, or undelete them; new rows are taken away",
+                                )
+                                .clicked()
+                            {
+                                result.grid.delete_selected_rows(&result.rows, result.columns.len());
+                            }
+                            if labelled(ui, Icon::Plus, "Insert row")
+                                .on_hover_text("Add a new row, written with Apply")
+                                .clicked()
+                            {
+                                result.grid.add_row(&result.rows, result.columns.len());
+                            }
+                            ui.separator();
                         }
                         None => {
                             if idle

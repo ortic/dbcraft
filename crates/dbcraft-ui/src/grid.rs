@@ -958,6 +958,19 @@ impl GridState {
         }
     }
 
+    /// Deletes the selected fetched rows, or undeletes them, and takes away
+    /// the selected new rows, as *Delete / undelete rows* of the menu.
+    pub fn delete_selected_rows(&mut self, rows: &[Vec<Cell>], columns: usize) {
+        self.sync(rows, &[]);
+        self.delete_rows(columns);
+    }
+
+    /// A cell or range is selected (what [`Self::delete_selected_rows`]
+    /// works on).
+    pub fn has_selection(&self) -> bool {
+        self.anchor.is_some()
+    }
+
     pub fn set_read_only(&mut self) {
         self.edit = None;
         self.changes_revision += 1;
@@ -5958,6 +5971,34 @@ mod tests {
         // Undone, it is back where it was.
         state.undo(&rows);
         assert_eq!(nulls(&state), BTreeSet::from([(1, 1)]));
+    }
+
+    /// The result bar's *Insert row* and *Delete rows*: an empty result has
+    /// no cell whose menu could add its first row.
+    #[test]
+    fn rows_come_and_go_without_the_cell_menu() {
+        let columns = cols();
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        frame(&ctx, &columns, &[], &mut state, vec![]);
+        assert!(!state.has_selection());
+        state.add_row(&[], 2);
+        assert_eq!(state.changes().unwrap().inserts.len(), 1);
+        // The new row is selected: deleting takes it away.
+        assert!(state.has_selection());
+        state.delete_selected_rows(&[], 2);
+        assert!(state.changes().unwrap().is_empty());
+
+        let rows = vec![vec![Some("1".to_owned()), Some("a".to_owned())]];
+        let mut state = GridState::default();
+        state.set_editable(None);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.select((0, 1), false);
+        state.delete_selected_rows(&rows, 2);
+        assert_eq!(state.changes().unwrap().deletes, BTreeSet::from([0]));
+        state.delete_selected_rows(&rows, 2);
+        assert!(state.changes().unwrap().is_empty());
     }
 
     #[test]

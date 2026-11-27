@@ -6,6 +6,12 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Editing a result, the bar has *Insert row* and *Delete rows* (which
+  undeletes them too) beside *Apply*: they were only on a cell's menu,
+  which an empty result hasn't got, so a table without rows couldn't get
+  its first one.
+
 ### Fixed
 - Monitor: a right click on a session in the blocking tree opens its menu
   (details, SQL details, cancel, kill, disconnect, trace) also on its text,
